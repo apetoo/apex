@@ -1,10 +1,12 @@
 """Manage ~/.stock-watchlist/watchlist.json: positions, candidates, archive."""
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from apex import config
+
+_TZ_CN = timezone(timedelta(hours=8))
 
 
 class DuplicatePositionError(Exception):
@@ -142,8 +144,18 @@ def add_position(ts_code: str, name: str, entry_price: float,
                  stop_loss: float, target: float,
                  trigger_price: Optional[float] = None,
                  trigger_direction: str = "below",
-                 expires_days: int = 10) -> None:
-    """Add new position. Raises DuplicatePositionError if ts_code already in active_positions."""
+                 expires_days: int = 10,
+                 position_size_shares: Optional[int] = None,
+                 risk_amount: Optional[float] = None,
+                 calibrated_confidence: Optional[float] = None,
+                 strategy: Optional[str] = None,
+                 regime_at_open: Optional[str] = None) -> None:
+    """Add new position. Raises DuplicatePositionError if ts_code already in active_positions.
+
+    可选字段缺省时不写入对应 key（保持老记录兼容）：
+      position_size_shares / risk_amount / calibrated_confidence / strategy
+    strategy 是策略归属（screener 4 个策略名之一，或 'manual'/'analyze' 等），用于
+    calibration.compute() 切 by_strategy 桶 + 长期评估各策略胜率。"""
     from datetime import timedelta
     data = _load()
     for existing in data["active_positions"]:
@@ -151,18 +163,39 @@ def add_position(ts_code: str, name: str, entry_price: float,
             raise DuplicatePositionError(ts_code, existing)
 
     expires = (date.today() + timedelta(days=expires_days)).isoformat()
-    data["active_positions"].append({
+    record: dict = {
         "ts_code": ts_code,
         "name": name,
         "entry_price": entry_price,
         "entry_date": date.today().isoformat(),
         "stop_loss": stop_loss,
         "target": target,
-        "trigger_price": trigger_price,  # None = 不触发；is_triggered 已处理 None
+        "trigger_price": trigger_price,
         "trigger_direction": trigger_direction,
         "expires_at": expires,
         "status": "active",
-    })
+    }
+    if position_size_shares is not None and position_size_shares > 0:
+        record["position_size_shares"] = int(position_size_shares)
+    if risk_amount is not None:
+        record["risk_amount"] = float(risk_amount)
+    if calibrated_confidence is not None:
+        record["calibrated_confidence"] = float(calibrated_confidence)
+    if strategy:
+        record["strategy"] = str(strategy)
+    # regime_at_open：调用方未传则从今日 regime 缓存取。无缓存就空（不主动 collect 避免延迟）
+    if regime_at_open is None:
+        try:
+            from apex import regime as _regime_mod
+            today_iso = date.today().isoformat()
+            r = _regime_mod.load(today_iso)
+            if r and r.get("label"):
+                regime_at_open = r["label"]
+        except Exception:
+            regime_at_open = None
+    if regime_at_open:
+        record["regime_at_open"] = str(regime_at_open)
+    data["active_positions"].append(record)
     _save(data)
 
 
@@ -170,21 +203,36 @@ def replace_position(ts_code: str, name: str, entry_price: float,
                      stop_loss: float, target: float,
                      trigger_price: Optional[float] = None,
                      trigger_direction: str = "below",
-                     expires_days: int = 10) -> None:
+                     expires_days: int = 10,
+                     position_size_shares: Optional[int] = None,
+                     risk_amount: Optional[float] = None,
+                     calibrated_confidence: Optional[float] = None,
+                     strategy: Optional[str] = None,
+                     regime_at_open: Optional[str] = None) -> None:
     """Archive existing position with reason='replaced', then add new one."""
     archive_entry(ts_code, "active_positions", reason="replaced")
     add_position(ts_code, name, entry_price, stop_loss, target,
-                 trigger_price, trigger_direction, expires_days)
+                 trigger_price, trigger_direction, expires_days,
+                 position_size_shares=position_size_shares,
+                 risk_amount=risk_amount,
+                 calibrated_confidence=calibrated_confidence,
+                 strategy=strategy,
+                 regime_at_open=regime_at_open)
 
 
 def promote_candidate(ts_code: str, entry_price: float,
                       stop_loss: float, target: float,
-                      expires_days: int = 10) -> None:
+                      expires_days: int = 10,
+                      position_size_shares: Optional[int] = None,
+                      risk_amount: Optional[float] = None,
+                      calibrated_confidence: Optional[float] = None,
+                      strategy: Optional[str] = None,
+                      regime_at_open: Optional[str] = None) -> None:
     """Promote a candidate to active position. Archives the candidate with
     reason='promoted', then adds the active position using actual fill values.
-    Raises DuplicatePositionError if ts_code already in active_positions
-    (candidate is left intact in that case so the caller can resolve the conflict).
-    Raises ValueError if candidate doesn't exist."""
+
+    strategy 缺省时从候选 record 自动继承（候选时如果带了 strategy 字段）。
+    """
     wl = _load()
     existing = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
     if existing is not None:
@@ -193,10 +241,16 @@ def promote_candidate(ts_code: str, entry_price: float,
     if cand is None:
         raise ValueError(f"候选 {ts_code} 不存在")
     name = cand.get("name", "")
+    inherited_strategy = strategy or cand.get("strategy")
     archive_entry(ts_code, "candidates", reason="promoted")
     add_position(ts_code, name, entry_price, stop_loss, target,
                  trigger_price=None, trigger_direction="below",
-                 expires_days=expires_days)
+                 expires_days=expires_days,
+                 position_size_shares=position_size_shares,
+                 risk_amount=risk_amount,
+                 calibrated_confidence=calibrated_confidence,
+                 strategy=inherited_strategy,
+                 regime_at_open=regime_at_open)
 
 
 def dedup_active_positions() -> int:
@@ -253,12 +307,198 @@ def archive_entry(ts_code: str, section: str, reason: str = "manual") -> bool:
     return False
 
 
+def _closed_positions_path() -> Path:
+    cfg = config.get()
+    journal_dir = Path(cfg["paths"]["journal_dir"]).expanduser()
+    return journal_dir / "closed_positions.jsonl"
+
+
+def _fetch_holding_period_extremes(ts_code: str, entry_date: str, exit_date: str) -> dict:
+    """从 K 线拉持仓期间的 high/low/days_held。失败返回 {} 不阻塞平仓主流程。"""
+    try:
+        from apex import data as _data
+        start = entry_date.replace("-", "")
+        end = exit_date.replace("-", "")
+        raw = _data.get_daily_price(ts_code, start_date=start, end_date=end, adj="qfq")
+        rows = json.loads(raw)
+        if not rows or not isinstance(rows, list):
+            return {}
+        highs = [r["high"] for r in rows if r.get("high") is not None]
+        lows = [r["low"] for r in rows if r.get("low") is not None]
+        return {
+            "high_during_hold": round(max(highs), 3) if highs else None,
+            "low_during_hold": round(min(lows), 3) if lows else None,
+            "trading_days": len(rows),
+        }
+    except Exception:
+        return {}
+
+
+def _latest_journal_for(ts_code: str, before: Optional[str] = None) -> Optional[dict]:
+    """取该股最近一条 journal 记录（可选限定 before 日期之前），用于反向关联开仓时 AI 上下文。"""
+    try:
+        from apex import journal as _journal
+        entries = _journal.load_entries(ts_code=ts_code)
+        if before:
+            entries = [e for e in entries if (e.get("date") or "") <= before]
+        if not entries:
+            return None
+        return sorted(entries, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
+    except Exception:
+        return None
+
+
+class PositionNotFoundError(Exception):
+    pass
+
+
+def close_position(ts_code: str,
+                   exit_price: float,
+                   exit_reason: str = "manual",
+                   exit_date: Optional[str] = None,
+                   user_notes: str = "",
+                   actual_fill_price: Optional[float] = None) -> dict:
+    """平仓一笔持仓 → 写一条完整记录到 closed_positions.jsonl，并从 active_positions 移除。
+
+    返回写入的 closed record（不含 diagnosis 段，那是 1.4 post-mortem 的活）。
+
+    actual_fill_price: 开仓时的实际成交价（A股可能与 entry_price 略有滑点）；缺省回落到 entry_price。
+
+    Raises:
+      PositionNotFoundError: ts_code 不在 active_positions 中
+      ValueError: exit_price 非正
+    """
+    from apex.schemas import EXIT_REASON_ENUM
+
+    if exit_price is None or float(exit_price) <= 0:
+        raise ValueError(f"exit_price 必须 > 0，got {exit_price}")
+    if exit_reason not in EXIT_REASON_ENUM:
+        exit_reason = "other"
+
+    today_str = date.today().isoformat()
+    if not exit_date:
+        exit_date = today_str
+
+    wl = _load()
+    pos = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
+    if pos is None:
+        raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
+
+    entry_date = pos.get("entry_date") or today_str
+    entry_price = float(pos.get("entry_price") or 0)
+    fill_price = float(actual_fill_price) if actual_fill_price is not None else entry_price
+    shares = int(pos.get("position_size_shares") or 0)
+
+    extremes = _fetch_holding_period_extremes(ts_code, entry_date, exit_date)
+
+    days_held = 0
+    try:
+        d_in = date.fromisoformat(entry_date)
+        d_out = date.fromisoformat(exit_date)
+        days_held = max(0, (d_out - d_in).days)
+    except Exception:
+        pass
+
+    realized_pnl_pct = None
+    realized_pnl_amount = None
+    if fill_price > 0:
+        realized_pnl_pct = round((float(exit_price) - fill_price) / fill_price, 4)
+        if shares > 0:
+            realized_pnl_amount = round((float(exit_price) - fill_price) * shares, 2)
+
+    journal_at_open = _latest_journal_for(ts_code, before=entry_date)
+
+    record = {
+        "ts_code": ts_code,
+        "name": pos.get("name", ""),
+        "open": {
+            "entry_date": entry_date,
+            "entry_price": entry_price or None,
+            "actual_fill_price": fill_price or None,
+            "position_size_shares": shares or None,
+            "stop_loss": pos.get("stop_loss"),
+            "target": pos.get("target"),
+            "risk_amount": pos.get("risk_amount"),
+            "calibrated_confidence": pos.get("calibrated_confidence"),
+            "strategy": pos.get("strategy"),
+            "regime_at_open": pos.get("regime_at_open"),
+            "ai_verdict": (journal_at_open or {}).get("verdict"),
+            "ai_confidence": (journal_at_open or {}).get("confidence"),
+            "ai_features": (journal_at_open or {}).get("features"),
+            "ai_analysis_text": (journal_at_open or {}).get("analysis_text"),
+            "screener_signals": None,
+            "screener_rule_score": None,
+        },
+        "close": {
+            "exit_date": exit_date,
+            "actual_exit_price": float(exit_price),
+            "exit_reason": exit_reason,
+            "days_held": days_held,
+            "trading_days_held": extremes.get("trading_days"),
+            "high_during_hold": extremes.get("high_during_hold"),
+            "low_during_hold": extremes.get("low_during_hold"),
+            "realized_pnl_pct": realized_pnl_pct,
+            "realized_pnl_amount": realized_pnl_amount,
+            "user_notes": user_notes or "",
+            "closed_at": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
+        },
+        "diagnosis": None,
+    }
+
+    out_path = _closed_positions_path()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    wl["active_positions"] = [p for p in wl["active_positions"] if p.get("ts_code") != ts_code]
+    pos_breadcrumb = dict(pos)
+    pos_breadcrumb["status"] = f"closed_{exit_reason}"
+    pos_breadcrumb["archived_date"] = today_str
+    pos_breadcrumb["archived_from"] = "active_positions"
+    pos_breadcrumb["closed_record_ref"] = record["close"]["closed_at"]
+    wl["archived"].append(pos_breadcrumb)
+    _save(wl)
+
+    return record
+
+
+def load_closed_positions(limit: Optional[int] = None,
+                          since_days: Optional[int] = None) -> list[dict]:
+    """读 closed_positions.jsonl，按 closed_at 倒序。limit / since_days 二选一可选。"""
+    path = _closed_positions_path()
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    cutoff: Optional[str] = None
+    if since_days:
+        cutoff = (datetime.now(_TZ_CN) - timedelta(days=since_days)).isoformat()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if cutoff:
+                closed_at = (rec.get("close") or {}).get("closed_at") or ""
+                if closed_at < cutoff:
+                    continue
+            out.append(rec)
+    out.sort(key=lambda r: (r.get("close") or {}).get("closed_at") or "", reverse=True)
+    if limit:
+        out = out[:limit]
+    return out
+
+
 def add_candidate(ts_code: str, name: str, trigger_price: float,
                   trigger_direction: str = "above",
                   note: str = "",
                   expires_days: int = 7,
                   stop_advice: Optional[float] = None,
-                  target_advice: Optional[float] = None) -> None:
+                  target_advice: Optional[float] = None,
+                  strategy: Optional[str] = None) -> None:
     from datetime import timedelta
     data = _load()
     expires = (date.today() + timedelta(days=expires_days)).isoformat()
@@ -274,5 +514,7 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["stop_advice"] = stop_advice
     if target_advice is not None:
         entry["target_advice"] = target_advice
+    if strategy:
+        entry["strategy"] = str(strategy)
     data["candidates"].append(entry)
     _save(data)

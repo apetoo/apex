@@ -42,8 +42,13 @@ def _tushare():
     return _ts_api
 
 
-def get_daily_price(ts_code: str, start_date: str = None, end_date: str = None) -> str:
-    """Return daily OHLCV + MA data as JSON string. start/end: YYYYMMDD."""
+def get_daily_price(ts_code: str, start_date: str = None, end_date: str = None,
+                    adj: str = "qfq") -> str:
+    """Return daily OHLCV + MA data as JSON string. start/end: YYYYMMDD.
+
+    adj: 'qfq'（前复权，默认；MA / 趋势分析必须用此）/ 'hfq'（后复权）/ 'none'（不复权，
+    真实历史成交价，仅用于回测建模实际成交成本）。
+    """
     if not start_date:
         start_date = (datetime.today() - timedelta(days=120)).strftime("%Y%m%d")
     if not end_date:
@@ -54,18 +59,21 @@ def get_daily_price(ts_code: str, start_date: str = None, end_date: str = None) 
     end_date = end_date.replace("-", "")
 
     try:
-        pro = _tushare()
-        df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        _tushare()  # 确保 token 已 set
+        import tushare as ts_module
+        adj_param = None if adj == "none" else adj
+        df = ts_module.pro_bar(ts_code=ts_code, adj=adj_param, freq="D",
+                                start_date=start_date, end_date=end_date)
         if df is None or df.empty:
             raise ValueError("empty")
         df = df.sort_values("trade_date").reset_index(drop=True)
     except Exception:
-        # Fallback: akshare
+        # Fallback: akshare（同样使用复权口径，保持与 tushare 一致）
         import akshare as ak
-        symbol = ts_code.replace(".SZ", "").replace(".SH", "")
-        df = ak.stock_zh_a_hist(symbol=symbol, start_date=start_date[:4]+"-"+start_date[4:6]+"-"+start_date[6:],
-                                 end_date=end_date[:4]+"-"+end_date[4:6]+"-"+end_date[6:],
-                                 adjust="qfq")
+        symbol = ts_code.split(".")[0]
+        ak_adjust = "" if adj == "none" else adj
+        df = ak.stock_zh_a_hist(symbol=symbol, start_date=start_date,
+                                 end_date=end_date, adjust=ak_adjust)
         df = df.rename(columns={"日期": "trade_date", "开盘": "open", "收盘": "close",
                                   "最高": "high", "最低": "low", "成交量": "vol"})
         df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "")

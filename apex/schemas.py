@@ -6,6 +6,30 @@ BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}
 
 REQUIRED_FEATURE_KEYS = ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"]
 
+SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept"]
+
+EXIT_REASON_ENUM = ["stop_hit", "target_hit", "manual", "expired", "other"]
+
+
+class SignalRecord(TypedDict, total=False):
+    ts_code: str
+    name: str
+    signal_type: str
+    signal_strength: float
+    raw: dict
+
+
+class ScreenerEntry(TypedDict, total=False):
+    ts_code: str
+    name: str
+    signals: list
+    signal_types: list
+    rule_score: float
+    ai_score: Optional[int]
+    verdict: Optional[str]
+    one_liner: Optional[str]
+    red_flag: Optional[bool]
+
 
 class FeaturesSchema(TypedDict, total=False):
     ma5_position: Literal["above", "below"]
