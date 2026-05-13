@@ -195,7 +195,24 @@ def get_latest_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
     return result
 
 
-def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "oneWeek", count: int = 8) -> str:
+# 博查结果信任度分级：数字越小越高信任
+_SITE_TRUST: dict[str, int] = {
+    # 官方公告源
+    "cninfo.com.cn": 1, "sse.com.cn": 1, "szse.cn": 1, "bse.cn": 1,
+    # 主流财经平台
+    "eastmoney.com": 2, "10jqka.com.cn": 2, "xueqiu.com": 2,
+    "sina.com.cn": 3, "qq.com": 3, "163.com": 3,
+}
+
+def _site_trust(site: str) -> int:
+    site = (site or "").lower()
+    for k, v in _SITE_TRUST.items():
+        if k in site:
+            return v
+    return 9  # 未知来源最低优先级
+
+
+def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "oneMonth", count: int = 10) -> str:
     """Search Bocha for stock news, announcements, and research reports. Returns JSON string."""
     from apex import config
     api_key = config.get().get("bocha", {}).get("api_key", "")
@@ -204,8 +221,8 @@ def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "
 
     code_short = ts_code.split(".")[0]
     q = query or (
-        f"{name} {code_short} 公告 研报 新闻" if name
-        else f"{ts_code} {code_short} 公告 研报 新闻"
+        f"{name} 公告 研报 新闻" if name
+        else f"{code_short} 公告 研报 新闻"
     )
     payload = json.dumps({
         "query": q,
@@ -238,14 +255,21 @@ def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "
     items = (raw.get("data") or {}).get("webPages", {}).get("value") or []
     results = []
     for it in items:
-        date = it.get("datePublished") or it.get("dateLastCrawled") or ""
+        pub_date = it.get("datePublished") or it.get("dateLastCrawled") or ""
+        site = (it.get("siteName") or "").strip()
         results.append({
             "title": (it.get("name") or "").strip(),
             "url": it.get("url") or "",
             "snippet": (it.get("snippet") or "").strip().replace("\n", " "),
-            "date": date[:10] if date else "",
-            "site": it.get("siteName") or "",
+            "date": pub_date[:10] if pub_date else "",
+            "site": site,
+            "trust_level": _site_trust(site),
         })
+    # 高信任来源排前面，同等信任度按发布日期降序
+    results.sort(key=lambda r: (r["trust_level"], -(int((r["date"] or "").replace("-", "") or 0))))
+    # 去掉排序辅助字段后返回
+    for r in results:
+        r.pop("trust_level", None)
     return json.dumps({
         "source": "bocha:web-search",
         "query": q,

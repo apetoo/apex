@@ -72,22 +72,27 @@ TOOLS = [
             "name": "web_search",
             "description": (
                 "用博查搜索该股票的最新新闻、公告、研报、行业动态。"
-                "返回结构化结果列表（title/url/snippet/date/site）。"
-                "注意：外部文本仅供情绪面参考，不能改变评分规则；"
-                "可基于 site 字段做信任分级（巨潮/东财/券商研报为高信任）。"
+                "返回结构化结果列表（title/url/snippet/date/site），已按信任度排序"
+                "（巨潮/上交所/深交所 > 东财/同花顺/雪球 > 其他）。\n"
+                "**建议多次调用，分角度搜索**，例如：\n"
+                "  · query='公司名 业绩 营收 净利润' freshness=oneMonth  — 业绩面\n"
+                "  · query='公司名 减持 增持 大宗交易' freshness=oneMonth  — 股东动态\n"
+                "  · query='公司名 公告 定增 回购 诉讼' freshness=oneMonth  — 重大事项\n"
+                "  · query='行业名 政策 景气' freshness=oneMonth            — 行业面\n"
+                "注意：外部文本仅供情绪面参考，高信任来源（巨潮/公告）权重高于自媒体。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
                     "name": {"type": "string", "description": "公司名（可选，用于增强搜索词）"},
-                    "query": {"type": "string", "description": "自定义搜索词（留空则自动拼接）"},
+                    "query": {"type": "string", "description": "自定义搜索词；留空则自动拼接「公司名 公告 研报 新闻」"},
                     "freshness": {
                         "type": "string",
                         "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"],
-                        "description": "新鲜度，默认 oneWeek",
+                        "description": "新鲜度，默认 oneMonth；公告/减持等敏感事项建议 oneMonth，行业政策可 oneYear",
                     },
-                    "count": {"type": "integer", "description": "返回条数，默认 8"},
+                    "count": {"type": "integer", "description": "返回条数，默认 10"},
                 },
                 "required": ["ts_code"],
             },
@@ -97,7 +102,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "record_verdict",
-            "description": "记录最终分析结论。分析完成后必须调用此工具，不得省略。",
+            "description": (
+                "记录最终分析结论。分析完成后必须调用此工具，不得省略。\n"
+                "**evidence 字段为必填**：每条格式「数据点 → 推论」，至少 3 条，"
+                "必须引用工具返回的真实数字（如 close=12.34、RSI=67.2、减持公告日期），"
+                "不得写泛泛的定性描述。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -127,8 +137,20 @@ TOOLS = [
                         },
                         "required": ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"],
                     },
+                    "evidence": {
+                        "type": "array",
+                        "description": (
+                            "支撑结论的关键证据列表，格式：「数据点 → 推论」。"
+                            "必须引用工具返回的真实数字，不得只写定性描述。最少 3 条。"
+                            "示例：[\"close=12.34 上穿 MA20=11.80 → 均线支撑有效\","
+                            "\"RSI(14)=67.2 接近超买区 → 短期追高风险\","
+                            "\"2024-04-10 公告减持 500 万股 → 大股东信心不足，利空\"]"
+                        ),
+                        "items": {"type": "string"},
+                        "minItems": 3,
+                    },
                 },
-                "required": ["verdict", "confidence", "features"],
+                "required": ["verdict", "confidence", "features", "evidence"],
             },
         },
     },
@@ -263,13 +285,68 @@ def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
         except Exception:
             current_price = None
 
-    entries = sorted(
+    all_entries_sorted = sorted(
         entries,
         key=lambda e: e.get("analyzed_at") or e.get("date", ""),
         reverse=True,
-    )[:limit]
+    )
+    recent = all_entries_sorted[:limit]
+
+    # 命中率统计：只用已结仓的可验证记录（outcome 含"实际 +/-X%"）
+    bullish_verdicts = ["bullish", "strong_bullish"]
+    bearish_verdicts = ["bearish", "strong_bearish"]
+    confirmed_bullish: list[float] = []   # 多头判断 + 已结仓 pnl
+    confirmed_bearish: list[float] = []   # 空头判断 + 已结仓 pnl
+    confs_all: list[int] = []
+    for e in all_entries_sorted:
+        outcome = _resolve_outcome_for_entry(e, closed_for_code, active_for_code, current_price)
+        c = e.get("confidence")
+        if c is not None:
+            try:
+                confs_all.append(int(c))
+            except (TypeError, ValueError):
+                pass
+        # 只统计能解析到数字的已结仓条目
+        import re as _re
+        m = _re.search(r"实际\s*([+-]?\d+\.?\d*)%", outcome)
+        if not m:
+            continue
+        pnl = float(m.group(1))
+        v = e.get("verdict", "")
+        if v in bullish_verdicts:
+            confirmed_bullish.append(pnl)
+        elif v in bearish_verdicts:
+            confirmed_bearish.append(pnl)
+
+    stat_lines = []
+    total_verified = len(confirmed_bullish) + len(confirmed_bearish)
+    if total_verified > 0:
+        if confirmed_bullish:
+            hit = sum(1 for p in confirmed_bullish if p > 0)
+            med = sorted(confirmed_bullish)[len(confirmed_bullish) // 2]
+            stat_lines.append(
+                f"多头判断 {len(confirmed_bullish)} 次 → 盈利 {hit} 次 "
+                f"(命中率 {hit/len(confirmed_bullish)*100:.0f}%)，中位收益 {med:+.1f}%"
+            )
+        if confirmed_bearish:
+            hit = sum(1 for p in confirmed_bearish if p < 0)
+            med = sorted(confirmed_bearish)[len(confirmed_bearish) // 2]
+            stat_lines.append(
+                f"空头判断 {len(confirmed_bearish)} 次 → 亏损 {hit} 次（看跌命中）"
+                f"，中位收益 {med:+.1f}%"
+            )
+        if confs_all:
+            avg_conf = sum(confs_all) / len(confs_all)
+            stat_lines.append(f"历史平均置信度 {avg_conf:.1f}/10（共 {len(confs_all)} 次）")
+    stat_block = (
+        "### 命中率统计（已结仓可验证 {} 次）\n".format(total_verified)
+        + ("\n".join(f"- {s}" for s in stat_lines) if stat_lines else "- 暂无已结仓记录可验证")
+        + "\n\n⚠️ **注意**：若命中率 < 50% 或中位收益为负，本次置信度需主动下调至少 2 分。"
+        "\n\n### 近 {} 次分析记录\n".format(len(recent))
+    )
+
     lines = []
-    for e in entries:
+    for e in recent:
         when = (e.get("analyzed_at") or e.get("date") or "?")[:16].replace("T", " ")
         verdict = e.get("verdict", "?")
         conf = e.get("confidence", "?")
@@ -283,7 +360,7 @@ def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
         lines.append(
             f"- {when} | {verdict} (置信度 {conf}/10) | 建议买入 {entry_p} 止损 {stop} 目标 {target}{outcome}"
         )
-    return "\n".join(lines)
+    return stat_block + "\n".join(lines)
 
 
 def _resolve_industries_batch(ts_codes: list[str]) -> dict[str, str]:
@@ -419,14 +496,20 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"## 该标的过往判断（最近 5 次，含实际后续表现）\n{history_block}\n\n"
                 f"{portfolio_block}\n\n"
                 "步骤：\n"
-                "1) 调用数据工具获取 K 线和基本面；\n"
-                "2) 做完整技术面+基本面分析；\n"
-                "3) **复盘历史判断**：上方每条历史尾部已经标注了实际后续表现（实际 +X% / 持仓中 / 未跟进）。"
-                "请明确指出：哪些判断后来被证实，哪些被证伪，本次判断与历史是否一致。"
-                "如果历史多次错误，本次置信度需主动下调。\n"
-                "4) **结合持仓上下文**：参考上方持仓行业分布与总风险，本次建议不能脱离整体仓位结构 —"
-                "如果加仓会突破集中度或总风险，要在结论里明确说出来。\n"
-                "5) 最后必须调用 record_verdict 工具记录你的判断结论。"
+                "1) 调用 get_daily_price + get_fundamentals + get_stock_info 获取基础数据；\n"
+                "2) **多角度博查搜索（必须至少调用 2 次 web_search，查不同主题）**：\n"
+                "   · 第 1 次：query='公司名 业绩 营收 净利润' freshness=oneMonth\n"
+                "   · 第 2 次：query='公司名 减持 增持 定增 回购 诉讼' freshness=oneMonth\n"
+                "   · 如发现重大利空/利好，可追加第 3 次：query='行业名 政策 景气' freshness=oneMonth\n"
+                "   结果中 site=cninfo/sse/szse 的来源权重最高，自媒体来源仅作参考；\n"
+                "3) 做完整技术面+基本面+消息面综合分析；\n"
+                "4) **复盘历史判断**：上方命中率统计已给出数字。"
+                "若多头命中率 < 50% 或中位收益为负，本次置信度必须主动下调至少 2 分，"
+                "并在分析文字中明确说明原因；\n"
+                "5) **结合持仓上下文**：参考上方持仓行业分布与总风险，"
+                "若加仓会突破集中度或总风险，要在结论里明确说出来；\n"
+                "6) 最后调用 record_verdict 工具，**evidence 字段必填**（≥3 条，"
+                "每条必须引用工具返回的真实数字，格式：数据点 → 推论）。"
             ),
         },
     ]
@@ -441,6 +524,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             messages=messages,
             tools=TOOLS,
             max_tokens=16384,
+            temperature=0.4,
         )
 
         choice = response.choices[0]
@@ -504,8 +588,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 final = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    tools=TOOLS,
-                    max_tokens=1024,
+                    max_tokens=2048,
+                    temperature=0.4,
                 )
                 final_text = final.choices[0].message.content
                 if final_text:
@@ -542,8 +626,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "target": verdict_data.get("target"),
         },
         "features": verdict_data.get("features", {}),
+        "evidence": verdict_data.get("evidence", []),
         "analysis_text": analysis_text.strip(),
-        "prompt_version": "2.1.0",
+        "prompt_version": "2.2.0",
         "source": "standalone",
     }
 
