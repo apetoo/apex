@@ -212,21 +212,96 @@ def _site_trust(site: str) -> int:
     return 9  # 未知来源最低优先级
 
 
-def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "oneMonth", count: int = 10) -> str:
-    """Search Bocha for stock news, announcements, and research reports. Returns JSON string."""
+# 博查搜索类别规范（与 analyze.py 工具 schema 保持一致）
+_SEARCH_CATEGORIES: dict[str, dict] = {
+    "earnings": {
+        "query_tpl": "{name} 业绩 营收 净利润 季报 预告",
+        "freshness": "oneMonth",
+    },
+    "shareholders": {
+        "query_tpl": "{name} 减持 增持 大宗交易 解禁",
+        "freshness": "oneMonth",
+    },
+    "regulatory": {
+        "query_tpl": "{name} 立案 处罚 诉讼 问询函 警示",
+        "freshness": "oneYear",
+    },
+    "money_flow": {
+        "query_tpl": "{name} 北向 龙虎榜 主力 机构",
+        "freshness": "oneWeek",
+    },
+    "corporate_actions": {
+        "query_tpl": "{name} 定增 配股 回购 重组 并购",
+        "freshness": "oneYear",
+    },
+    "research": {
+        "query_tpl": "{name} 研报 评级 目标价 上调 下调",
+        "freshness": "oneMonth",
+    },
+    "industry": {
+        "query_tpl": "{industry} 政策 景气 需求 补贴",
+        "freshness": "oneYear",
+    },
+    "general": {
+        "query_tpl": None,  # 用 caller 传入的 query 字段
+        "freshness": "oneMonth",
+    },
+}
+
+MANDATORY_SEARCH_CATEGORIES = ["earnings", "shareholders", "regulatory", "money_flow"]
+
+
+def web_search(
+    ts_code: str,
+    category: str = "general",
+    name: str = "",
+    industry: str = "",
+    query: str = "",
+    freshness: str = "",
+    count: int = 10,
+) -> str:
+    """Search Bocha with category-based query templates. Returns JSON string.
+
+    category: one of _SEARCH_CATEGORIES keys. Determines query template + default freshness.
+    name / industry: substituted into the template.
+    query: only used when category == 'general'.
+    freshness: optional override of the category's default.
+    """
     from apex import config
     api_key = config.get().get("bocha", {}).get("api_key", "")
     if not api_key:
         return json.dumps({"error": "bocha.api_key not configured"})
 
+    cat_spec = _SEARCH_CATEGORIES.get(category)
+    if cat_spec is None:
+        return json.dumps({
+            "error": f"unknown category '{category}'. "
+                     f"valid: {list(_SEARCH_CATEGORIES.keys())}"
+        })
+
     code_short = ts_code.split(".")[0]
-    q = query or (
-        f"{name} 公告 研报 新闻" if name
-        else f"{code_short} 公告 研报 新闻"
-    )
+
+    if category == "general":
+        q = query or (
+            f"{name} 公告 研报 新闻" if name
+            else f"{code_short} 公告 研报 新闻"
+        )
+    elif category == "industry":
+        if not industry:
+            return json.dumps({
+                "error": "category=industry 必须传 industry 参数（先调 get_stock_info 拿到行业）"
+            })
+        q = cat_spec["query_tpl"].format(industry=industry)
+    else:
+        # 其他分类需要 name；缺失时退化为 ts_code（召回会变差）
+        actual_name = name or code_short
+        q = cat_spec["query_tpl"].format(name=actual_name)
+
+    actual_freshness = freshness or cat_spec["freshness"]
+
     payload = json.dumps({
         "query": q,
-        "freshness": freshness,
+        "freshness": actual_freshness,
         "summary": False,
         "count": count,
     }).encode("utf-8")
@@ -272,8 +347,9 @@ def web_search(ts_code: str, name: str = "", query: str = "", freshness: str = "
         r.pop("trust_level", None)
     return json.dumps({
         "source": "bocha:web-search",
+        "category": category,
         "query": q,
-        "freshness": freshness,
+        "freshness": actual_freshness,
         "count": len(results),
         "results": results,
     }, ensure_ascii=False)

@@ -71,30 +71,56 @@ TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "用博查搜索该股票的最新新闻、公告、研报、行业动态。"
-                "返回结构化结果列表（title/url/snippet/date/site），已按信任度排序"
-                "（巨潮/上交所/深交所 > 东财/同花顺/雪球 > 其他）。\n"
-                "**建议多次调用，分角度搜索**，例如：\n"
-                "  · query='公司名 业绩 营收 净利润' freshness=oneMonth  — 业绩面\n"
-                "  · query='公司名 减持 增持 大宗交易' freshness=oneMonth  — 股东动态\n"
-                "  · query='公司名 公告 定增 回购 诉讼' freshness=oneMonth  — 重大事项\n"
-                "  · query='行业名 政策 景气' freshness=oneMonth            — 行业面\n"
-                "注意：外部文本仅供情绪面参考，高信任来源（巨潮/公告）权重高于自媒体。"
+                "用博查搜索股票相关信息。**必须分类搜索，不要混搜**。\n"
+                "每次调用只查一个 category，AI 应分多次调用覆盖不同维度。\n"
+                "\n"
+                "**强制类别（record_verdict 前必须全部调用过，否则系统拒绝记录结论）**：\n"
+                "  · earnings           — 业绩面（季报/预告/营收/净利润），oneMonth 窗口\n"
+                "  · shareholders       — 股东动态（减持/增持/解禁/大宗交易），oneMonth 窗口\n"
+                "  · regulatory         — 监管/合规（立案/处罚/诉讼/问询函），oneYear 窗口\n"
+                "  · money_flow         — 资金面（北向/龙虎榜/主力/机构），oneWeek 窗口\n"
+                "\n"
+                "**可选类别（按需追加）**：\n"
+                "  · corporate_actions  — 资本运作（定增/回购/重组/并购），oneYear 窗口\n"
+                "  · research           — 卖方研报（评级/目标价变化），oneMonth 窗口\n"
+                "  · industry           — 行业政策（需先用 get_stock_info 拿到 industry 后传入），oneYear 窗口\n"
+                "  · general            — 兜底自定义 query\n"
+                "\n"
+                "返回结果已按信任度排序：cninfo/sse/szse > 东财/同花顺/雪球 > 其他自媒体。\n"
+                "高信任来源（官方公告）的权重应明显高于自媒体。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
-                    "name": {"type": "string", "description": "公司名（可选，用于增强搜索词）"},
-                    "query": {"type": "string", "description": "自定义搜索词；留空则自动拼接「公司名 公告 研报 新闻」"},
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "earnings", "shareholders", "regulatory", "money_flow",
+                            "corporate_actions", "research", "industry", "general",
+                        ],
+                        "description": "搜索类别（必填）。一次调用只能选一个。",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "公司名。除 industry/general 外强烈建议传入，否则只能用代码召回，质量差。",
+                    },
+                    "industry": {
+                        "type": "string",
+                        "description": "行业名。仅当 category=industry 时使用（必填）。",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "自定义搜索词。仅当 category=general 时生效。",
+                    },
                     "freshness": {
                         "type": "string",
                         "enum": ["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"],
-                        "description": "新鲜度，默认 oneMonth；公告/减持等敏感事项建议 oneMonth，行业政策可 oneYear",
+                        "description": "可选；通常用 category 内置默认值，特殊场景才覆盖。",
                     },
                     "count": {"type": "integer", "description": "返回条数，默认 10"},
                 },
-                "required": ["ts_code"],
+                "required": ["ts_code", "category"],
             },
         },
     },
@@ -497,19 +523,44 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"{portfolio_block}\n\n"
                 "步骤：\n"
                 "1) 调用 get_daily_price + get_fundamentals + get_stock_info 获取基础数据；\n"
-                "2) **多角度博查搜索（必须至少调用 2 次 web_search，查不同主题）**：\n"
-                "   · 第 1 次：query='公司名 业绩 营收 净利润' freshness=oneMonth\n"
-                "   · 第 2 次：query='公司名 减持 增持 定增 回购 诉讼' freshness=oneMonth\n"
-                "   · 如发现重大利空/利好，可追加第 3 次：query='行业名 政策 景气' freshness=oneMonth\n"
-                "   结果中 site=cninfo/sse/szse 的来源权重最高，自媒体来源仅作参考；\n"
-                "3) 做完整技术面+基本面+消息面综合分析；\n"
-                "4) **复盘历史判断**：上方命中率统计已给出数字。"
-                "若多头命中率 < 50% 或中位收益为负，本次置信度必须主动下调至少 2 分，"
-                "并在分析文字中明确说明原因；\n"
-                "5) **结合持仓上下文**：参考上方持仓行业分布与总风险，"
-                "若加仓会突破集中度或总风险，要在结论里明确说出来；\n"
-                "6) 最后调用 record_verdict 工具，**evidence 字段必填**（≥3 条，"
-                "每条必须引用工具返回的真实数字，格式：数据点 → 推论）。"
+                "2) **强制 4 类博查搜索（缺任一类别 record_verdict 会被系统拒绝）**：\n"
+                "   · web_search(ts_code=..., category='earnings', name='公司名')\n"
+                "   · web_search(ts_code=..., category='shareholders', name='公司名')\n"
+                "   · web_search(ts_code=..., category='regulatory', name='公司名')\n"
+                "   · web_search(ts_code=..., category='money_flow', name='公司名')\n"
+                "   可按需追加可选类别：corporate_actions / research / industry / general。\n"
+                "   结果按信任度排序：site=cninfo/sse/szse 权重最高，自媒体仅作参考。\n"
+                "   若某 category 召回为空，在 evidence 里明确写「该类别无召回」，**不要跳过该调用**；\n"
+                "\n"
+                "3) **强制三段式辩论结构（写在 message content 里，不是 tool 调用）**：\n"
+                "\n"
+                "   ### 一、多头论点（≥3 条，每条格式：数据点 → 推论）\n"
+                "   - 示例：close=12.34 上穿 MA20=11.80（4 日前），且 vol_ratio=1.8 → 突破有量，趋势确立\n"
+                "   - 必须引用 K 线/基本面/消息面的具体数字，禁止空话\n"
+                "\n"
+                "   ### 二、空头论点（≥3 条，禁止使用「虽然 X 但是 Y」的弱化句式）\n"
+                "   - 每条必须是独立的、能站住脚的反方证据，不是给多头让步的修饰\n"
+                "   - 至少有 1 条必须直接反驳多头某条具体论点（指名道姓：「多头第 N 条认为..., 但 ...」）\n"
+                "   - 必须考虑：估值是否偏高？是否有解禁/减持？行业是否处于景气下行？\n"
+                "     技术面是否有背离（如价创新高但 RSI 走低）？历史回撤幅度？\n"
+                "\n"
+                "   ### 三、裁判结论\n"
+                "   - 多空双方各自最硬的 1 条证据是什么？\n"
+                "   - 双方互斥的核心矛盾点：哪些证据导致多空无法共存？倾向哪边？为什么？\n"
+                "   - 最终方向（verdict）+ 原始置信度（initial_confidence，1-10）\n"
+                "   - **置信度扣减规则（强制执行）**：\n"
+                "     · 每存在 1 条「空头论点在第三段未被有效反驳」→ 置信度 −1\n"
+                "     · 历史命中率 < 50% 或中位收益为负 → 再 −2\n"
+                "     · 加仓会突破行业集中度（≥3 只同行业）或总风险逼近上限 → 再 −1\n"
+                "   - 列出每一项扣减的具体数额，给出最终 final_confidence\n"
+                "\n"
+                "4) **结合持仓上下文**：参考上方持仓行业分布与总风险，"
+                "若加仓会突破集中度或总风险，要在裁判结论里明确说出来并执行上面的扣减；\n"
+                "\n"
+                "5) 最后调用 record_verdict 工具：\n"
+                "   · `confidence` 填扣减后的 final_confidence（不是原始值）；\n"
+                "   · `evidence` 字段填 ≥3 条裁判结论里采纳的关键证据，"
+                "格式：数据点 → 推论，必须引用真实数字。"
             ),
         },
     ]
@@ -517,6 +568,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     verdict_data: dict = {}
     analysis_text = ""
     iteration = 0
+    searches_performed: list[str] = []  # 累计调用过的 web_search category
 
     while True:
         response = client.chat.completions.create(
@@ -555,16 +607,41 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 tool_input = {}
 
             if name == "record_verdict":
-                verdict_data = tool_input
-                result = "verdict recorded"
-                if on_progress:
-                    on_progress(f"📝 记录结论: {verdict_data.get('verdict')}")
+                missing = [
+                    c for c in data.MANDATORY_SEARCH_CATEGORIES
+                    if c not in searches_performed
+                ]
+                if missing:
+                    # 拒绝记录结论，强制 AI 先把强制类别补齐
+                    result = json.dumps({
+                        "error": (
+                            f"强制博查类别未全部调用，缺：{missing}。"
+                            f"请先调用 web_search(category=<上述类别>) 把每个缺失项查一遍，"
+                            f"再调用 record_verdict。"
+                        ),
+                        "missing_categories": missing,
+                        "performed": searches_performed,
+                    }, ensure_ascii=False)
+                    if on_progress:
+                        on_progress(f"⛔ 拒绝记录结论，缺类别: {missing}")
+                else:
+                    verdict_data = tool_input
+                    result = "verdict recorded"
+                    if on_progress:
+                        on_progress(f"📝 记录结论: {verdict_data.get('verdict')}")
             else:
+                if name == "web_search":
+                    cat = tool_input.get("category", "general")
+                    if cat not in searches_performed:
+                        searches_performed.append(cat)
+                    label_extra = f"[{cat}] " + (tool_input.get('name') or tool_input.get('industry') or tool_input.get('query') or tool_input.get('ts_code', ''))
+                else:
+                    label_extra = tool_input.get('ts_code', '')
                 tool_labels = {
-                    "get_daily_price": f"📊 拉取K线数据 {tool_input.get('ts_code', '')}",
-                    "get_fundamentals": f"🏦 拉取基本面 {tool_input.get('ts_code', '')}",
-                    "get_stock_info": f"ℹ️ 查询公司信息 {tool_input.get('ts_code', '')}",
-                    "web_search": f"🔍 博查搜索: {tool_input.get('query') or tool_input.get('name') or tool_input.get('ts_code', '')}",
+                    "get_daily_price": f"📊 拉取K线数据 {label_extra}",
+                    "get_fundamentals": f"🏦 拉取基本面 {label_extra}",
+                    "get_stock_info": f"ℹ️ 查询公司信息 {label_extra}",
+                    "web_search": f"🔍 博查搜索 {label_extra}",
                 }
                 if on_progress:
                     on_progress(tool_labels.get(name, f"🔧 {name}"))
@@ -627,8 +704,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         },
         "features": verdict_data.get("features", {}),
         "evidence": verdict_data.get("evidence", []),
+        "searches_performed": searches_performed,
         "analysis_text": analysis_text.strip(),
-        "prompt_version": "2.2.0",
+        "prompt_version": "2.4.0",
         "source": "standalone",
     }
 
