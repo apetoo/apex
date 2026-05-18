@@ -1,8 +1,10 @@
+import logging
 import os
 import yaml
 from pathlib import Path
 
 _cfg: dict = {}
+_logger = logging.getLogger(__name__)
 
 
 def load(path: str = "config.yaml") -> dict:
@@ -27,7 +29,36 @@ def load(path: str = "config.yaml") -> dict:
     for key, val in paths.items():
         paths[key] = str(Path(val).expanduser())
 
+    _apply_proxy(_cfg.setdefault("proxy", {}))
+
     return _cfg
+
+
+def _apply_proxy(proxy_cfg: dict) -> None:
+    """把 config.proxy 同步到 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量（大小写两份都写）。
+
+    优先级：shell 环境变量 > config.yaml。
+    设置后 httpx / requests / urllib 会自动生效，无需各模块单独传参。
+    新浪行情接口在 data.get_realtime_price 内显式 ProxyHandler({}) bypass，不受影响。
+    """
+    mapping = {
+        "http_proxy": ("HTTP_PROXY", "http_proxy"),
+        "https_proxy": ("HTTPS_PROXY", "https_proxy"),
+        "no_proxy": ("NO_PROXY", "no_proxy"),
+    }
+    applied = {}
+    for cfg_key, (upper, lower) in mapping.items():
+        existing = os.environ.get(upper) or os.environ.get(lower)
+        cfg_val = ((proxy_cfg or {}).get(cfg_key) or "").strip()
+        chosen = existing or cfg_val
+        if not chosen:
+            continue
+        # 大小写两种形式都写，避免只查 HTTPS_PROXY 或只查 https_proxy 的库读不到
+        os.environ[upper] = chosen
+        os.environ[lower] = chosen
+        applied[upper] = chosen
+    if applied:
+        _logger.info("代理已启用: %s", ", ".join(f"{k}={v}" for k, v in applied.items()))
 
 
 def get() -> dict:

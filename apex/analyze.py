@@ -11,8 +11,8 @@ _TZ_CN = timezone(timedelta(hours=8))
 
 from openai import OpenAI
 
-from apex import config, data, journal, calibration
-from apex.schemas import VERDICT_ENUM
+from apex import config, data, journal, calibration, evidence_attribution
+from apex.schemas import VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS
 
 
 class AnalysisError(Exception):
@@ -127,6 +127,64 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_dragon_tiger_list",
+            "description": (
+                "查个股近 N 天龙虎榜上榜情况（akshare 东财源，免费）。\n"
+                "返回上榜日期清单 + 上榜频次。可选拉最近 3 次的买卖席位 TOP5（机构/游资）。\n"
+                "\n"
+                "**何时调用**：当 web_search(money_flow) 召回里出现「龙虎榜」字样、"
+                "或股价短期异动需要确认是否游资炒作时调用。"
+                "比 web_search 召回更结构化、可直接引用具体上榜次数和净买额。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
+                    "days": {
+                        "type": "integer",
+                        "description": "回溯天数（自然日），默认 90",
+                    },
+                    "fetch_seats": {
+                        "type": "boolean",
+                        "description": "是否拉最近 3 次的买卖席位 TOP5（默认 false，需要时再开）",
+                    },
+                },
+                "required": ["ts_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_unlock_schedule",
+            "description": (
+                "查个股限售解禁日程（akshare 东财源，免费）。\n"
+                "返回未来 180 天待解禁明细 + 近 180 天已发生解禁（含解禁后 20 日表现）。\n"
+                "\n"
+                "**何时调用**：分析多头判断前必查。短期内大额解禁（占流通盘 > 5%）是"
+                "重要利空信号。比 web_search(shareholders) 召回的「公告减持」更精确、可直接"
+                "引用解禁日期 / 股份数 / 占流通比例。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "未来回看天数，默认 180",
+                    },
+                    "history_days": {
+                        "type": "integer",
+                        "description": "历史回看天数（评估以往解禁后股价反应），默认 180",
+                    },
+                },
+                "required": ["ts_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_verdict",
             "description": (
                 "记录最终分析结论。分析完成后必须调用此工具，不得省略。\n"
@@ -193,7 +251,7 @@ def _load_system_prompt() -> str:
             "你是一位资深A股投资顾问。对给定股票做技术面+基本面综合分析，"
             "给出明确的判断方向和具体价位建议。分析完成后必须调用 record_verdict 工具记录结论。"
         )
-    return calibration.inject_into(base)
+    return evidence_attribution.inject_into(calibration.inject_into(base))
 
 
 def _dispatch_tool(name: str, tool_input: dict) -> str:
@@ -207,6 +265,102 @@ def _make_client(cfg: dict) -> OpenAI:
         api_key=cfg["deepseek"]["api_key"],
         base_url="https://api.deepseek.com",
     )
+
+
+def _fetch_forward_bars(ts_code: str, start_d: date, end_d: date) -> list[dict]:
+    """拉取 [start_d, end_d] 区间的日 K 线（升序）。失败返回 []。
+
+    复用 data.get_daily_price，注意它会 tail(60)——所以窗口超过 60 个交易日时，
+    最早的 entries 会拿不到前向收益（acceptable degradation）。
+    """
+    try:
+        raw = data.get_daily_price(
+            ts_code,
+            start_date=start_d.strftime("%Y%m%d"),
+            end_date=end_d.strftime("%Y%m%d"),
+        )
+        bars = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(bars, list):
+            return []
+        bars.sort(key=lambda b: str(b.get("trade_date", "")))
+        return bars
+    except Exception:
+        return []
+
+
+def _forward_return_pct(j_date: date, bars: list[dict],
+                        n_trading_days: int = 10,
+                        min_trading_days: int = 5) -> Optional[tuple[float, str, int]]:
+    """从 j_date 起算最多 N 个交易日的收益率（%）。
+
+    数据不足 N 天时降级到可用窗口，但至少需要 min_trading_days 天，否则返回 None。
+    返回 (pct, exit_trade_date, actual_n) 或 None。
+    """
+    if not bars:
+        return None
+    j_str = j_date.strftime("%Y%m%d")
+    entry_idx = None
+    for i, b in enumerate(bars):
+        td = str(b.get("trade_date", "")).replace("-", "")
+        if td >= j_str:
+            entry_idx = i
+            break
+    if entry_idx is None:
+        return None
+    available = len(bars) - 1 - entry_idx
+    if available < min_trading_days:
+        return None
+    actual_n = min(n_trading_days, available)
+    exit_idx = entry_idx + actual_n
+    p0 = bars[entry_idx].get("close")
+    p1 = bars[exit_idx].get("close")
+    if p0 in (None, 0) or p1 is None:
+        return None
+    try:
+        pct = (float(p1) - float(p0)) / float(p0) * 100
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return pct, str(bars[exit_idx].get("trade_date", "")), actual_n
+
+
+def _match_bullish_to_closed(
+    entries_sorted: list[dict],
+    closed_positions: list[dict],
+) -> dict[int, tuple[int, float]]:
+    """多头 journal ↔ 已结仓的去重匹配（贪心，按 delta 升序）。
+
+    每笔 closed 至多验证 1 条 bullish journal，每条 bullish journal 至多归因 1 笔 closed。
+    返回 {journal_idx → (closed_idx, pnl_pct)}。
+    """
+    pairs: list[tuple[int, int, int, float]] = []  # (delta, j_idx, c_idx, pnl_pct)
+    for j_idx, e in enumerate(entries_sorted):
+        if e.get("verdict") not in BULLISH_VERDICTS:
+            continue
+        try:
+            j_d = date.fromisoformat(e.get("date", ""))
+        except (TypeError, ValueError):
+            continue
+        for c_idx, c in enumerate(closed_positions):
+            try:
+                ed = date.fromisoformat((c.get("open") or {}).get("entry_date", ""))
+            except (TypeError, ValueError):
+                continue
+            delta = (ed - j_d).days
+            if 0 <= delta <= 14:
+                pnl = (c.get("close") or {}).get("realized_pnl_pct")
+                if pnl is not None:
+                    pairs.append((delta, j_idx, c_idx, float(pnl) * 100))
+    pairs.sort(key=lambda t: t[0])
+    used_j: set[int] = set()
+    used_c: set[int] = set()
+    out: dict[int, tuple[int, float]] = {}
+    for delta, j_idx, c_idx, pnl in pairs:
+        if j_idx in used_j or c_idx in used_c:
+            continue
+        used_j.add(j_idx)
+        used_c.add(c_idx)
+        out[j_idx] = (c_idx, pnl)
+    return out
 
 
 def _resolve_outcome_for_entry(entry: dict,
@@ -318,61 +472,107 @@ def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
     )
     recent = all_entries_sorted[:limit]
 
-    # 命中率统计：只用已结仓的可验证记录（outcome 含"实际 +/-X%"）
-    bullish_verdicts = ["bullish", "strong_bullish"]
-    bearish_verdicts = ["bearish", "strong_bearish"]
-    confirmed_bullish: list[float] = []   # 多头判断 + 已结仓 pnl
-    confirmed_bearish: list[float] = []   # 空头判断 + 已结仓 pnl
+    # 拉取覆盖所有 journal 日期的日 K 线，用于空头/未匹配多头的前向收益验证
+    bars: list[dict] = []
+    valid_dates: list[date] = []
+    for e in all_entries_sorted:
+        try:
+            valid_dates.append(date.fromisoformat(e.get("date") or ""))
+        except (TypeError, ValueError):
+            continue
+    if valid_dates:
+        bars = _fetch_forward_bars(
+            ts_code,
+            min(valid_dates) - timedelta(days=5),
+            max(valid_dates) + timedelta(days=30),
+        )
+
+    # 多头 ↔ 已结仓：去重 1:1 匹配
+    bullish_match = _match_bullish_to_closed(all_entries_sorted, closed_for_code)
+    confirmed_bullish: list[float] = [pnl for _, pnl in bullish_match.values()]
+
+    # 空头 → 10 日前向收益（A 股不能做空，用价格本身验证 "避开后确实跌了" 的判断）
+    confirmed_bearish: list[float] = []
+    outcome_by_idx: dict[int, str] = {}
+    for j_idx, e in enumerate(all_entries_sorted):
+        v = e.get("verdict", "")
+        # 多头匹配到已结仓 → 直接用实盘 pnl
+        if j_idx in bullish_match:
+            c_idx, pnl = bullish_match[j_idx]
+            cl = closed_for_code[c_idx].get("close") or {}
+            days = cl.get("days_held", "?")
+            reason = cl.get("exit_reason", "")
+            outcome_by_idx[j_idx] = f" → **实际 {pnl:+.2f}%**（持有 {days} 天，{reason}）"
+            continue
+        # 否则先看是否有持仓中匹配
+        active_outcome = _resolve_outcome_for_entry(e, [], active_for_code, current_price)
+        if active_outcome and "持仓中" in active_outcome:
+            outcome_by_idx[j_idx] = active_outcome
+            continue
+        # 最后用前向收益评估方向类判断（中性/观望不算）
+        if v in BULLISH_VERDICTS or v in BEARISH_VERDICTS:
+            try:
+                j_d = date.fromisoformat(e.get("date") or "")
+            except (TypeError, ValueError):
+                outcome_by_idx[j_idx] = " → 未跟进（日期缺失）"
+                continue
+            fr = _forward_return_pct(j_d, bars, n_trading_days=10, min_trading_days=5)
+            if fr is None:
+                outcome_by_idx[j_idx] = " → 未跟进（前向数据不足）"
+                continue
+            pct, _, actual_n = fr
+            if v in BEARISH_VERDICTS:
+                tag = "✅看跌命中" if pct < 0 else "❌看跌打脸"
+                confirmed_bearish.append(pct)
+                outcome_by_idx[j_idx] = f" → {actual_n}日后 {pct:+.2f}% {tag}"
+            else:
+                # 多头但未实际开仓 → 仅作为参考显示，不计入统计（避免实盘 pnl 与纸面收益混算）
+                tag = "✅看涨命中" if pct > 0 else "❌看涨打脸"
+                outcome_by_idx[j_idx] = f" → {actual_n}日后 {pct:+.2f}% {tag}（未跟进，纸面）"
+        else:
+            outcome_by_idx[j_idx] = " → 未跟进（未开仓）"
+
     confs_all: list[int] = []
     for e in all_entries_sorted:
-        outcome = _resolve_outcome_for_entry(e, closed_for_code, active_for_code, current_price)
         c = e.get("confidence")
         if c is not None:
             try:
                 confs_all.append(int(c))
             except (TypeError, ValueError):
                 pass
-        # 只统计能解析到数字的已结仓条目
-        import re as _re
-        m = _re.search(r"实际\s*([+-]?\d+\.?\d*)%", outcome)
-        if not m:
-            continue
-        pnl = float(m.group(1))
-        v = e.get("verdict", "")
-        if v in bullish_verdicts:
-            confirmed_bullish.append(pnl)
-        elif v in bearish_verdicts:
-            confirmed_bearish.append(pnl)
 
     stat_lines = []
-    total_verified = len(confirmed_bullish) + len(confirmed_bearish)
-    if total_verified > 0:
-        if confirmed_bullish:
-            hit = sum(1 for p in confirmed_bullish if p > 0)
-            med = sorted(confirmed_bullish)[len(confirmed_bullish) // 2]
-            stat_lines.append(
-                f"多头判断 {len(confirmed_bullish)} 次 → 盈利 {hit} 次 "
-                f"(命中率 {hit/len(confirmed_bullish)*100:.0f}%)，中位收益 {med:+.1f}%"
-            )
-        if confirmed_bearish:
-            hit = sum(1 for p in confirmed_bearish if p < 0)
-            med = sorted(confirmed_bearish)[len(confirmed_bearish) // 2]
-            stat_lines.append(
-                f"空头判断 {len(confirmed_bearish)} 次 → 亏损 {hit} 次（看跌命中）"
-                f"，中位收益 {med:+.1f}%"
-            )
-        if confs_all:
-            avg_conf = sum(confs_all) / len(confs_all)
-            stat_lines.append(f"历史平均置信度 {avg_conf:.1f}/10（共 {len(confs_all)} 次）")
+    if confirmed_bullish:
+        hit = sum(1 for p in confirmed_bullish if p > 0)
+        med = sorted(confirmed_bullish)[len(confirmed_bullish) // 2]
+        stat_lines.append(
+            f"多头判断 {len(confirmed_bullish)} 笔（实盘 pnl）→ 盈利 {hit} 笔 "
+            f"(命中率 {hit/len(confirmed_bullish)*100:.0f}%)，中位收益 {med:+.1f}%"
+        )
+    if confirmed_bearish:
+        hit = sum(1 for p in confirmed_bearish if p < 0)
+        med = sorted(confirmed_bearish)[len(confirmed_bearish) // 2]
+        stat_lines.append(
+            f"空头判断 {len(confirmed_bearish)} 次（5~10日前向收益）→ 后市下跌 {hit} 次 "
+            f"(看跌命中率 {hit/len(confirmed_bearish)*100:.0f}%)，中位收益 {med:+.1f}%"
+        )
+    if confs_all:
+        avg_conf = sum(confs_all) / len(confs_all)
+        stat_lines.append(f"历史平均置信度 {avg_conf:.1f}/10（共 {len(confs_all)} 次）")
+
     stat_block = (
-        "### 命中率统计（已结仓可验证 {} 次）\n".format(total_verified)
-        + ("\n".join(f"- {s}" for s in stat_lines) if stat_lines else "- 暂无已结仓记录可验证")
-        + "\n\n⚠️ **注意**：若命中率 < 50% 或中位收益为负，本次置信度需主动下调至少 2 分。"
+        f"### 命中率统计（多头={len(confirmed_bullish)}笔实盘 / "
+        f"空头={len(confirmed_bearish)}次前向收益）\n"
+        + ("\n".join(f"- {s}" for s in stat_lines) if stat_lines else "- 暂无可验证样本")
+        + "\n（命中率低对置信度的影响见下方"
+        "「置信度调整」表，不要在这里另算）"
         "\n\n### 近 {} 次分析记录\n".format(len(recent))
     )
 
+    idx_by_id = {id(e): i for i, e in enumerate(all_entries_sorted)}
     lines = []
     for e in recent:
+        j_idx = idx_by_id.get(id(e), -1)
         when = (e.get("analyzed_at") or e.get("date") or "?")[:16].replace("T", " ")
         verdict = e.get("verdict", "?")
         conf = e.get("confidence", "?")
@@ -380,9 +580,7 @@ def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
         entry_p = pa.get("entry") if pa.get("entry") is not None else "-"
         stop = pa.get("stop_loss") if pa.get("stop_loss") is not None else "-"
         target = pa.get("target") if pa.get("target") is not None else "-"
-        outcome = _resolve_outcome_for_entry(
-            e, closed_for_code, active_for_code, current_price,
-        )
+        outcome = outcome_by_idx.get(j_idx, " → 未跟进（未开仓）")
         lines.append(
             f"- {when} | {verdict} (置信度 {conf}/10) | 建议买入 {entry_p} 止损 {stop} 目标 {target}{outcome}"
         )
@@ -484,16 +682,151 @@ def _format_portfolio_context(candidate_ts_code: str) -> str:
                 )
 
         lines.append(
-            "\n**判断建议时必须考虑**："
-            "(a) 是否推高行业集中度？"
-            "(b) 总风险是否还有余量（上限内）？"
-            "(c) 是否与现有持仓形成对冲或重叠？"
-            "若加仓后会突破单一行业 ≥3 只或总风险逼近上限，应在结论里明确建议"
-            "**减仓 / 等待 / 替换持仓**而不是无脑加。"
+            "\n**判断时必须考虑**："
+            "(a) 是否推高行业集中度？(b) 总风险是否还有余量？(c) 与现有持仓是对冲还是重叠？"
+            "若加仓后会突破单一行业 ≥3 只或总风险逼近上限，结论里必须明确建议"
+            "**减仓 / 等待 / 替换持仓**而不是无脑加（对置信度的影响见下方调整表）。"
         )
         return "\n".join(lines)
     except Exception as e:
         return f"## 你的当前持仓上下文\n（加载失败: {type(e).__name__}: {e}）"
+
+
+def _format_market_context(ts_code: str) -> tuple[str, dict]:
+    """大盘 / 板块 / 资金面 / 个股相对强度 context。
+
+    返回 (formatted_str, raw_dict)：前者塞 prompt，后者存 journal。
+    设计原则：把判断逻辑（强势 / 弱势 / 跑赢）先在 Python 里算成 regime 标签，
+    AI 看到的是已经翻译过的结论而不是一堆数字，减小误读概率。
+    """
+    try:
+        raw = data.get_market_context(ts_code)
+        ctx = json.loads(raw)
+    except Exception as e:
+        return f"## 市场 context\n（加载失败: {type(e).__name__}: {e}）", {}
+
+    if not ctx.get("indices") and not ctx.get("sector") and not ctx.get("north_money"):
+        return "## 市场 context\n（数据全部加载失败，本次分析不可用此项）", ctx
+
+    lines = [f"## 市场 / 板块 / 资金面 context（截至 {ctx.get('as_of', '?')}）"]
+
+    # 大盘
+    if ctx.get("indices"):
+        lines.append("\n### 大盘指数")
+        for idx in ctx["indices"]:
+            parts = [f"{idx['name']} {idx['close']}"]
+            if idx.get("daily_chg_pct") is not None:
+                parts.append(f"今日 {idx['daily_chg_pct']:+.2f}%")
+            if idx.get("chg_5d_pct") is not None:
+                parts.append(f"5日 {idx['chg_5d_pct']:+.2f}%")
+            if idx.get("chg_20d_pct") is not None:
+                parts.append(f"20日 {idx['chg_20d_pct']:+.2f}%")
+            if idx.get("position_60d_pct") is not None:
+                parts.append(f"60日位置 {idx['position_60d_pct']:.0f}%")
+            if idx.get("vol_ratio_5d") is not None:
+                v = idx["vol_ratio_5d"]
+                vol_label = "放量" if v > 1.2 else ("缩量" if v < 0.8 else "平量")
+                parts.append(f"量比 {v:.2f}({vol_label})")
+            lines.append(f"- {' / '.join(parts)}")
+
+    # 板块
+    sector = ctx.get("sector")
+    if sector:
+        parts = []
+        if sector.get("daily_chg_pct") is not None:
+            parts.append(f"今日 {sector['daily_chg_pct']:+.2f}%")
+        if sector.get("chg_5d_pct") is not None:
+            parts.append(f"5日 {sector['chg_5d_pct']:+.2f}%")
+        if sector.get("chg_20d_pct") is not None:
+            parts.append(f"20日 {sector['chg_20d_pct']:+.2f}%")
+        lines.append(f"\n### 个股所属板块（{sector.get('name', '?')}）")
+        lines.append(f"- {' / '.join(parts) if parts else '（数据缺失）'}")
+    else:
+        lines.append("\n### 个股所属板块\n- （未能匹配申万 L1 行业，跳过；可能 tushare 权限不足）")
+
+    # 个股相对
+    sr = ctx.get("stock_relative")
+    if sr:
+        lines.append(f"\n### 个股 {ts_code} 相对强度")
+        self_parts = []
+        if sr.get("chg_5d_pct") is not None:
+            self_parts.append(f"5日 {sr['chg_5d_pct']:+.2f}%")
+        if sr.get("chg_20d_pct") is not None:
+            self_parts.append(f"20日 {sr['chg_20d_pct']:+.2f}%")
+        if self_parts:
+            lines.append(f"- 自身涨幅：{' / '.join(self_parts)}")
+        if sr.get("vs_index_5d_pct") is not None:
+            diff = sr["vs_index_5d_pct"]
+            label = "跑赢" if diff > 0 else "跑输"
+            lines.append(f"- vs {sr.get('ref_index_name', '大盘')} 5日：{label} {abs(diff):.2f}%")
+        if sr.get("vs_sector_5d_pct") is not None:
+            diff = sr["vs_sector_5d_pct"]
+            label = "跑赢" if diff > 0 else "跑输"
+            lines.append(f"- vs {sr.get('sector_name', '板块')} 5日：{label} {abs(diff):.2f}%")
+
+    # 北向
+    nm = ctx.get("north_money")
+    if nm:
+        parts = []
+        if nm.get("today_yi") is not None:
+            t = nm["today_yi"]
+            parts.append(f"今日{'净流入' if t >= 0 else '净流出'} {abs(t):.2f} 亿")
+        if nm.get("cumulative_5d_yi") is not None:
+            c = nm["cumulative_5d_yi"]
+            parts.append(f"5日累计{'净流入' if c >= 0 else '净流出'} {abs(c):.2f} 亿")
+        if parts:
+            lines.append("\n### 资金面（北向）")
+            lines.append(f"- {' / '.join(parts)}")
+
+    # 综合 regime 标签 —— 把判断写死在 Python 里，AI 直接读结论
+    lines.append("\n### 综合 regime 判断（Python 预计算，直接引用）")
+    regime: list[str] = []
+
+    hs300 = next((i for i in ctx.get("indices", []) if i["code"] == "000300.SH"), None)
+    hs300_5d = hs300.get("chg_5d_pct") if hs300 else None
+    if hs300_5d is not None:
+        if hs300_5d < -2:
+            regime.append("**大盘弱势**(沪深300 5日 < -2%)")
+        elif hs300_5d > 2:
+            regime.append("**大盘强势**(沪深300 5日 > +2%)")
+        else:
+            regime.append("大盘震荡")
+
+    sector_5d = sector.get("chg_5d_pct") if sector else None
+    if sector_5d is not None and hs300_5d is not None:
+        rel = sector_5d - hs300_5d
+        if rel > 1:
+            regime.append(f"**板块强势**({sector['name']}跑赢大盘 {rel:+.1f}%)")
+        elif rel < -1:
+            regime.append(f"**板块弱势**({sector['name']}跑输大盘 {rel:+.1f}%)")
+        else:
+            regime.append(f"板块同步({sector['name']})")
+
+    if sr and sr.get("vs_sector_5d_pct") is not None:
+        rel = sr["vs_sector_5d_pct"]
+        if rel > 1.5:
+            regime.append(f"**个股强于板块**({rel:+.1f}%)")
+        elif rel < -1.5:
+            regime.append(f"**个股弱于板块**({rel:+.1f}% — 板块涨它不涨是危险信号)")
+
+    if nm and nm.get("cumulative_5d_yi") is not None:
+        c = nm["cumulative_5d_yi"]
+        if c < -100:
+            regime.append(f"**北向 5 日大幅净流出** ({c:.0f} 亿)")
+        elif c > 100:
+            regime.append(f"**北向 5 日大幅净流入** (+{c:.0f} 亿)")
+
+    if regime:
+        lines.append("- " + " / ".join(regime))
+    else:
+        lines.append("- （数据不足，无法形成结论）")
+
+    lines.append(
+        "\n**裁判结论必须明确引用以上 regime 标签**；"
+        "对置信度的调整见下方「置信度调整」表，不要在这里另算。"
+    )
+
+    return "\n".join(lines), ctx
 
 
 def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
@@ -512,6 +845,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         journal.load_entries(ts_code=ts_code), ts_code=ts_code,
     )
     portfolio_block = _format_portfolio_context(ts_code)
+    market_block, market_ctx = _format_market_context(ts_code)
+    if on_progress:
+        on_progress("🌐 已注入大盘 / 板块 / 资金面 context")
 
     messages = [
         {"role": "system", "content": system},
@@ -521,46 +857,46 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"请分析股票 {ts_code}。\n\n"
                 f"## 该标的过往判断（最近 5 次，含实际后续表现）\n{history_block}\n\n"
                 f"{portfolio_block}\n\n"
+                f"{market_block}\n\n"
                 "步骤：\n"
-                "1) 调用 get_daily_price + get_fundamentals + get_stock_info 获取基础数据；\n"
-                "2) **强制 4 类博查搜索（缺任一类别 record_verdict 会被系统拒绝）**：\n"
-                "   · web_search(ts_code=..., category='earnings', name='公司名')\n"
-                "   · web_search(ts_code=..., category='shareholders', name='公司名')\n"
-                "   · web_search(ts_code=..., category='regulatory', name='公司名')\n"
-                "   · web_search(ts_code=..., category='money_flow', name='公司名')\n"
-                "   可按需追加可选类别：corporate_actions / research / industry / general。\n"
-                "   结果按信任度排序：site=cninfo/sse/szse 权重最高，自媒体仅作参考。\n"
-                "   若某 category 召回为空，在 evidence 里明确写「该类别无召回」，**不要跳过该调用**；\n"
+                "1) 数据：调用 get_daily_price + get_fundamentals + get_stock_info\n"
                 "\n"
-                "3) **强制三段式辩论结构（写在 message content 里，不是 tool 调用）**：\n"
+                "   **结构化补充工具（推荐使用，但非强制）**：\n"
+                "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
+                "   · get_dragon_tiger_list — 龙虎榜上榜情况；用于判断游资炒作 / 机构动向\n"
+                "   这两个工具的返回是结构化数字，比 web_search 召回的新闻 snippet 可直接引用，"
+                "   优先用它们的数据填 evidence；web_search 仍负责覆盖广度。\n"
                 "\n"
-                "   ### 一、多头论点（≥3 条，每条格式：数据点 → 推论）\n"
-                "   - 示例：close=12.34 上穿 MA20=11.80（4 日前），且 vol_ratio=1.8 → 突破有量，趋势确立\n"
-                "   - 必须引用 K 线/基本面/消息面的具体数字，禁止空话\n"
+                "2) 博查 4 类强制（缺一类 record_verdict 被拒）：earnings / shareholders / regulatory / money_flow。\n"
+                "   按需加 corporate_actions / research / industry / general。若召回为空，evidence 里明确写「该类别无召回」，**不要跳过调用**。\n"
                 "\n"
-                "   ### 二、空头论点（≥3 条，禁止使用「虽然 X 但是 Y」的弱化句式）\n"
-                "   - 每条必须是独立的、能站住脚的反方证据，不是给多头让步的修饰\n"
-                "   - 至少有 1 条必须直接反驳多头某条具体论点（指名道姓：「多头第 N 条认为..., 但 ...」）\n"
-                "   - 必须考虑：估值是否偏高？是否有解禁/减持？行业是否处于景气下行？\n"
-                "     技术面是否有背离（如价创新高但 RSI 走低）？历史回撤幅度？\n"
-                "\n"
+                "3) 三段式辩论（写在 message content 里）：\n"
+                "   ### 一、多头论点（≥3 条，格式：数据点 → 推论）\n"
+                "   引用 K 线/基本面/消息面的具体数字，禁空话。\n"
+                "   ### 二、空头论点（≥3 条，禁「虽然 X 但是 Y」）\n"
+                "   独立反方证据；至少 1 条直接反驳多头第 N 条；必须考虑估值/解禁减持/行业景气/技术背离/历史回撤。\n"
                 "   ### 三、裁判结论\n"
-                "   - 多空双方各自最硬的 1 条证据是什么？\n"
-                "   - 双方互斥的核心矛盾点：哪些证据导致多空无法共存？倾向哪边？为什么？\n"
-                "   - 最终方向（verdict）+ 原始置信度（initial_confidence，1-10）\n"
-                "   - **置信度扣减规则（强制执行）**：\n"
-                "     · 每存在 1 条「空头论点在第三段未被有效反驳」→ 置信度 −1\n"
-                "     · 历史命中率 < 50% 或中位收益为负 → 再 −2\n"
-                "     · 加仓会突破行业集中度（≥3 只同行业）或总风险逼近上限 → 再 −1\n"
-                "   - 列出每一项扣减的具体数额，给出最终 final_confidence\n"
+                "   多空各自最硬的 1 条；互斥矛盾点 → 倾向哪边？为什么？\n"
+                "   最终 verdict + initial_confidence (1-10)\n"
                 "\n"
-                "4) **结合持仓上下文**：参考上方持仓行业分布与总风险，"
-                "若加仓会突破集中度或总风险，要在裁判结论里明确说出来并执行上面的扣减；\n"
+                "4) **置信度调整（一次性结算）**：以 initial_confidence 为基准，遍历下表逐条结算。\n"
+                "   最终 final_confidence = clamp(initial − 扣减总和 + 加分总和, 1, 10)。\n"
+                "   在裁判结论里逐条列出命中的规则与具体数额。\n"
                 "\n"
-                "5) 最后调用 record_verdict 工具：\n"
-                "   · `confidence` 填扣减后的 final_confidence（不是原始值）；\n"
-                "   · `evidence` 字段填 ≥3 条裁判结论里采纳的关键证据，"
-                "格式：数据点 → 推论，必须引用真实数字。"
+                "   | 条件 | 调整 |\n"
+                "   |---|---|\n"
+                "   | 历史命中率 < 50% 或中位收益为负 | **−2** |\n"
+                "   | 每条「空头论点未被第三段有效反驳」 | **−1/条** |\n"
+                "   | 加仓突破行业集中度（≥3 同行业）或总风险逼近上限 | **−1** |\n"
+                "   | 多头判断 + 大盘弱势（沪深300 5日 < −2%） | **−1** |\n"
+                "   | 多头判断 + 板块跑输大盘（5日 差 < −1%） | **−1** |\n"
+                "   | 多头判断 + 个股跑输板块（5日 差 < −1.5%） | **−1** |\n"
+                "   | 多头判断 + 板块强于大盘（5日 差 ≥ +1.5%） | **+1** |\n"
+                "   | 多头判断 + 业绩超预期（最近季度净利润 yoy ≥ +30%）且 PE_TTM ≤ 30 | **+1** |\n"
+                "   | 空头判断 + ST/退市风险 或 监管立案/处罚 | **+1** |\n"
+                "   | 空头判断 + regime 弱势（任一 regime 利空命中） | 顺势，不扣不加 |\n"
+                "\n"
+                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。"
             ),
         },
     ]
@@ -642,6 +978,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                     "get_fundamentals": f"🏦 拉取基本面 {label_extra}",
                     "get_stock_info": f"ℹ️ 查询公司信息 {label_extra}",
                     "web_search": f"🔍 博查搜索 {label_extra}",
+                    "get_dragon_tiger_list": f"🐲 龙虎榜查询 {label_extra}",
+                    "get_unlock_schedule": f"🔓 限售解禁查询 {label_extra}",
                 }
                 if on_progress:
                     on_progress(tool_labels.get(name, f"🔧 {name}"))
@@ -678,6 +1016,12 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
 
     raw_verdict = verdict_data["verdict"]
     raw_confidence = verdict_data.get("confidence")
+    # AI 自报置信度兜底：clamp 到 [1, 10]，避免扣减规则叠加把分扣穿
+    if raw_confidence is not None:
+        try:
+            raw_confidence = max(1, min(10, int(raw_confidence)))
+        except (TypeError, ValueError):
+            raw_confidence = None
     cal_score: Optional[float] = None
     cal_explanation = ""
     if raw_confidence is not None:
@@ -685,6 +1029,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             cal_score, cal_explanation = calibration.calibrate_confidence(
                 int(raw_confidence), raw_verdict,
             )
+            if cal_score is not None:
+                cal_score = max(1.0, min(10.0, float(cal_score)))
         except Exception as e:
             cal_explanation = f"校准失败: {e}"
 
@@ -705,8 +1051,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "features": verdict_data.get("features", {}),
         "evidence": verdict_data.get("evidence", []),
         "searches_performed": searches_performed,
+        "market_context": market_ctx,
         "analysis_text": analysis_text.strip(),
-        "prompt_version": "2.4.0",
+        "prompt_version": "2.5.0",
         "source": "standalone",
     }
 
