@@ -11,7 +11,7 @@ _TZ_CN = timezone(timedelta(hours=8))
 
 from openai import OpenAI
 
-from apex import config, data, journal, calibration, evidence_attribution
+from apex import config, data, journal, calibration, evidence_attribution, trace as trace_mod
 from apex.schemas import VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS
 
 
@@ -832,8 +832,9 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
 def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     """
     Run full agent analysis for ts_code via DeepSeek API.
-    on_progress(msg: str) is called at each tool call for live UI updates.
-    Returns the parsed verdict dict. Saves to journal if save=True.
+    on_progress(event: dict) is called for each milestone (context injection /
+    AI assistant text / tool call / tool result / verdict). See apex/trace.py
+    for event schema. Returns the parsed verdict dict. Saves to journal if save=True.
     """
     cfg = config.get()
     model = cfg["deepseek"]["model"]
@@ -841,13 +842,24 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     client = _make_client(cfg)
     system = _load_system_prompt()
 
+    events: list[dict] = []
+
+    def _emit(event: dict) -> None:
+        events.append(event)
+        if on_progress:
+            try:
+                on_progress(event)
+            except Exception:
+                pass
+
     history_block = _format_history(
         journal.load_entries(ts_code=ts_code), ts_code=ts_code,
     )
     portfolio_block = _format_portfolio_context(ts_code)
     market_block, market_ctx = _format_market_context(ts_code)
-    if on_progress:
-        on_progress("🌐 已注入大盘 / 板块 / 资金面 context")
+    _emit({"type": "context", "name": "history", "content": history_block})
+    _emit({"type": "context", "name": "portfolio", "content": portfolio_block})
+    _emit({"type": "context", "name": "market", "content": market_block})
 
     messages = [
         {"role": "system", "content": system},
@@ -918,9 +930,14 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         choice = response.choices[0]
         msg = choice.message
 
-        # Collect text content
+        # Collect text content + emit as event
         if msg.content:
             analysis_text += msg.content
+            _emit({
+                "type": "assistant_text",
+                "iteration": iteration,
+                "content": msg.content,
+            })
 
         # Check termination
         if choice.finish_reason != "tool_calls":
@@ -939,8 +956,16 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             name = tool_call.function.name
             try:
                 tool_input = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
+            except json.JSONDecodeError:
                 tool_input = {}
+
+            _emit({
+                "type": "tool_call",
+                "iteration": iteration,
+                "tool_call_id": tool_call.id,
+                "name": name,
+                "args": tool_input,
+            })
 
             if name == "record_verdict":
                 missing = [
@@ -958,35 +983,40 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         "missing_categories": missing,
                         "performed": searches_performed,
                     }, ensure_ascii=False)
-                    if on_progress:
-                        on_progress(f"⛔ 拒绝记录结论，缺类别: {missing}")
+                    _emit({
+                        "type": "verdict_rejected",
+                        "iteration": iteration,
+                        "tool_call_id": tool_call.id,
+                        "missing": missing,
+                        "performed": list(searches_performed),
+                    })
                 else:
                     verdict_data = tool_input
                     result = "verdict recorded"
-                    if on_progress:
-                        on_progress(f"📝 记录结论: {verdict_data.get('verdict')}")
+                    _emit({
+                        "type": "verdict_recorded",
+                        "iteration": iteration,
+                        "tool_call_id": tool_call.id,
+                        "verdict": verdict_data.get("verdict"),
+                        "confidence": verdict_data.get("confidence"),
+                    })
             else:
                 if name == "web_search":
                     cat = tool_input.get("category", "general")
                     if cat not in searches_performed:
                         searches_performed.append(cat)
-                    label_extra = f"[{cat}] " + (tool_input.get('name') or tool_input.get('industry') or tool_input.get('query') or tool_input.get('ts_code', ''))
-                else:
-                    label_extra = tool_input.get('ts_code', '')
-                tool_labels = {
-                    "get_daily_price": f"📊 拉取K线数据 {label_extra}",
-                    "get_fundamentals": f"🏦 拉取基本面 {label_extra}",
-                    "get_stock_info": f"ℹ️ 查询公司信息 {label_extra}",
-                    "web_search": f"🔍 博查搜索 {label_extra}",
-                    "get_dragon_tiger_list": f"🐲 龙虎榜查询 {label_extra}",
-                    "get_unlock_schedule": f"🔓 限售解禁查询 {label_extra}",
-                }
-                if on_progress:
-                    on_progress(tool_labels.get(name, f"🔧 {name}"))
                 try:
                     result = _dispatch_tool(name, tool_input)
                 except Exception as e:
                     result = json.dumps({"error": str(e)})
+                _emit({
+                    "type": "tool_result",
+                    "iteration": iteration,
+                    "tool_call_id": tool_call.id,
+                    "name": name,
+                    "summary": trace_mod.summarize_tool_result(name, result),
+                    "raw": result,
+                })
 
             messages.append({
                 "role": "tool",
@@ -1009,6 +1039,12 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 final_text = final.choices[0].message.content
                 if final_text:
                     analysis_text += "\n" + final_text
+                    _emit({
+                        "type": "assistant_text",
+                        "iteration": iteration,
+                        "content": final_text,
+                        "final": True,
+                    })
                 break
 
     if not verdict_data:
@@ -1059,6 +1095,11 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
 
     if save:
         journal.write_entry(entry)
+        try:
+            trace_mod.write_trace(ts_code, entry["analyzed_at"], events)
+        except Exception as e:
+            print(f"⚠ trace 写入失败（不影响 journal）: {e}")
         print(f"✓ 已保存到日志: {ts_code} → {entry['verdict']} (置信度 {entry['confidence']})")
 
+    entry["_trace_events"] = events  # 当前会话直接用，不序列化到 journal
     return entry

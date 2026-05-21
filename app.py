@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from apex import config as cfg_module
 cfg_module.load()
 
-from apex import watchlist as wl_mod, journal, data, account as account_mod, monitor, postmortem, calibration
+from apex import watchlist as wl_mod, journal, data, account as account_mod, monitor, postmortem, calibration, trace as trace_mod
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="apex 交易系统", page_icon="📈", layout="wide")
@@ -79,6 +79,133 @@ def _render_last_analysis(ts_code: str):
     text = last.get("analysis_text") or ""
     if text:
         st.markdown(text)
+
+
+@st.dialog("AI 分析过程详情", width="large")
+def _show_trace_dialog(ts_code: str, analyzed_at: str):
+    """先用 session_state 里的内存 events（刚跑完的、含 save=False 的情况），
+    再 fallback 到 trace.jsonl 文件（历史记录）。"""
+    st.caption(f"{ts_code} · {analyzed_at}")
+    events = None
+    last = st.session_state.get("last_analysis")
+    if (
+        isinstance(last, dict)
+        and last.get("ts_code") == ts_code
+        and last.get("analyzed_at") == analyzed_at
+        and last.get("_trace_events")
+    ):
+        events = last["_trace_events"]
+    if not events:
+        rec = trace_mod.load_trace(ts_code, analyzed_at)
+        events = (rec or {}).get("events") or []
+    if not events:
+        st.warning("未找到此次分析的过程记录（可能未保存日志或在此功能上线前已分析）。")
+        return
+    st.caption(f"共 {len(events)} 个事件 · 默认全部折叠，点击展开看详情")
+    for i, ev in enumerate(events):
+        render_trace_event(ev, key_prefix=f"trace-{i}-")
+
+
+_TOOL_EMOJI = {
+    "get_daily_price": "📊",
+    "get_fundamentals": "🏦",
+    "get_stock_info": "ℹ️",
+    "web_search": "🔍",
+    "get_dragon_tiger_list": "🐲",
+    "get_unlock_schedule": "🔓",
+    "record_verdict": "📝",
+}
+
+
+def render_trace_event(event: dict, key_prefix: str = "") -> None:
+    """Render one trace event as a folded st.expander. Default-collapsed.
+
+    `key_prefix` ensures expander keys are unique when rendering history alongside live runs.
+    """
+    t = event.get("type", "")
+
+    if t == "context":
+        name = event.get("name", "")
+        content = event.get("content", "")
+        title_map = {
+            "history": f"📜 注入 历史分析 context ({len(content)} 字)",
+            "portfolio": f"💼 注入 持仓 context ({len(content)} 字)",
+            "market": f"🌐 注入 大盘/板块/资金面 context ({len(content)} 字)",
+        }
+        with st.expander(title_map.get(name, f"📦 context: {name}"), expanded=False):
+            st.markdown(content)
+
+    elif t == "assistant_text":
+        content = event.get("content", "")
+        first_line = content.strip().split("\n", 1)[0][:80]
+        final_tag = " (最终)" if event.get("final") else ""
+        iter_n = event.get("iteration", "?")
+        with st.expander(f"💭 AI 思考 iter {iter_n}{final_tag}：{first_line}", expanded=False):
+            st.markdown(content)
+
+    elif t == "tool_call":
+        name = event.get("name", "")
+        args = event.get("args", {}) or {}
+        emoji = _TOOL_EMOJI.get(name, "🔧")
+        if name == "web_search":
+            cat = args.get("category", "?")
+            label = args.get("name") or args.get("industry") or args.get("query") or args.get("ts_code", "")
+            title = f"{emoji} 调用 {name}[{cat}] {label}"
+        else:
+            label = args.get("ts_code", "") or args.get("verdict", "")
+            title = f"{emoji} 调用 {name}({label})"
+        with st.expander(title, expanded=False):
+            st.markdown("**入参**")
+            st.json(args)
+
+    elif t == "tool_result":
+        name = event.get("name", "")
+        summary = event.get("summary", {}) or {}
+        raw = event.get("raw", "")
+        if "error" in summary:
+            title = f"❌ 返回 {name}：{str(summary['error'])[:60]}"
+        elif name == "web_search":
+            title = f"✅ 返回 {name}[{summary.get('category', '?')}] 命中 {summary.get('count', 0)} 条"
+        elif name == "get_daily_price":
+            title = f"✅ 返回 {name}：{summary.get('bars', '?')} 根K线，最新收盘 {summary.get('close', '?')}"
+        elif name == "get_fundamentals":
+            title = f"✅ 返回 {name}：PE={summary.get('pe', '-')} PB={summary.get('pb', '-')}"
+        elif name == "get_stock_info":
+            title = f"✅ 返回 {name}：{summary.get('name', '?')} / {summary.get('industry', '?')}"
+        elif name == "get_dragon_tiger_list":
+            title = f"✅ 返回 {name}：近 {summary.get('window_days', '?')} 天上榜 {summary.get('list_count', 0)} 次"
+        elif name == "get_unlock_schedule":
+            title = (
+                f"✅ 返回 {name}：未来 {summary.get('future_count', 0)} 次 / "
+                f"历史 {summary.get('history_count', 0)} 次"
+            )
+        else:
+            title = f"✅ 返回 {name}"
+        with st.expander(title, expanded=False):
+            st.markdown("**结果摘要**")
+            st.json(summary)
+            if raw:
+                st.markdown("**原始返回 JSON**")
+                raw_str = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2)
+                st.code(raw_str[:20000], language="json")
+                if len(raw_str) > 20000:
+                    st.caption(f"（已截断显示前 20000 字符，原始长度 {len(raw_str)}）")
+
+    elif t == "verdict_rejected":
+        missing = event.get("missing", [])
+        with st.expander(f"⛔ 记录结论被拒：缺类别 {missing}", expanded=False):
+            st.markdown(f"- 已完成类别：{event.get('performed', [])}")
+            st.markdown(f"- 缺失类别：{missing}")
+
+    elif t == "verdict_recorded":
+        with st.expander(
+            f"📝 记录结论：{event.get('verdict', '?')}（置信度 {event.get('confidence', '?')}/10）",
+            expanded=False,
+        ):
+            st.json({k: v for k, v in event.items() if k != "type"})
+
+    else:
+        st.caption(f"❓ 未知事件 type={t}：{event}")
 
 
 _DIR_MAP = {"向下跌破": "below", "向上突破": "above"}
@@ -898,25 +1025,51 @@ with tab_analyze:
                 if pa.get("entry"):
                     st.caption(f"建议买入 {pa['entry']}  止损 {pa.get('stop_loss','?')}  目标 {pa.get('target','?')}")
 
+        # Trace stream lives in the left column so the right column's final result
+        # stays in view without scrolling.
+        if run_btn and ts_code_analyze:
+            st.markdown("---")
+            st.markdown("### 🛰 分析过程")
+            st.caption("每一步默认折叠，点击展开看入参 / 返回 / AI 思考")
+            trace_status_container = st.container()
+            trace_container = st.container()
+        else:
+            trace_status_container = None
+            trace_container = None
+
     with col_out:
         if run_btn and ts_code_analyze:
             code = ts_code_analyze
-            progress_msgs = []
 
-            with st.status(f"分析 {code} 中...", expanded=True) as status:
-                def on_progress(msg):
-                    st.write(msg)
-                    progress_msgs.append(msg)
+            with trace_status_container:
+                status = st.status(f"分析 {code} 中...", expanded=True)
 
-                try:
-                    from apex import analyze as ana
-                    result = ana.run(code, save=save_journal, on_progress=on_progress)
-                    st.session_state["last_analysis"] = result
-                    status.update(label=f"✓ 分析完成", state="complete")
-                except Exception as e:
-                    status.update(label=f"✗ 分析失败: {e}", state="error")
-                    st.error(str(e))
-                    result = None
+            def on_progress(event):
+                with trace_container:
+                    render_trace_event(event)
+                t = event.get("type", "")
+                if t == "tool_call":
+                    status.write(f"🔧 调用 {event.get('name', '?')}")
+                elif t == "tool_result":
+                    status.write(f"  ↳ 返回 {event.get('name', '?')}")
+                elif t == "assistant_text":
+                    status.write(f"💭 AI 思考 (iter {event.get('iteration', '?')})")
+                elif t == "context":
+                    status.write(f"🌐 注入 {event.get('name', '?')} context")
+                elif t == "verdict_recorded":
+                    status.write(f"📝 记录结论 {event.get('verdict', '?')}")
+                elif t == "verdict_rejected":
+                    status.write(f"⛔ 结论被拒（缺类别）")
+
+            try:
+                from apex import analyze as ana
+                result = ana.run(code, save=save_journal, on_progress=on_progress)
+                st.session_state["last_analysis"] = result
+                status.update(label=f"✓ 分析完成", state="complete")
+            except Exception as e:
+                status.update(label=f"✗ 分析失败: {e}", state="error")
+                st.error(str(e))
+                result = None
 
             if result:
                 verdict = result.get("verdict", "")
@@ -950,6 +1103,14 @@ with tab_analyze:
                     with st.expander("完整分析", expanded=True):
                         st.markdown(result["analysis_text"])
 
+                analyzed_at_ev = result.get("analyzed_at") or ""
+                if analyzed_at_ev:
+                    if st.button(
+                        "🛰 查看 AI 分析过程",
+                        key=f"trace_btn_live_{result.get('ts_code', '')}_{analyzed_at_ev}",
+                    ):
+                        _show_trace_dialog(result.get("ts_code", ""), analyzed_at_ev)
+
         elif "last_analysis" in st.session_state and not run_btn:
             r = st.session_state["last_analysis"]
             if r.get("ts_code") == ts_code_analyze:
@@ -969,6 +1130,14 @@ with tab_analyze:
                 if result.get("analysis_text"):
                     with st.expander("分析内容", expanded=False):
                         st.markdown(result["analysis_text"])
+
+                analyzed_at_ev = result.get("analyzed_at") or ""
+                if analyzed_at_ev:
+                    if st.button(
+                        "🛰 查看 AI 分析过程",
+                        key=f"trace_btn_rerun_{result.get('ts_code', '')}_{analyzed_at_ev}",
+                    ):
+                        _show_trace_dialog(result.get("ts_code", ""), analyzed_at_ev)
 
         # ── Add to Watchlist (shown after any analysis, persists across rerenders) ──
         r = st.session_state.get("last_analysis")
@@ -1119,6 +1288,15 @@ with tab_analyze:
                 if text:
                     st.markdown("**完整分析**")
                     st.markdown(text)
+
+                # 分析过程（trace）按钮 —— dialog 弹出，避免嵌套 expander
+                analyzed_at_full = ent.get("analyzed_at") or ""
+                if analyzed_at_full:
+                    if st.button(
+                        "🛰 查看 AI 分析过程",
+                        key=f"hist_trace_btn_{ts_code_analyze}_{pick}",
+                    ):
+                        _show_trace_dialog(ts_code_analyze, analyzed_at_full)
 
 
 # ── Tab 3: Backtest ──────────────────────────────────────────────────────────
