@@ -43,7 +43,7 @@ def _build_tool_schema() -> dict:
         "type": "function",
         "function": {
             "name": "select_strategies",
-            "description": "决定今日 4 个策略的权重分配。必须调用此工具。",
+            "description": f"决定今日 {len(_strategy_names())} 个策略的权重分配。必须调用此工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -141,7 +141,7 @@ def _format_candidates_block(counts: dict[str, int]) -> str:
 
 def _build_prompt(regime: Optional[dict], counts: dict[str, int]) -> str:
     regime_label = (regime or {}).get("label")
-    return f"""你是 A 股选股策略的总指挥。今天需要决定 4 个策略的权重分配，让 screener 按权重融合候选股。
+    return f"""你是 A 股选股策略的总指挥。今天需要决定各策略的权重分配，让 screener 按权重融合候选股。
 
 # 今日市场 regime
 {regime_mod.format_for_prompt(regime)}
@@ -230,12 +230,13 @@ def select(regime: Optional[dict],
         resp = client.chat.completions.create(
             model=use_model,
             messages=[
-                {"role": "system", "content": "你是 A 股选股策略的总指挥，必须调用工具输出策略权重。"},
+                {"role": "system", "content": "你是 A 股选股策略的总指挥。你必须调用 select_strategies 工具来输出权重，不要用文字代替。"},
                 {"role": "user", "content": prompt},
             ],
             tools=[tool],
-            tool_choice={"type": "function", "function": {"name": "select_strategies"}},
-            max_tokens=512,
+            max_tokens=4096,
+            reasoning_effort="medium",
+            extra_body={"thinking": {"type": "enabled"}},
         )
     except Exception as e:
         if on_progress:
@@ -243,7 +244,10 @@ def select(regime: Optional[dict],
         return _equal_weights(), f"AI 调用失败 ({type(e).__name__}): {e}"
 
     try:
-        tc = resp.choices[0].message.tool_calls[0]
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            return _equal_weights(), "AI 未调用工具，等权回落"
+        tc = msg.tool_calls[0]
         args = json.loads(tc.function.arguments)
     except Exception as e:
         return _equal_weights(), f"AI 输出解析失败: {e}"

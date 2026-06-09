@@ -1520,6 +1520,7 @@ _SIGNAL_ICONS = {
     "industry": "🔥",
     "northbound": "🌊",
     "concept": "💎",
+    "limit_up_history": "📜",
 }
 _SIGNAL_LABELS = {
     "dragon_tiger": "龙虎榜",
@@ -1527,6 +1528,7 @@ _SIGNAL_LABELS = {
     "industry": "强势行业",
     "northbound": "北向加仓",
     "concept": "概念龙头",
+    "limit_up_history": "近期涨停",
 }
 
 
@@ -1539,10 +1541,133 @@ with tab_screen:
 
     st.subheader("今日粗筛 — 多策略 → AI 复核（含 actionable）")
     st.caption(
-        "5 信号源 → 4 个策略各自 select+score（首板龙头/机构资金/行业轮动/龙头放量）→ "
-        "按权重融合 Top N → AI 60s 打分（含 actionable 评级，过滤一字板/4+ 连板）。"
-        "S1 等权融合；S2 起 AI 看 regime + 历史胜率自动选权重。"
+        "6 信号源（含近20日涨停历史）→ 7 个策略 select+score（首板/机构/轮动/龙头放量/"
+        "**回踩均线/多头排列/放量突破**）→ 按权重融合 Top N → AI 60s 打分。"
+        "下面可手动选择策略组合和权重。"
     )
+
+    # ── 策略组合配置 ──────────────────────────────────────────
+    from apex.strategies import STRATEGIES as _STRAT_MODULES
+
+    _STRAT_CN = {
+        "first_board_leader": "首板龙头",
+        "institutional_flow": "机构资金",
+        "industry_rotation": "行业轮动",
+        "leader_with_volume": "龙头放量",
+        "pullback_to_ma": "回踩均线",
+        "bullish_alignment": "多头排列",
+        "volume_breakout": "放量突破",
+    }
+    _STRAT_ICONS = {
+        "first_board_leader": "🚀",
+        "institutional_flow": "🏦",
+        "industry_rotation": "🔄",
+        "leader_with_volume": "🐉",
+        "pullback_to_ma": "📉",
+        "bullish_alignment": "📈",
+        "volume_breakout": "💥",
+    }
+
+    _PRESET_AUTO = "均衡（AI 自动选权重）"
+    _PRESETS = [
+        _PRESET_AUTO,
+        "稳健（技术面+机构）",
+        "激进（打板+放量）",
+        "纯技术面（均线+量能）",
+        "自定义",
+    ]
+    _PRESET_WEIGHTS = {
+        "稳健（技术面+机构）": {
+            "pullback_to_ma": 0.28, "bullish_alignment": 0.22,
+            "institutional_flow": 0.22, "industry_rotation": 0.16,
+            "volume_breakout": 0.12, "first_board_leader": 0.0,
+            "leader_with_volume": 0.0,
+        },
+        "激进（打板+放量）": {
+            "first_board_leader": 0.25, "leader_with_volume": 0.25,
+            "volume_breakout": 0.20, "pullback_to_ma": 0.12,
+            "bullish_alignment": 0.10, "institutional_flow": 0.05,
+            "industry_rotation": 0.03,
+        },
+        "纯技术面（均线+量能）": {
+            "pullback_to_ma": 0.30, "bullish_alignment": 0.28,
+            "volume_breakout": 0.22, "industry_rotation": 0.20,
+            "first_board_leader": 0.0, "leader_with_volume": 0.0,
+            "institutional_flow": 0.0,
+        },
+    }
+
+    # Default: AI auto
+    strategy_weights: dict | None = None
+
+    with st.expander("📐 策略组合配置", expanded=True):
+        preset = st.selectbox("预设组合方案", _PRESETS, key="_screen_preset")
+
+        if preset == _PRESET_AUTO:
+            st.caption(
+                "全部 7 个策略启用，AI 根据当前市场 regime + 历史胜率自动分配权重。"
+                "勾选「仅规则层（跳过 AI）」时仍使用 AI 选权（未被跳过）。"
+            )
+        else:
+            if preset == "自定义":
+                weights = st.session_state.get("_screen_custom_weights", {})
+                if not weights:
+                    eq = round(1.0 / len(_STRAT_MODULES), 4)
+                    weights = {n: eq for n in _STRAT_MODULES}
+            else:
+                weights = dict(_PRESET_WEIGHTS.get(preset, {}))
+                for name in _STRAT_MODULES:
+                    weights.setdefault(name, 0.0)
+
+            st.caption("勾选 = 启用，拖拽滑块调权重。按任意值调整，提交时自动归一化。")
+
+            for name in _STRAT_MODULES:
+                label = _STRAT_CN.get(name, name)
+                icon = _STRAT_ICONS.get(name, "")
+                cur_w = weights.get(name, 0.0)
+                enabled = cur_w > 0
+
+                c1, c2, c3, c4 = st.columns([1, 3, 2, 4])
+                c1.write(icon)
+                c2.write(f"**{label}**")
+
+                if preset == "自定义":
+                    en = c3.checkbox(
+                        "", value=enabled,
+                        label_visibility="collapsed",
+                        key=f"_sc_en_{name}",
+                    )
+                    if en:
+                        w = c4.slider(
+                            "", 0.0, 1.0, value=max(cur_w, 0.05), step=0.05,
+                            label_visibility="collapsed",
+                            key=f"_sc_w_{name}",
+                        )
+                    else:
+                        w = 0.0
+                        c4.caption("已关闭")
+                else:
+                    c3.write("✅" if enabled else "—")
+                    c4.write(f"{cur_w:.0%}")
+
+                weights[name] = w
+
+            total_w = sum(v for v in weights.values() if v > 0)
+            if total_w <= 0:
+                st.warning("至少启用一个策略！")
+            else:
+                norm = {n: round(v / total_w, 4) for n, v in weights.items()}
+                n_enabled = sum(1 for v in weights.values() if v > 0)
+                if preset == "自定义":
+                    st.session_state["_screen_custom_weights"] = weights
+                weight_desc = ", ".join(
+                    f"{_STRAT_CN.get(n, n)}={w:.0%}"
+                    for n, w in norm.items() if w > 0
+                )
+                st.caption(f"启用 {n_enabled}/{len(_STRAT_MODULES)} 个 ｜ {weight_desc}")
+
+                if preset != _PRESET_AUTO:
+                    strategy_weights = norm
 
     available_dates = screener_mod.list_available_dates()
 
@@ -1573,7 +1698,11 @@ with tab_screen:
 
         try:
             with st.spinner("正在拉取信号 + 评分..."):
-                result = screener_mod.run(on_progress=_on_progress, skip_ai=skip_ai)
+                result = screener_mod.run(
+                    on_progress=_on_progress,
+                    skip_ai=skip_ai,
+                    strategy_weights=strategy_weights,
+                )
             st.success(
                 f"✓ 完成：{result['total_candidates']} 只候选 → "
                 f"Top {len(result['top_scored'])}"

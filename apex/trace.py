@@ -190,6 +190,43 @@ def summarize_get_unlock_schedule(raw) -> dict:
     return summary
 
 
+def summarize_mx_data_query(raw) -> dict:
+    data = _safe_parse(raw)
+    if not isinstance(data, dict):
+        return {"note": "返回不可解析"}
+    if data.get("error"):
+        return {"error": data["error"]}
+    tables = data.get("tables") or []
+    entities = []
+    for t in tables:
+        rows = t.get("rows") or []
+        entities.append({"entity": t.get("entity", ""), "rows": len(rows)})
+    return {"source": "mx:data", "query": data.get("query"), "tables": entities}
+
+
+def summarize_mx_news_search(raw) -> dict:
+    data = _safe_parse(raw)
+    if not isinstance(data, dict):
+        return {"note": "返回不可解析"}
+    if data.get("error"):
+        return {"error": data["error"]}
+    results = data.get("results") or []
+    top = []
+    for r in results[:5]:
+        top.append({"title": r.get("title", "")[:50], "type": r.get("type"), "date": r.get("date")})
+    return {"source": "mx:news", "query": data.get("query"), "count": data.get("count"), "top5": top}
+
+
+def summarize_mx_stock_screen(raw) -> dict:
+    data = _safe_parse(raw)
+    if not isinstance(data, dict):
+        return {"note": "返回不可解析"}
+    if data.get("error"):
+        return {"error": data["error"]}
+    rows = data.get("rows") or []
+    return {"source": "mx:screener", "query": data.get("query"), "count": data.get("count"), "sample": rows[:3]}
+
+
 _SUMMARIZERS = {
     "get_daily_price": summarize_get_daily_price,
     "get_fundamentals": summarize_get_fundamentals,
@@ -197,6 +234,9 @@ _SUMMARIZERS = {
     "web_search": summarize_web_search,
     "get_dragon_tiger_list": summarize_get_dragon_tiger_list,
     "get_unlock_schedule": summarize_get_unlock_schedule,
+    "mx_data_query": summarize_mx_data_query,
+    "mx_news_search": summarize_mx_news_search,
+    "mx_stock_screen": summarize_mx_stock_screen,
 }
 
 

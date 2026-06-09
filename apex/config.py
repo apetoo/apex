@@ -23,6 +23,7 @@ def load(path: str = "config.yaml") -> dict:
     _resolve("tushare", "token", "TUSHARE_TOKEN")
     _resolve("deepseek", "api_key", "DEEPSEEK_API_KEY")
     _resolve("bocha", "api_key", "BOCHA_API_KEY")
+    _resolve("mx", "api_key", "MX_APIKEY")
 
     # Tilde expansion for all path fields
     paths = _cfg.setdefault("paths", {})

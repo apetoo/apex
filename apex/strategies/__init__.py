@@ -24,6 +24,9 @@ from apex.strategies import (
     institutional_flow,
     industry_rotation,
     leader_with_volume,
+    pullback_to_ma,
+    bullish_alignment,
+    volume_breakout,
 )
 
 STRATEGIES = {
@@ -32,5 +35,8 @@ STRATEGIES = {
         institutional_flow,
         industry_rotation,
         leader_with_volume,
+        pullback_to_ma,
+        bullish_alignment,
+        volume_breakout,
     ]
 }

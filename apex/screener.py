@@ -57,6 +57,36 @@ def _fetch_all_signals(trade_date: str, on_progress=None) -> dict[str, list[Sign
     return results
 
 
+def _enrich_with_technical(by_source: dict, on_progress=None) -> dict:
+    """Phase 2: 为近期涨停候选池批量拉取日线技术数据，注入 by_source['_technical']。
+
+    所有技术面策略通过 by_source.get('_technical', {}) 读取共享缓存，
+    避免每个策略各自调 API。
+    """
+    from apex import technical as tech
+
+    limit_up_records = by_source.get("limit_up_history", []) or []
+    ts_codes = [r["ts_code"] for r in limit_up_records if r.get("ts_code")]
+
+    if not ts_codes:
+        by_source["_technical"] = {}
+        if on_progress:
+            on_progress("⊘ 无近期涨停候选，跳过技术面数据拉取")
+        return by_source
+
+    if on_progress:
+        on_progress(f"拉取 {len(ts_codes)} 只股票技术面数据（日线+均线+量比）...")
+
+    tech.clear_cache()
+    bars = tech.batch_fetch_bars(ts_codes)
+    by_source["_technical"] = bars
+
+    success = sum(1 for v in bars.values() if v is not None)
+    if on_progress:
+        on_progress(f"✓ 技术面数据就绪 {success}/{len(ts_codes)} 只（≥20根日线）")
+    return by_source
+
+
 # ── 策略层 ───────────────────────────────────────────────────────────────────
 
 def _run_strategies(by_source: dict, weights: dict[str, float],
@@ -246,14 +276,18 @@ def _ai_screen_one(client, model: str, system: str, candidate: dict) -> Optional
                 {"role": "user", "content": user},
             ],
             tools=[_AI_TOOL_SCHEMA],
-            tool_choice={"type": "function", "function": {"name": "record_quick_screen"}},
-            max_tokens=512,
+            max_tokens=4096,
+            reasoning_effort="medium",
+            extra_body={"thinking": {"type": "enabled"}},
         )
     except Exception:
         return None
 
     try:
-        tc = resp.choices[0].message.tool_calls[0]
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            return None
+        tc = msg.tool_calls[0]
         return json.loads(tc.function.arguments)
     except Exception:
         return None
@@ -395,8 +429,11 @@ def run(
     selector_reasoning = ""
 
     if on_progress:
-        on_progress(f"开始拉取 5 个信号源 (trade_date={trade_date})")
+        on_progress(f"开始拉取 {len(FETCHERS)} 个信号源 (trade_date={trade_date})")
     by_source = _fetch_all_signals(trade_date, on_progress=on_progress)
+
+    # Phase 2: 技术面数据（为近期涨停候选池批量拉日线）
+    by_source = _enrich_with_technical(by_source, on_progress=on_progress)
 
     # NEW: regime 采集（用 by_source 复用 limit_up_count，避免重调 limit_list_d）
     regime_data = None

@@ -155,6 +155,35 @@ def compute_position_size(entry: float,
     }
 
 
+def compute_position_size_atr(entry: float,
+                               atr_pct: float,
+                               multiplier: float = 2.0,
+                               account: Optional[dict] = None,
+                               risk_pct: Optional[float] = None,
+                               lot_size: int = 100) -> dict:
+    """基于 ATR 的仓位计算。
+
+    stop_distance = entry × atr_pct/100 × multiplier，再调用 risk-parity 公式。
+    相比 compute_position_size：不依赖手动指定止损价，而是用 ATR 推导合理止损距离。
+
+    返回格式同 compute_position_size。
+    """
+    entry = float(entry or 0)
+    atr_pct = float(atr_pct or 0)
+    if entry <= 0 or atr_pct <= 0:
+        return {
+            "shares": 0, "risk_amount": 0.0, "capital_required": 0.0,
+            "risk_pct_used": risk_pct or 1.0, "risk_pct_actual": 0.0,
+            "ok": False, "warnings": ["进场价或 ATR% 缺失"],
+        }
+    stop_distance = entry * atr_pct / 100.0 * multiplier
+    stop = entry - stop_distance
+    return compute_position_size(
+        entry=entry, stop=stop,
+        account=account, risk_pct=risk_pct, lot_size=lot_size,
+    )
+
+
 def current_total_risk(active_positions: list[dict],
                        account: Optional[dict] = None) -> dict:
     """

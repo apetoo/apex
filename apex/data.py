@@ -10,6 +10,8 @@ from typing import Optional
 
 import pandas as pd
 
+from apex import mx_client as _mx
+
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
 
 
@@ -784,4 +786,8 @@ TOOL_FUNCTIONS = {
     "web_search": web_search,
     "get_dragon_tiger_list": get_dragon_tiger_list,
     "get_unlock_schedule": get_unlock_schedule,
+    # 妙想 MX API tools
+    "mx_data_query": _mx.mx_data_query,
+    "mx_news_search": _mx.mx_news_search,
+    "mx_stock_screen": _mx.mx_stock_screen,
 }

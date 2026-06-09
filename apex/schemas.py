@@ -6,7 +6,7 @@ BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}
 
 REQUIRED_FEATURE_KEYS = ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"]
 
-SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept"]
+SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept", "limit_up_history"]
 
 EXIT_REASON_ENUM = ["stop_hit", "target_hit", "manual", "expired", "other"]
 
@@ -39,12 +39,14 @@ class FeaturesSchema(TypedDict, total=False):
     macd_zone: Literal["above_zero", "below_zero"]
     rsi_14: float
     price_vs_ma5_pct: float
+    atr_14_pct: float
 
 
 class PriceAdviceSchema(TypedDict, total=False):
     entry: Optional[float]
     stop_loss: Optional[float]
     target: Optional[float]
+    position_size_pct: Optional[int]
 
 
 class JournalEntry(TypedDict, total=False):

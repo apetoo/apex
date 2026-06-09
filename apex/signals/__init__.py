@@ -5,6 +5,7 @@ from apex.signals import (
     industry,
     northbound,
     concept,
+    limit_up_history,
 )
 
 FETCHERS = {
@@ -13,4 +14,5 @@ FETCHERS = {
     "industry": industry.fetch,
     "northbound": northbound.fetch,
     "concept": concept.fetch,
+    "limit_up_history": limit_up_history.fetch,
 }

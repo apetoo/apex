@@ -185,6 +185,78 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "mx_data_query",
+            "description": (
+                "妙想金融数据查询（东方财富官方数据源）。支持自然语言查询行情、财务、"
+                "股东、板块、指数等数据。\n"
+                "示例：\"贵州茅台近三年净利润 营业收入\" \"东方财富最新价 主力资金流向\"\n"
+                "\n"
+                "相比 get_daily_price / get_fundamentals：支持更灵活的自然语言查询、"
+                "可查历史财务数据对比；但响应格式不如 tushare 结构化。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query_text": {
+                        "type": "string",
+                        "description": "自然语言查询问句，如 \"贵州茅台近三年净利润 营业收入\"",
+                    },
+                },
+                "required": ["query_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mx_news_search",
+            "description": (
+                "妙想财经资讯搜索（东方财富数据源）。搜索新闻、研报、公告。\n"
+                "示例：\"格力电器最新研报\" \"宁德时代利空\"\n"
+                "\n"
+                "相比 web_search：专注财经领域（东财数据库），召回更垂直精准；"
+                "但覆盖广度不如 Bocha（无监管/行业政策等通用搜索）。"
+                "两者可互补：如需查财经新闻用 mx_news_search，如需查监管/政策用 web_search。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索问句，如 \"格力电器最新研报\"",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mx_stock_screen",
+            "description": (
+                "妙想智能选股。通过自然语言筛选A股。\n"
+                "示例：\"市盈率低于20且ROE大于15%的A股\" "
+                "\"今天放量大涨的股票\" \"北向资金近期增持的股票\"\n"
+                "\n"
+                "适用于批量筛选候选标的（从几千只股票中缩小范围），"
+                "然后可进一步对具体标的调 get_daily_price / 分析等做详细判断。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言选股条件",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "record_verdict",
             "description": (
                 "记录最终分析结论。分析完成后必须调用此工具，不得省略。\n"
@@ -218,8 +290,9 @@ TOOLS = [
                             "macd_zone": {"type": "string", "enum": ["above_zero", "below_zero"]},
                             "rsi_14": {"type": "number"},
                             "price_vs_ma5_pct": {"type": "number"},
+                            "atr_14_pct": {"type": "number", "description": "ATR(14)占最新收盘价的百分比，用于止损宽度计算"},
                         },
-                        "required": ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"],
+                        "required": ["ma5_position", "ma20_position", "volume_ratio", "rsi_14", "atr_14_pct"],
                     },
                     "evidence": {
                         "type": "array",
@@ -232,6 +305,16 @@ TOOLS = [
                         ),
                         "items": {"type": "string"},
                         "minItems": 3,
+                    },
+                    "position_size_pct": {
+                        "type": "integer",
+                        "description": (
+                            "建议仓位占账户总资金的百分比（0-50）。"
+                            "映射：confidence 1-2→0%, 3→≤5%, 4→≤10%, 5→≤15%, "
+                            "6→≤20%, 7→≤30%, 8→≤35%, 9→≤40%, 10→≤50%。"
+                            "「偏多」及更弱的方向且 position_size_pct=0 表示只观察不买入。"
+                            "「观望」及更弱的方向应填 0。"
+                        ),
                     },
                 },
                 "required": ["verdict", "confidence", "features", "evidence"],
@@ -255,9 +338,27 @@ def _load_system_prompt() -> str:
 
 
 def _dispatch_tool(name: str, tool_input: dict) -> str:
-    if name in data.TOOL_FUNCTIONS:
-        return data.TOOL_FUNCTIONS[name](**tool_input)
-    raise AnalysisError(f"Unknown tool: {name}")
+    if name not in data.TOOL_FUNCTIONS:
+        raise AnalysisError(f"Unknown tool: {name}")
+    result = data.TOOL_FUNCTIONS[name](**tool_input)
+
+    # 为 get_daily_price 返回注入 ATR(14)，让 AI 在止损宽度计算中有据可依
+    if name == "get_daily_price":
+        try:
+            bars = json.loads(result)
+            if isinstance(bars, list) and len(bars) >= 15:
+                from apex import technical
+                atr_val = technical.atr_14(bars)
+                atr_pct = technical.atr_14_pct(bars)
+                result = json.dumps({
+                    "bars": bars,
+                    "atr_14": atr_val,
+                    "atr_14_pct": atr_pct,
+                }, ensure_ascii=False)
+        except Exception:
+            pass  # 注入失败不影响原始返回
+
+    return result
 
 
 def _make_client(cfg: dict) -> OpenAI:
@@ -876,8 +977,14 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   **结构化补充工具（推荐使用，但非强制）**：\n"
                 "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
                 "   · get_dragon_tiger_list — 龙虎榜上榜情况；用于判断游资炒作 / 机构动向\n"
-                "   这两个工具的返回是结构化数字，比 web_search 召回的新闻 snippet 可直接引用，"
-                "   优先用它们的数据填 evidence；web_search 仍负责覆盖广度。\n"
+                "   · mx_data_query — 妙想金融数据查询（东方财富）。自然语言问行情/财务/股东，"
+                "如\"贵州茅台近三年净利润 营业收入\"，比 tushare 更灵活\n"
+                "   · mx_news_search — 妙想财经资讯搜索（东方财富），比博查更垂直精准，"
+                "适合搜研报/新闻/公告\n"
+                "   · mx_stock_screen — 妙想智能选股，自然语言批量筛选候选标的，"
+                "如\"市盈率低于20且ROE大于15%的A股\"\n"
+                "   以上 MX 工具是东财官方数据源，返回结构化数据，与博查 web_search 互补："
+                "查财经数据/新闻用 MX，查监管/政策用 web_search。\n"
                 "\n"
                 "2) 博查 4 类强制（缺一类 record_verdict 被拒）：earnings / shareholders / regulatory / money_flow。\n"
                 "   按需加 corporate_actions / research / industry / general。若召回为空，evidence 里明确写「该类别无召回」，**不要跳过调用**。\n"
@@ -1048,7 +1155,41 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 break
 
     if not verdict_data:
-        raise AnalysisError("AI did not call record_verdict — no verdict captured")
+        # 兜底：AI 忘了调 record_verdict，给最后一次机会
+        messages.append({
+            "role": "user",
+            "content": (
+                "⚠️ 系统提醒：你还没有调用 record_verdict 函数来提交最终判断结论。\n"
+                "纯文本分析不会被记录。请立即调用 record_verdict(verdict=..., confidence=..., evidence=[...])，"
+                "并且不要再调任何其他工具。"
+            ),
+        })
+        retry = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=4096,
+            temperature=0.4,
+        )
+        retry_choice = retry.choices[0]
+        retry_msg = retry_choice.message
+        if retry_choice.finish_reason == "tool_calls":
+            for tool_call in (retry_msg.tool_calls or []):
+                if tool_call.function.name == "record_verdict":
+                    try:
+                        verdict_data = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        pass
+                    _emit({
+                        "type": "verdict_recorded",
+                        "iteration": iteration,
+                        "tool_call_id": tool_call.id,
+                        "verdict": verdict_data.get("verdict"),
+                        "confidence": verdict_data.get("confidence"),
+                    })
+                    break
+        if not verdict_data:
+            raise AnalysisError("AI did not call record_verdict — no verdict captured")
 
     raw_verdict = verdict_data["verdict"]
     raw_confidence = verdict_data.get("confidence")
@@ -1083,6 +1224,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "entry": verdict_data.get("entry"),
             "stop_loss": verdict_data.get("stop_loss"),
             "target": verdict_data.get("target"),
+            "position_size_pct": verdict_data.get("position_size_pct"),
         },
         "features": verdict_data.get("features", {}),
         "evidence": verdict_data.get("evidence", []),
