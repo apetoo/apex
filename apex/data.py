@@ -8,6 +8,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from apex import mx_client as _mx
@@ -94,23 +95,279 @@ def get_daily_price(ts_code: str, start_date: str = None, end_date: str = None,
     return result.to_json(orient="records", force_ascii=False)
 
 
+def compute_candlestick_features(bars: list[dict]) -> dict:
+    """从最近 N 根 K 线计算蜡烛图形态特征。
+
+    返回 dict，包含：
+    - latest: 最近一根 K 线的单根形态
+    - prev: 倒数第二根 K 线的单根形态（用于识别前日的长上影/长下影等信号）
+    - multi_bar: 多蜡烛组合形态（3-5 根）
+    """
+    if not bars or len(bars) < 3:
+        return {}
+
+    def _single_candle(b: dict, prev_closes: list[float] = None) -> dict:
+        o, h, l, c = float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"])
+        amp = h - l
+        if amp <= 0:
+            return {}
+        body = abs(c - o)
+        body_pct = round(body / amp * 100, 1)
+        upper_shadow = h - max(c, o)
+        lower_shadow = min(c, o) - l
+        upper_pct = round(upper_shadow / amp * 100, 1)
+        lower_pct = round(lower_shadow / amp * 100, 1)
+        direction = "阳" if c >= o else "阴"
+        is_cross = body_pct <= 10
+        is_long_upper = upper_pct >= 50 and body_pct <= 40
+        is_long_lower = lower_pct >= 50 and body_pct <= 40
+        is_hammer = False
+        is_shooting_star = False
+        if prev_closes and len(prev_closes) >= 4:
+            avg_prev = sum(prev_closes[-5:]) / 5
+            if is_long_lower and c < avg_prev:
+                is_hammer = True
+            if is_long_upper and c > avg_prev:
+                is_shooting_star = True
+        return {
+            "body_pct": body_pct,
+            "upper_shadow_pct": upper_pct,
+            "lower_shadow_pct": lower_pct,
+            "direction": "十字星" if is_cross else direction,
+            "is_long_upper_shadow": is_long_upper,
+            "is_long_lower_shadow": is_long_lower,
+            "is_hammer": is_hammer,
+            "is_shooting_star": is_shooting_star,
+        }
+
+    all_closes = [float(b["close"]) for b in bars]
+
+    # latest: 最近一根
+    latest_candle = _single_candle(bars[-1], all_closes[:-1] if len(bars) >= 6 else all_closes[:-1])
+
+    # prev: 倒数第二根（可能是关键信号 K 线，如 6/10 的长上影）
+    prev_candle = {}
+    if len(bars) >= 2:
+        prev_closes_for_prev = all_closes[:-2] if len(bars) >= 7 else all_closes[:-2]
+        prev_candle = _single_candle(bars[-2], prev_closes_for_prev if len(prev_closes_for_prev) >= 5 else None)
+
+    # 多蜡烛组合形态
+    patterns: list[str] = []
+    if len(bars) >= 5:
+        # 双顶风险：最近两根高点接近（相差 < 2%），且中间有低点
+        recent_highs = []
+        for b in bars[-10:]:
+            recent_highs.append(float(b["high"]))
+        max_high = max(recent_highs)
+        # 找最近的两次接近最高点的位置
+        peaks = [i for i, v in enumerate(recent_highs) if v >= max_high * 0.98]
+        if len(peaks) >= 2 and peaks[-1] - peaks[0] >= 2:
+            patterns.append("双顶雏形")
+
+        # 量价背离：价格新高但量缩
+        if len(bars) >= 5:
+            last_two = bars[-2:]
+            prev_three = bars[-5:-2]
+            if float(last_two[-1]["close"]) >= max(float(b["close"]) for b in prev_three):
+                avg_vol_recent = sum(float(b["vol"]) for b in last_two) / 2
+                avg_vol_prev = sum(float(b["vol"]) for b in prev_three) / 3
+                if avg_vol_prev > 0 and avg_vol_recent < avg_vol_prev * 0.7:
+                    patterns.append("量价背离(价升量缩)")
+
+        # 连续阴线/阳线计数
+        directions_recent = ["阳" if float(b["close"]) >= float(b["open"]) else "阴" for b in bars[-5:]]
+        if directions_recent[-1] == "阴":
+            consecutive = 0
+            for d in reversed(directions_recent):
+                if d == "阴":
+                    consecutive += 1
+                else:
+                    break
+            if consecutive >= 3:
+                patterns.append(f"连续{consecutive}阴")
+
+    # 最近 3 天量价趋势
+    last_3_vols = [float(b["vol"]) for b in bars[-3:]]
+    last_3_closes = [float(b["close"]) for b in bars[-3:]]
+    vol_trend = "放量" if last_3_vols[-1] > sum(last_3_vols[:-1]) / 2 * 1.3 else (
+        "缩量" if last_3_vols[-1] < sum(last_3_vols[:-1]) / 2 * 0.7 else "平量"
+    )
+    price_trend_3d = "上涨" if last_3_closes[-1] > last_3_closes[0] else "下跌"
+
+    return {
+        "latest": latest_candle,
+        "prev": prev_candle,
+        "multi_bar": {
+            "patterns": patterns,
+            "vol_trend_3d": vol_trend,
+            "price_trend_3d": price_trend_3d,
+        },
+    }
+
+
+# ── Financial indicator constants & helpers ──────────────────────────────────
+
+# 18 fields selected from tushare fina_indicator (92 available)
+_FINA_FIELDS = [
+    "end_date",
+    # Profitability
+    "roe", "roa", "grossprofit_margin", "netprofit_margin", "roic",
+    # Per share
+    "eps", "bps", "ocfps",
+    # Solvency
+    "debt_to_assets", "current_ratio", "quick_ratio",
+    # Growth YoY
+    "or_yoy", "netprofit_yoy", "roe_yoy", "bps_yoy", "basic_eps_yoy",
+    # Cash flow / efficiency
+    "fcff", "fcfe", "assets_turn",
+]
+
+
+def _safe_number(val):
+    """Convert numpy types to native Python, NaN/Inf to None."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            if np.isnan(val) or np.isinf(val):
+                return None
+            return float(val)
+        return val
+    except Exception:
+        return val
+
+
+def _compute_financial_summary(df: "pd.DataFrame") -> dict:
+    """Compute trend labels and warning flags from 4Q financial data.
+
+    df: sorted by end_date descending, columns from _FINA_FIELDS.
+    """
+    n = len(df)
+    if n < 2:
+        return {"data_quarters": n, "flags": []}
+
+    latest = df.iloc[0]
+
+    def _trend(series, improving_is_up=True):
+        vals = [v for v in series.dropna().tolist() if v is not None]
+        if len(vals) < 2:
+            return None
+        first, last = vals[0], vals[-1]
+        diff = first - last
+        if abs(diff) < 1.0:
+            return "stable"
+        if improving_is_up:
+            return "improving" if diff > 0 else "declining"
+        else:
+            return "improving" if diff < 0 else "declining"
+
+    roe_trend = _trend(df["roe_yoy"], improving_is_up=True)
+    revenue_trend = _trend(df["or_yoy"], improving_is_up=True)
+    margin_trend = _trend(df["grossprofit_margin"], improving_is_up=True)
+
+    # Warning flags
+    flags = []
+
+    debt = latest.get("debt_to_assets")
+    if debt is not None and debt > 70:
+        flags.append(f"资产负债率偏高: {debt:.1f}% (>70%)")
+
+    cr = latest.get("current_ratio")
+    if cr is not None and cr < 1.0:
+        flags.append(f"流动比率偏低: {cr:.2f} (<1.0)")
+
+    # Check if ALL quarters have negative ROE
+    roe_vals = [v for v in df["roe"].dropna().tolist() if v is not None]
+    if len(roe_vals) >= 4 and all(v < 0 for v in roe_vals[:4]):
+        flags.append("ROE连续4个季度为负")
+
+    # Check if ALL quarters have negative ROE YoY (persistent decline vs last year)
+    roe_yoy_vals = [v for v in df["roe_yoy"].dropna().tolist() if v is not None]
+    if len(roe_yoy_vals) >= 4 and all(v is not None and v < 0 for v in roe_yoy_vals[:4]):
+        flags.append("ROE同比连续4个季度下滑（盈利能力持续恶化）")
+
+    ocfps_vals = [v for v in df["ocfps"].dropna().tolist() if v is not None]
+    eps_vals = [v for v in df["eps"].dropna().tolist() if v is not None]
+    if len(ocfps_vals) >= 3 and len(eps_vals) >= 3:
+        below = sum(
+            1 for o, e in zip(ocfps_vals[:3], eps_vals[:3])
+            if o < e
+        )
+        if below >= 3:
+            flags.append("经营现金流每股连续3个季度低于每股收益（盈利质量存疑）")
+
+    # Note: trend labels are approximate because fina_indicator data is cumulative
+    # within each fiscal year (Q1 < Q2 < Q3 < FY), so comparing different quarters
+    # directly is not always apples-to-apples.
+    return {
+        "data_quarters": n,
+        "roe_trend": roe_trend,
+        "revenue_growth_trend": revenue_trend,
+        "margin_trend": margin_trend,
+        "flags": flags,
+        "_trend_note": "趋势标签基于最近可用数据的首尾比较，因财务数据为累计值，跨报告期比较可能存在偏差。以 flags（风险标记）为准。",
+    }
+
+
 def get_fundamentals(ts_code: str) -> str:
-    """Return latest PE/PB/turnover_rate/circ_mv as JSON string."""
+    """Return valuation + latest 4Q financial indicators + computed summary as JSON.
+
+    Part 1: daily_basic → PE/PB/PS/turnover/circ_mv (always)
+    Part 2: fina_indicator → profitability/solvency/growth/cashflow (fail-soft)
+    """
+    result: dict = {}
+
+    # ── Part 1: Valuation (daily_basic) — always works ────────────────────
     try:
         pro = _tushare()
         today = datetime.today().strftime("%Y%m%d")
-        df = pro.daily_basic(ts_code=ts_code, trade_date=today,
-                              fields="ts_code,trade_date,pe,pe_ttm,pb,ps_ttm,dv_ttm,turnover_rate,circ_mv")
-        if df is None or df.empty:
-            # Try previous trading day
-            prev = (datetime.today() - timedelta(days=3)).strftime("%Y%m%d")
-            df = pro.daily_basic(ts_code=ts_code, start_date=prev, end_date=today,
+        df_val = pro.daily_basic(ts_code=ts_code, trade_date=today,
                                   fields="ts_code,trade_date,pe,pe_ttm,pb,ps_ttm,dv_ttm,turnover_rate,circ_mv")
-        if df is None or df.empty:
+        if df_val is None or df_val.empty:
+            prev = (datetime.today() - timedelta(days=3)).strftime("%Y%m%d")
+            df_val = pro.daily_basic(ts_code=ts_code, start_date=prev, end_date=today,
+                                      fields="ts_code,trade_date,pe,pe_ttm,pb,ps_ttm,dv_ttm,turnover_rate,circ_mv")
+        if df_val is None or df_val.empty:
             return json.dumps({"error": "no fundamental data"})
-        return df.tail(1).to_json(orient="records", force_ascii=False)
+        val_row = df_val.tail(1).iloc[0].to_dict()
+        result["valuation"] = {
+            k: _safe_number(val_row.get(k))
+            for k in ["trade_date", "pe", "pe_ttm", "pb", "ps_ttm", "dv_ttm", "turnover_rate", "circ_mv"]
+        }
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+    # ── Part 2: Financial indicators (fina_indicator) — fail-soft ─────────
+    try:
+        fields_str = ",".join(_FINA_FIELDS)
+        df_fin = pro.fina_indicator(ts_code=ts_code, fields=fields_str)
+        if df_fin is not None and not df_fin.empty:
+            df_fin = df_fin.sort_values("end_date", ascending=False)
+            df_fin = df_fin.drop_duplicates(subset=["end_date"])
+            df_fin = df_fin.head(4)
+            df_fin = df_fin.where(pd.notna(df_fin), None)
+            quarters = []
+            for _, row in df_fin.iterrows():
+                q = {}
+                for col in _FINA_FIELDS:
+                    q[col] = _safe_number(row.get(col))
+                quarters.append(q)
+            result["latest_quarter"] = str(df_fin.iloc[0].get("end_date", ""))
+            result["quarters"] = quarters
+            result["_note"] = "财务数据为累计报告期值（ROE/ROA等为年初至今累计值，Q1<Q2<Q3<年报）。增长率(or_yoy/roe_yoy等)为同比，可直接用于趋势判断。"
+            result["summary"] = _compute_financial_summary(df_fin)
+        else:
+            result["quarters"] = []
+            result["summary"] = None
+    except Exception:
+        result["quarters"] = []
+        result["summary"] = None
+
+    return json.dumps(result, ensure_ascii=False)
 
 
 def get_stock_info(ts_code: str) -> str:

@@ -42,7 +42,21 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_fundamentals",
-            "description": "获取股票基本面数据：PE、PB、PS、换手率、流通市值。",
+            "description": (
+                "获取股票深度基本面数据，包含两部分：\n"
+                "1) 估值面：PE、PE_TTM、PB、PS_TTM、股息率、换手率、流通市值（来自 daily_basic）\n"
+                "2) 财务面：最近4个季度的盈利能力(ROE/ROA/毛利率/净利率/ROIC)、"
+                "每股指标(EPS/BPS/经营现金流每股)、偿债能力(资产负债率/流动比率/速动比率)、"
+                "同比增长(营收YoY/净利润YoY/ROE YoY)、现金流(FCFF/FCFE)、"
+                "以及 Python 预计算的趋势判断和风险标记(summary.flags)。\n"
+                "\n"
+                "返回结构：valuation(估值) + quarters(最近4季财务) + summary(趋势+风险标记)。\n"
+                "summary.flags 是 Python 预计算的客观标记（如 debt_to_assets>70%、ROE连续4季为负），"
+                "AI 必须逐条引用，不要自己重新判断这些基础指标。\n"
+                "\n"
+                "财务数据来自 tushare fina_indicator，若权限不足或数据缺失则 quarters 为空数组、"
+                "summary 为 null，此时仅返回 valuation 部分（与旧版行为兼容）。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -191,8 +205,9 @@ TOOLS = [
                 "股东、板块、指数等数据。\n"
                 "示例：\"贵州茅台近三年净利润 营业收入\" \"东方财富最新价 主力资金流向\"\n"
                 "\n"
-                "相比 get_daily_price / get_fundamentals：支持更灵活的自然语言查询、"
-                "可查历史财务数据对比；但响应格式不如 tushare 结构化。"
+                "get_fundamentals 已提供结构化的最近4季财务数据（ROE/毛利率/营收增速/现金流等），"
+                "mx_data_query 作为补充：当需要查更长历史（如近3年营收趋势）或特定指标（如研发费用）时使用。"
+                "相比 get_daily_price：支持更灵活的自然语言查询。"
             ),
             "parameters": {
                 "type": "object",
@@ -262,7 +277,9 @@ TOOLS = [
                 "记录最终分析结论。分析完成后必须调用此工具，不得省略。\n"
                 "**evidence 字段为必填**：每条格式「数据点 → 推论」，至少 3 条，"
                 "必须引用工具返回的真实数字（如 close=12.34、RSI=67.2、减持公告日期），"
-                "不得写泛泛的定性描述。"
+                "不得写泛泛的定性描述。\n"
+                "**entry / stop_loss / target 为必填**：看多/偏多/观望偏多必须填具体价位，"
+                "非看多方向（中性及以下）统一填 0。"
             ),
             "parameters": {
                 "type": "object",
@@ -276,9 +293,9 @@ TOOLS = [
                         "type": "integer",
                         "description": "置信度 1-10",
                     },
-                    "entry": {"type": "number", "description": "建议买入价（可选）"},
-                    "stop_loss": {"type": "number", "description": "止损价（可选）"},
-                    "target": {"type": "number", "description": "目标价（可选）"},
+                    "entry": {"type": "number", "description": "建议买入价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "stop_loss": {"type": "number", "description": "止损价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "target": {"type": "number", "description": "目标价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
                     "features": {
                         "type": "object",
                         "description": "技术特征快照",
@@ -291,6 +308,11 @@ TOOLS = [
                             "rsi_14": {"type": "number"},
                             "price_vs_ma5_pct": {"type": "number"},
                             "atr_14_pct": {"type": "number", "description": "ATR(14)占最新收盘价的百分比，用于止损宽度计算"},
+                            "candle_direction": {"type": "string", "enum": ["阳", "阴", "十字星"], "description": "最近一根 K 线的实体方向"},
+                            "candle_body_pct": {"type": "number", "description": "实体占当日振幅百分比"},
+                            "candle_upper_shadow_pct": {"type": "number", "description": "上影线占当日振幅百分比"},
+                            "candle_lower_shadow_pct": {"type": "number", "description": "下影线占当日振幅百分比"},
+                            "candle_pattern": {"type": "string", "description": "识别到的蜡烛形态标签，如 长上影/长下影/锤子线/射击之星/双顶雏形/量价背离/无"},
                         },
                         "required": ["ma5_position", "ma20_position", "volume_ratio", "rsi_14", "atr_14_pct"],
                     },
@@ -317,7 +339,7 @@ TOOLS = [
                         ),
                     },
                 },
-                "required": ["verdict", "confidence", "features", "evidence"],
+                "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence"],
             },
         },
     },
@@ -342,7 +364,7 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
         raise AnalysisError(f"Unknown tool: {name}")
     result = data.TOOL_FUNCTIONS[name](**tool_input)
 
-    # 为 get_daily_price 返回注入 ATR(14)，让 AI 在止损宽度计算中有据可依
+    # 为 get_daily_price 返回注入 ATR(14) + 蜡烛图形态，让 AI 直接引用预计算结果
     if name == "get_daily_price":
         try:
             bars = json.loads(result)
@@ -350,10 +372,12 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
                 from apex import technical
                 atr_val = technical.atr_14(bars)
                 atr_pct = technical.atr_14_pct(bars)
+                candlestick = data.compute_candlestick_features(bars)
                 result = json.dumps({
                     "bars": bars,
                     "atr_14": atr_val,
                     "atr_14_pct": atr_pct,
+                    "candlestick": candlestick,
                 }, ensure_ascii=False)
         except Exception:
             pass  # 注入失败不影响原始返回
@@ -972,30 +996,62 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"{portfolio_block}\n\n"
                 f"{market_block}\n\n"
                 "步骤：\n"
-                "1) 数据：调用 get_daily_price + get_fundamentals + get_stock_info\n"
+                "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"
+                "   先调 get_fundamentals + get_stock_info + get_dragon_tiger_list，\n"
+                "   拿到 circ_mv / PE_TTM / turnover_rate / industry / 龙虎榜上榜次数，\n"
+                "   以及 quarters（最近4季财务）和 summary.flags（Python预计算的风险标记）后，\n"
+                "   对照下表自行判断标的类型并**显式声明**：\n"
+                "\n"
+                "   | 类型 | 识别特征 | 财务特征 | 技术 | 基本 | 资金 | 情绪 |\n"
+                "   |------|---------|---------|------|------|------|------|\n"
+                "   | 蓝筹/白马 | circ_mv > 500亿, PE适中, 消费/金融/公用 | ROE>10%稳定, 负债率<60%, OCF为正 | 30% | 50% | 10% | 10% |\n"
+                "   | 题材/游资 | circ_mv < 100亿, turnover >5%, 龙虎榜常客 | 仅排雷: 负债率, 连续亏损 | 35% | 15% | 30% | 20% |\n"
+                "   | 周期股 | 钢铁/煤炭/有色/化工/建材/航运/养殖 | ROE周期性波动, 高杠杆需警惕 | 25% | 35% | 20% | 20% |\n"
+                "   | 成长股 | circ_mv 100-500亿, PE偏高, 科技/医药/新能源 | 营收增速>20%, 毛利率扩张/稳定 | 30% | 40% | 15% | 15% |\n"
+                "   | 均衡型 | 无法明确归类 | 多特征混合 | 25% | 25% | 25% | 25% |\n"
+                "\n"
+                "   声明格式：「**标的类型：XX**，四维权重：技术 X%/基本 X%/资金 X%/情绪 X%」\n"
+                "   如果 circ_mv / PE / turnover_rate 数据缺失（新股或数据源故障），\n"
+                "   根据 industry + 龙虎榜频次 + 上市时间做最佳推断，并在声明中注明「数据缺失，推断分类」。\n"
+                "   **必须引用 summary.flags 中的 Python 预计算风险标记**，不要自己重新判断 ROE 趋势或负债率阈值。\n"
+                "   分类完成后，后续所有步骤的分析深度和证据选择必须按上表权重分配精力。\n"
+                "\n"
+                "1) 数据：调用 get_daily_price（在步骤 0 之外补充 K 线数据）\n"
                 "\n"
                 "   **结构化补充工具（推荐使用，但非强制）**：\n"
                 "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
-                "   · get_dragon_tiger_list — 龙虎榜上榜情况；用于判断游资炒作 / 机构动向\n"
-                "   · mx_data_query — 妙想金融数据查询（东方财富）。自然语言问行情/财务/股东，"
-                "如\"贵州茅台近三年净利润 营业收入\"，比 tushare 更灵活\n"
-                "   · mx_news_search — 妙想财经资讯搜索（东方财富），比博查更垂直精准，"
-                "适合搜研报/新闻/公告\n"
-                "   · mx_stock_screen — 妙想智能选股，自然语言批量筛选候选标的，"
-                "如\"市盈率低于20且ROE大于15%的A股\"\n"
-                "   以上 MX 工具是东财官方数据源，返回结构化数据，与博查 web_search 互补："
-                "查财经数据/新闻用 MX，查监管/政策用 web_search。\n"
+                "   · mx_data_query — 妙想金融数据查询（东方财富）。**蓝筹/白马和成长股必须至少调用 1 次**，\n"
+                "     查营收/净利润/ROE/毛利率/经营现金流等深度财务数据，否则基本面权重是空壳。\n"
+                "     题材/游资股可选，但建议查一下排除业绩暴雷风险。\n"
+                "   · mx_news_search — 妙想财经资讯搜索（东方财富），比博查更垂直精准，\n"
+                "     适合搜研报/新闻/公告\n"
+                "   · mx_stock_screen — 妙想智能选股，自然语言批量筛选候选标的，\n"
+                "     如\"市盈率低于20且ROE大于15%的A股\"\n"
+                "   以上 MX 工具是东财官方数据源，返回结构化数据，与博查 web_search 互补：\n"
+                "   查财经数据/新闻用 MX，查监管/政策用 web_search。\n"
                 "\n"
                 "2) 博查 4 类强制（缺一类 record_verdict 被拒）：earnings / shareholders / regulatory / money_flow。\n"
                 "   按需加 corporate_actions / research / industry / general。若召回为空，evidence 里明确写「该类别无召回」，**不要跳过调用**。\n"
+                "   **股票类型提示**：蓝筹/白马和成长股在 earnings 类别中应额外关注营收/利润趋势的持续性；\n"
+                "   题材/游资股在 money_flow 类别中应重点关注游资动向和席位分析。\n"
                 "\n"
                 "3) 三段式辩论（写在 message content 里）：\n"
                 "   ### 一、多头论点（≥3 条，格式：数据点 → 推论）\n"
                 "   引用 K 线/基本面/消息面的具体数字，禁空话。\n"
+                "   **股票类型约束**：蓝筹/白马的多头论点中，至少 2 条必须来自基本面证据（mx_data_query / earnings 博查）；\n"
+                "   题材/游资的多头论点中，资金面（龙虎榜/北向/主力流向）必须占至少 1 条。\n"
                 "   ### 二、空头论点（≥3 条，禁「虽然 X 但是 Y」）\n"
                 "   独立反方证据；至少 1 条直接反驳多头第 N 条；必须考虑估值/解禁减持/行业景气/技术背离/历史回撤。\n"
+                "   **股票类型约束**：蓝筹/白马的空头论点必须包含估值分析（PE 历史分位 / 与行业均值对比）；\n"
+                "   周期股的空头论点必须考虑周期位置（产品价格趋势 / 产能周期 / 库存水平）。\n"
                 "   ### 三、裁判结论\n"
                 "   多空各自最硬的 1 条；互斥矛盾点 → 倾向哪边？为什么？\n"
+                "   **必须包含加权四维评分**（按步骤 0 声明的权重）：\n"
+                "   - 技术面 X 分 × Wt% = Y\n"
+                "   - 基本面 X 分 × Wf% = Y\n"
+                "   - 资金面 X 分 × Wm% = Y\n"
+                "   - 情绪面 X 分 × Ws% = Y\n"
+                "   - 加权总分 = Z → 档位\n"
                 "   最终 verdict + initial_confidence (1-10)\n"
                 "\n"
                 "4) **置信度调整（一次性结算）**：以 initial_confidence 为基准，遍历下表逐条结算。\n"
@@ -1004,7 +1060,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "\n"
                 "   | 条件 | 调整 |\n"
                 "   |---|---|\n"
-                "   | 历史命中率 < 50% 或中位收益为负 | **−2** |\n"
+                "   | 历史命中率 < 50% 或中位收益为负（历史 ≥ 3 次才触发；< 3 次改为 **−1**） | **−2**（≥3次）/ **−1**（<3次） |\n"
                 "   | 每条「空头论点未被第三段有效反驳」 | **−1/条** |\n"
                 "   | 加仓突破行业集中度（≥3 同行业）或总风险逼近上限 | **−1** |\n"
                 "   | 多头判断 + 大盘弱势（沪深300 5日 < −2%） | **−1** |\n"
@@ -1014,8 +1070,19 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | 多头判断 + 业绩超预期（最近季度净利润 yoy ≥ +30%）且 PE_TTM ≤ 30 | **+1** |\n"
                 "   | 空头判断 + ST/退市风险 或 监管立案/处罚 | **+1** |\n"
                 "   | 空头判断 + regime 弱势（任一 regime 利空命中） | 顺势，不扣不加 |\n"
+                "   | **24h 内重复分析且无新增基本面数据** | 方向最多变化 ±1 档，conf 最多变化 ±2（防 LLM 随机性导致剧烈摆动） |\n"
+                "   | **蓝筹/白马 + 基本面证据 < 2 条** | **−2**（基本面权重 50% 但没有实质证据，置信度必须打折扣） |\n"
+                "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
                 "\n"
-                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。"
+                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。\n"
+                "\n"
+                "6) **自我检查（在调用 record_verdict 前完成，写在 message content 末尾）**：\n"
+                "   - [ ] 我的四维权重与声明的股票类型是否一致？\n"
+                "   - [ ] 蓝筹/成长股：基本面证据是否 ≥ 2 条且来自 mx_data_query 或博查 earnings？\n"
+                "   - [ ] 题材/游资股：我是否错误地把\"基本面\"当成了主要判断依据？\n"
+                "   - [ ] 周期股：我是否在 PE 很低时说\"估值便宜\"（这是周期股陷阱）？\n"
+                "   - [ ] 我的 K 线分析深度是否与股票类型匹配（蓝筹股不需要逐根 K 线数浪）？\n"
+                "   如果任一条不通过，回到对应步骤修正后再调 record_verdict。"
             ),
         },
     ]
@@ -1032,6 +1099,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             tools=TOOLS,
             max_tokens=16384,
             temperature=0.4,
+            extra_body={"thinking": {"type": "disabled"}},
         )
 
         choice = response.choices[0]
@@ -1142,6 +1210,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                     messages=messages,
                     max_tokens=2048,
                     temperature=0.4,
+                    extra_body={"thinking": {"type": "disabled"}},
                 )
                 final_text = final.choices[0].message.content
                 if final_text:
@@ -1170,6 +1239,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             tools=TOOLS,
             max_tokens=4096,
             temperature=0.4,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         retry_choice = retry.choices[0]
         retry_msg = retry_choice.message

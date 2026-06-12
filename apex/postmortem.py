@@ -268,6 +268,7 @@ def run(record: dict, model: Optional[str] = None) -> dict:
             tools=[_TOOL],
             tool_choice={"type": "function", "function": {"name": "record_diagnosis"}},
             max_tokens=1024,
+            extra_body={"thinking": {"type": "disabled"}},
         )
     except Exception as e:
         raise PostmortemError(f"DeepSeek 调用失败: {type(e).__name__}: {e}") from e

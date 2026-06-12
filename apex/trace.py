@@ -99,7 +99,26 @@ def summarize_get_fundamentals(raw) -> dict:
     data = _safe_parse(raw)
     if isinstance(data, dict) and data.get("error"):
         return {"error": data["error"]}
+    if isinstance(data, dict):
+        # New enhanced format: {valuation, quarters, summary}
+        val = data.get("valuation") or {}
+        quarters = data.get("quarters") or []
+        summary = data.get("summary") or {}
+        result = {
+            "pe": val.get("pe"),
+            "pe_ttm": val.get("pe_ttm"),
+            "pb": val.get("pb"),
+            "ps_ttm": val.get("ps_ttm"),
+            "dv_ttm": val.get("dv_ttm"),
+            "turnover_rate": val.get("turnover_rate"),
+            "circ_mv_yi": round(val["circ_mv"] / 10000, 2) if val.get("circ_mv") else None,
+            "fin_quarters": len(quarters),
+            "latest_roe": quarters[0].get("roe") if quarters else None,
+            "flags": summary.get("flags", []),
+        }
+        return result
     if isinstance(data, list) and data:
+        # Legacy flat list format
         row = data[0]
         return {
             "pe": row.get("pe"),

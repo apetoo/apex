@@ -169,7 +169,19 @@ def render_trace_event(event: dict, key_prefix: str = "") -> None:
         elif name == "get_daily_price":
             title = f"✅ 返回 {name}：{summary.get('bars', '?')} 根K线，最新收盘 {summary.get('close', '?')}"
         elif name == "get_fundamentals":
-            title = f"✅ 返回 {name}：PE={summary.get('pe', '-')} PB={summary.get('pb', '-')}"
+            pe = summary.get('pe', '-')
+            pb = summary.get('pb', '-')
+            nq = summary.get('fin_quarters', 0)
+            roe = summary.get('latest_roe')
+            flags = summary.get('flags', [])
+            parts = [f"PE={pe}", f"PB={pb}"]
+            if nq:
+                parts.append(f"{nq}季财务")
+            if roe is not None:
+                parts.append(f"ROE={roe:.1f}%")
+            if flags:
+                parts.append(f"⚠{len(flags)}条风险")
+            title = f"✅ 返回 {name}：" + " ".join(parts)
         elif name == "get_stock_info":
             title = f"✅ 返回 {name}：{summary.get('name', '?')} / {summary.get('industry', '?')}"
         elif name == "get_dragon_tiger_list":
@@ -1093,6 +1105,32 @@ with tab_analyze:
                     m3.metric("目标价", pa.get("target", "-"))
 
                 feats = result.get("features") or {}
+                # 蜡烛图形态可视化标签
+                candle_parts = []
+                if feats.get("candle_direction"):
+                    dir_emoji = {"阳": "🟢", "阴": "🔴", "十字星": "⚪"}.get(feats["candle_direction"], "")
+                    candle_parts.append(f"{dir_emoji} {feats['candle_direction']}线")
+                if feats.get("candle_pattern") and feats["candle_pattern"] != "无":
+                    pattern_emoji = {
+                        "长上影": "📌", "长下影": "📍", "锤子线": "🔨",
+                        "射击之星": "⭐", "双顶雏形": "⚠️", "量价背离": "📉",
+                        "连续阴": "🔻",
+                    }
+                    emoji = "🕯️"
+                    for k, v in pattern_emoji.items():
+                        if k in str(feats["candle_pattern"]):
+                            emoji = v
+                            break
+                    candle_parts.append(f"{emoji} {feats['candle_pattern']}")
+                if feats.get("candle_body_pct") is not None:
+                    candle_parts.append(f"实体{feats['candle_body_pct']}%")
+                if feats.get("candle_upper_shadow_pct") is not None:
+                    candle_parts.append(f"上影{feats['candle_upper_shadow_pct']}%")
+                if feats.get("candle_lower_shadow_pct") is not None:
+                    candle_parts.append(f"下影{feats['candle_lower_shadow_pct']}%")
+                if candle_parts:
+                    st.caption("🕯️ K线形态：" + " ｜ ".join(candle_parts))
+
                 if feats:
                     with st.expander("技术特征"):
                         feat_df = pd.DataFrame([feats]).T.rename(columns={0: "值"})
@@ -1158,32 +1196,74 @@ with tab_analyze:
                     pass
                 return ""
 
+            verdict = r.get("verdict", "")
+            is_bullish = verdict in ("看多", "偏多", "观望偏多")
             st.caption("加为候选 = 还没买，等触发；已成交 = 已经买入，直接记为持仓")
             cand_col, pos_col = st.columns(2)
 
-            if cand_col.button("加为候选（等触发）", disabled=not entry_advice):
+            # ── AI 没给 entry 但偏多时，让用户手动填 ──
+            if not entry_advice and is_bullish:
+                manual_trigger = cand_col.number_input(
+                    "触发价（AI 未给具体价位，手动输入）",
+                    min_value=0.0, step=0.01, value=0.0,
+                    key=f"manual_trigger_{r['ts_code']}",
+                )
+                can_candidate = manual_trigger > 0
+                trigger_price = manual_trigger if can_candidate else None
+                note_template = f"AI偏多但未给价位，手动设触发 {manual_trigger}（止损 {stop_advice or '-'}  目标 {target_advice or '-'}）"
+            else:
+                can_candidate = bool(entry_advice)
+                trigger_price = entry_advice
+                note_template = f"AI建议买入 {entry_advice}（止损 {stop_advice or '-'}  目标 {target_advice or '-'}）" if entry_advice else ""
+
+            if cand_col.button("加为候选（等触发）", disabled=not can_candidate):
                 name = _resolve_name(r["ts_code"])
                 try:
                     wl_mod.add_candidate(
                         r["ts_code"], name,
-                        trigger_price=entry_advice,
+                        trigger_price=trigger_price,
                         trigger_direction="below",
-                        note=f"AI建议买入 {entry_advice}（止损 {stop_advice or '-'}  目标 {target_advice or '-'}）",
+                        note=note_template,
                         expires_days=7,
                         stop_advice=stop_advice,
                         target_advice=target_advice,
                     )
                     st.session_state.pop("prices", None)
-                    st.success(f"✓ 已加为候选 {r['ts_code']} {name}（触发价 {entry_advice}）")
+                    st.success(f"✓ 已加为候选 {r['ts_code']} {name}（触发价 {trigger_price}）")
                 except Exception as e:
                     st.error(f"添加失败: {e}")
 
             with pos_col:
-                # 仓位预览（基于 AI 建议价位）
+                # ── AI 没给 entry 时让用户手动填成交价 ──
+                if not entry_advice and is_bullish:
+                    manual_entry = st.number_input(
+                        "成交价（AI 未给，手动输入）",
+                        min_value=0.0, step=0.01, value=0.0,
+                        key=f"manual_entry_{r['ts_code']}",
+                    )
+                    manual_stop = st.number_input(
+                        "止损价",
+                        min_value=0.0, step=0.01, value=0.0,
+                        key=f"manual_stop_{r['ts_code']}",
+                    )
+                    manual_target = st.number_input(
+                        "目标价",
+                        min_value=0.0, step=0.01, value=0.0,
+                        key=f"manual_target_{r['ts_code']}",
+                    )
+                    used_entry = manual_entry if manual_entry > 0 else None
+                    used_stop = manual_stop if manual_stop > 0 else None
+                    used_target = manual_target if manual_target > 0 else None
+                else:
+                    used_entry = entry_advice
+                    used_stop = stop_advice
+                    used_target = target_advice
+
+                # 仓位预览（基于 AI 建议价位 或 手动输入价位）
                 analyze_acc = account_mod.load()
                 analyze_sizing = (
-                    account_mod.compute_position_size(entry_advice, stop_advice, account=analyze_acc)
-                    if entry_advice and stop_advice else
+                    account_mod.compute_position_size(used_entry, used_stop, account=analyze_acc)
+                    if used_entry and used_stop else
                     {"ok": False, "shares": 0, "warnings": []}
                 )
                 if analyze_sizing["ok"]:
@@ -1204,14 +1284,14 @@ with tab_analyze:
                 if st.button("已成交，记为持仓"):
                     name = _resolve_name(r["ts_code"])
                     actual_risk = (
-                        analyze_shares * abs(entry_advice - stop_advice)
-                        if analyze_shares and entry_advice and stop_advice else None
+                        analyze_shares * abs(used_entry - used_stop)
+                        if analyze_shares and used_entry and used_stop else None
                     )
                     pos_args = dict(
                         ts_code=r["ts_code"], name=name,
-                        entry_price=entry_advice,
-                        stop_loss=stop_advice,
-                        target=target_advice,
+                        entry_price=used_entry,
+                        stop_loss=used_stop,
+                        target=used_target,
                         expires_days=10,
                         position_size_shares=analyze_shares or None,
                         risk_amount=actual_risk,
@@ -1278,6 +1358,22 @@ with tab_analyze:
                     m3.metric("目标", pa_h.get("target") or "-")
 
                 feats = ent.get("features") or {}
+                # 蜡烛图形态标签（历史记录）
+                candle_parts_h = []
+                if feats.get("candle_direction"):
+                    dir_emoji = {"阳": "🟢", "阴": "🔴", "十字星": "⚪"}.get(feats["candle_direction"], "")
+                    candle_parts_h.append(f"{dir_emoji} {feats['candle_direction']}线")
+                if feats.get("candle_pattern") and feats["candle_pattern"] != "无":
+                    candle_parts_h.append(f"🕯️ {feats['candle_pattern']}")
+                if feats.get("candle_body_pct") is not None:
+                    candle_parts_h.append(f"实体{feats['candle_body_pct']}%")
+                if feats.get("candle_upper_shadow_pct") is not None:
+                    candle_parts_h.append(f"上影{feats['candle_upper_shadow_pct']}%")
+                if feats.get("candle_lower_shadow_pct") is not None:
+                    candle_parts_h.append(f"下影{feats['candle_lower_shadow_pct']}%")
+                if candle_parts_h:
+                    st.caption("🕯️ K线形态：" + " ｜ ".join(candle_parts_h))
+
                 if feats:
                     st.markdown("**技术特征**")
                     feat_df = pd.DataFrame([feats]).T.rename(columns={0: "值"})
