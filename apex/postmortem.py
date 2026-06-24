@@ -248,14 +248,14 @@ def run(record: dict, model: Optional[str] = None) -> dict:
     user_block = _format_for_ai(record, mech, post_exit_text)
     system = _load_system_prompt()
 
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
     # 优先级：调用方 → postmortem.model → screener.ai_model（与 screener 同模型，已验证支持 tool_choice）
     # 注意：deepseek-reasoner / 推理模型不支持强制 tool_choice，因此不能直接落 deepseek.model
     use_model = (
         model
         or cfg.get("postmortem", {}).get("model")
         or cfg.get("screener", {}).get("ai_model")
-        or "deepseek-chat"
+        or cfg.get("deepseek", {}).get("model", "deepseek-chat")
     )
 
     try:

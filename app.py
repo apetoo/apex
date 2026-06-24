@@ -56,6 +56,73 @@ def verdict_badge(verdict: str) -> str:
     return f":{color}[**{verdict}**]"
 
 
+def _render_intraday_chart(ts_code: str) -> None:
+    """渲染当日分时图：1分钟 close 走势线 + VWAP 均价线 + 成交量副图。
+
+    数据来自 data.get_intraday_bars（真实价不复权）。fail-soft：无数据时静默返回。
+    """
+    try:
+        raw = data.get_intraday_bars(ts_code)
+    except Exception:
+        return
+    if not raw or not raw.get("bars"):
+        return
+    bars = raw["bars"]
+    prev_close = raw.get("prev_close")
+    if len(bars) < 2:
+        return
+
+    import pandas as _pd
+    df = _pd.DataFrame(bars)
+    # 用 "HH:MM" 字符串作 category 轴，只画有数据的分钟点，
+    # 避免午休 11:30-13:00 时段被拉成平线
+    df["hm"] = df["time"].str[11:16]
+    df["vol_shou"] = df["vol"] / 100.0
+
+    label = "盘中实时" if raw.get("is_intraday") else "当日"
+    title = f"📈 {ts_code} {label}分时（截至 {raw.get('as_of_time','?')[11:16]}）"
+
+    fig = go.Figure()
+    # 走势线
+    fig.add_trace(go.Scatter(
+        x=df["hm"], y=df["close"], mode="lines", name="现价",
+        line=dict(color="#e84040", width=1.5),
+    ))
+    # 昨收虚线
+    if prev_close:
+        fig.add_hline(y=prev_close, line_dash="dot", line_color="gray",
+                      annotation_text=f"昨收 {prev_close}", annotation_position="top left")
+    # VWAP
+    df["_cum_amount"] = df["amount"].cumsum()
+    df["_cum_vol"] = df["vol"].replace(0, _pd.NA).cumsum()
+    df["vwap"] = (df["_cum_amount"] / df["_cum_vol"]).ffill()
+    fig.add_trace(go.Scatter(
+        x=df["hm"], y=df["vwap"], mode="lines", name="VWAP",
+        line=dict(color="#ffa726", width=1, dash="dash"),
+    ))
+    fig.update_layout(
+        title=title, height=380, margin=dict(l=50, r=20, t=40, b=0),
+        xaxis=dict(type="category", tickangle=0, nticks=12),
+        yaxis=dict(title="价格", side="right", gridcolor="#f0f0f0"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 成交量副图
+    bar_colors = ["#e84040" if c >= o else "#2ecc71" for o, c in zip(df["open"], df["close"])]
+    fig_vol = go.Figure()
+    fig_vol.add_trace(go.Bar(x=df["hm"], y=df["vol_shou"], name="成交量(手)",
+                             marker_color=bar_colors, showlegend=False))
+    fig_vol.update_layout(
+        height=140, margin=dict(l=50, r=20, t=0, b=30),
+        xaxis=dict(type="category", tickangle=0, nticks=12, title="时间"),
+        yaxis=dict(title="量(手)", gridcolor="#f0f0f0"),
+        template="plotly_white",
+    )
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+
 def _render_last_analysis(ts_code: str):
     last = journal.load_latest(ts_code)
     if not last:
@@ -1131,6 +1198,8 @@ with tab_analyze:
                 if candle_parts:
                     st.caption("🕯️ K线形态：" + " ｜ ".join(candle_parts))
 
+                _render_intraday_chart(result.get("ts_code", ts_code_analyze))
+
                 if feats:
                     with st.expander("技术特征"):
                         feat_df = pd.DataFrame([feats]).T.rename(columns={0: "值"})
@@ -1165,6 +1234,7 @@ with tab_analyze:
                     m1.metric("建议买入", pa.get("entry", "-"))
                     m2.metric("止损", pa.get("stop_loss", "-"))
                     m3.metric("目标价", pa.get("target", "-"))
+                _render_intraday_chart(result.get("ts_code", ts_code_analyze))
                 if result.get("analysis_text"):
                     with st.expander("分析内容", expanded=False):
                         st.markdown(result["analysis_text"])
@@ -2024,3 +2094,149 @@ with tab_screen:
                         f"- **{r['ts_code']}** {r.get('name', '')} "
                         f"— {r.get('one_liner', '')}"
                     )
+
+
+# ── Chat sidebar ──────────────────────────────────────────────────────────────
+
+_CHAT_SYSTEM_PROMPT = """\
+你是 Apex AI 股票分析助手，一个 A 股投资对话机器人。
+
+## 核心能力
+- 分析 A 股市场、板块、个股
+- 解读行情数据、资金流向、技术指标
+- 回答投资方法论问题（PE/PB/仓位管理等）
+
+## 意图分析（重要）
+用户表达往往不完整。收到问题后先判断清晰度：
+
+**模糊问题**（如"看看今天盘面""有色板块怎么样""最近有什么机会"）：
+→ 先做 1 轮澄清，追问 1-2 个关键方向。模板：
+  "你想重点看哪个维度？我帮你梳理几个方向：
+  • [方向1] — [一句话说明]
+  • [方向2] — [一句话说明]
+  • [方向3] — [一句话说明]
+  或者直接说'全都要'，我一次性展开。"
+
+**明确问题**（含股票代码/具体指标/明确指令）：
+→ 直接回答。末尾可追加："还需要我分析 XX 方面吗？"（1 个扩展方向即可，不要列太多）
+
+## 对话规则
+- 回答简洁、要点式。每条结论有具体数据或逻辑支撑
+- 涉及买卖建议时声明「⚠️ 仅供参考，不构成投资建议」
+- 用中文回答
+- 当前时间：{current_time}
+"""
+
+# Context budget: reserve ~24K tokens for conversation history (DeepSeek v4-pro = 1M window)
+_CHAT_HISTORY_TOKEN_BUDGET = 24000
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough BPE token estimate for Chinese + English mixed text.
+    Chinese chars ~1.5 tokens, ASCII ~0.3 tokens. Returns int."""
+    cn = sum(1 for c in text if '一' <= c <= '鿿')
+    en = len(text) - cn
+    return int(cn * 1.5 + en * 0.3)
+
+
+def _trim_history(history: list[dict], budget: int) -> list[dict]:
+    """Keep most recent messages that fit within token budget."""
+    kept = []
+    total = 0
+    for msg in reversed(history):
+        t = _estimate_tokens(msg.get("content", ""))
+        if total + t > budget and kept:
+            break
+        kept.insert(0, msg)
+        total += t
+    return kept
+
+
+def _chat_reply(user_message: str, chat_history: list[dict]):
+    """Stream a reply from the LLM. Yields content chunks."""
+    from apex import llm
+
+    now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S 北京时间")
+    system = _CHAT_SYSTEM_PROMPT.format(current_time=now_str)
+
+    messages = [{"role": "system", "content": system}]
+    for m in _trim_history(chat_history, _CHAT_HISTORY_TOKEN_BUDGET):
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        yield from llm.chat_stream(messages, temperature=0.3, max_tokens=8192)
+    except Exception as e:
+        yield f"\n\n❌ 调用大模型失败：{e}"
+
+
+def _render_chat_sidebar():
+    """Render AI chat panel in the sidebar with streaming replies."""
+    with st.sidebar:
+        st.subheader("💬 AI 对话")
+
+        if "_chat_messages" not in st.session_state:
+            st.session_state["_chat_messages"] = []
+        if "_chat_pending" not in st.session_state:
+            st.session_state["_chat_pending"] = None
+
+        # ── Toolbar ──
+        has_messages = len(st.session_state["_chat_messages"]) > 0
+        if has_messages:
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("🗑️ 清空", use_container_width=True, key="clear_chat_btn"):
+                    st.session_state["_chat_messages"] = []
+                    st.session_state["_chat_pending"] = None
+                    st.rerun()
+            with col2:
+                st.caption(f"{len(st.session_state['_chat_messages'])} 条消息")
+
+        # ── Content ──
+        if not has_messages and st.session_state["_chat_pending"] is None:
+            st.info(
+                "👋 我是 Apex AI 股票分析助手。\n\n"
+                "可以问我任何 A 股相关的问题，比如：\n"
+                "• 最近市场热点是什么？\n"
+                "• 如何理解 PE 和 PB？\n"
+                "• 当前仓位管理有什么建议？\n\n"
+                "⚠️ 分析仅供参考，不构成投资建议"
+            )
+        else:
+            pending = st.session_state["_chat_pending"]
+            chat_container = st.container(height=380)
+            with chat_container:
+                for msg in st.session_state["_chat_messages"]:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+                # Stream assistant reply if there's a pending message
+                if pending is not None:
+                    st.session_state["_chat_pending"] = None
+                    with st.chat_message("assistant"):
+                        chunks = []
+                        try:
+                            for chunk in _chat_reply(
+                                user_message=pending,
+                                chat_history=[
+                                    {"role": m["role"], "content": m["content"]}
+                                    for m in st.session_state["_chat_messages"]
+                                ],
+                            ):
+                                chunks.append(chunk)
+                            reply = "".join(chunks)
+                            st.markdown(reply)
+                        except Exception as e:
+                            reply = f"❌ 出错了：{e}"
+                            st.error(reply)
+                    st.session_state["_chat_messages"].append({"role": "assistant", "content": reply})
+                    st.rerun()
+
+        # ── Chat input (always last) ──
+        if prompt := st.chat_input("输入问题...", key="sidebar_chat"):
+            st.session_state["_chat_messages"].append({"role": "user", "content": prompt})
+            st.session_state["_chat_pending"] = prompt
+            st.rerun()
+
+
+_render_chat_sidebar()

@@ -299,7 +299,7 @@ def _ai_quick_screen(top_candidates: list[dict], cfg: dict,
 
     client = OpenAI(
         api_key=cfg["deepseek"]["api_key"],
-        base_url="https://api.deepseek.com",
+        base_url=cfg["deepseek"].get("base_url", "https://api.deepseek.com"),
     )
     model = cfg["screener"].get("ai_model") or cfg["deepseek"]["model"]
     system = _load_screener_prompt(regime=regime)

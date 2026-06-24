@@ -454,6 +454,315 @@ def get_latest_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
     return result
 
 
+def _sina_prev_close(ts_code: str) -> Optional[float]:
+    """从新浪行情取昨收价（真实价，不复权）。失败返 None。
+
+    与 akshare 分时线口径一致（均为真实成交价），避免用 qfq 日线昨收导致除权日算错。
+    """
+    try:
+        symbol = ts_code.split(".")[0]
+        suffix = ts_code.split(".")[1] if "." in ts_code else ""
+        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sh")
+        url = f"https://hq.sinajs.cn/list={prefix}{symbol}"
+        req = urllib.request.Request(url, headers={
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": "Mozilla/5.0",
+        })
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+        import re
+        m = re.search(r'="([^"]*)"', raw)
+        if not m:
+            return None
+        fields = m.group(1).split(",")
+        if len(fields) < 3:
+            return None
+        pc = float(fields[2])
+        return pc if pc > 0 else None
+    except Exception:
+        return None
+
+
+def _intraday_shape(open_p: float, last: float, prev_close: Optional[float],
+                    high: float, low: float) -> str:
+    """根据开盘/现价/昨收/高低点判断盘中走势形态文字。"""
+    if not prev_close or prev_close <= 0 or open_p <= 0:
+        return "未知"
+    open_chg = (open_p - prev_close) / prev_close
+    trend = (last - open_p) / open_p
+    open_label = "高开" if open_chg > 0.002 else ("低开" if open_chg < -0.002 else "平开")
+    trend_label = "高走" if trend > 0.003 else ("低走" if trend < -0.003 else "震荡")
+    base = f"{open_label}{trend_label}"
+    # 冲高回落 / 探底回升补充
+    if last > 0:
+        upper_excursion = (high - last) / last  # 盘中最高到现价的回落
+        lower_excursion = (last - low) / last if low > 0 else 0
+        if upper_excursion > 0.01 and trend < 0.003:
+            base += "（冲高回落）"
+        elif lower_excursion > 0.01 and trend > -0.003:
+            base += "（探底回升）"
+    return base
+
+
+def get_intraday_bars(ts_code: str) -> dict:
+    """底层：取个股当日 1 分钟 K 线（akshare，真实价不复权）+ 昨收 + 昨量。
+
+    供 get_intraday_snapshot（给 AI 的特征）和 app.py 分时图（给人看）复用。
+    返回 dict：{trade_date, as_of_time, is_intraday, prev_close, prev_vol_shou,
+               bars: [{time, open, high, low, close, vol, amount}, ...]}
+    任何失败返回空 dict（fail-soft）。bars 按时间升序，仅含当日。
+    """
+    out: dict = {}
+    try:
+        import akshare as ak
+        symbol = ts_code.split(".")[0]
+        suffix = ts_code.split(".")[1] if "." in ts_code else ""
+        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sh")
+        df = ak.stock_zh_a_minute(symbol=f"{prefix}{symbol}", period="1", adjust="")
+        if df is None or df.empty:
+            return out
+        df = df.copy()
+        df["day"] = df["day"].astype(str)
+        last_date = df["day"].iloc[-1][:10]
+        today_df = df[df["day"].str.startswith(last_date)].reset_index(drop=True)
+        if today_df.empty:
+            return out
+        for col in ("open", "high", "low", "close", "volume"):
+            if col in today_df.columns:
+                today_df[col] = pd.to_numeric(today_df[col], errors="coerce")
+        # amount 列在不同 akshare 版本可能缺失，缺失时用 close*volume 估算成交额
+        if "amount" in today_df.columns:
+            today_df["amount"] = pd.to_numeric(today_df["amount"], errors="coerce")
+            today_df["amount"] = today_df["amount"].fillna(today_df["close"] * today_df["volume"])
+        else:
+            today_df["amount"] = today_df["close"] * today_df["volume"]
+
+        last_row = today_df.iloc[-1]
+        as_of_time = str(last_row["day"])
+        trade_date = last_date.replace("-", "")
+        now = datetime.today()
+        is_intraday = (last_date == now.strftime("%Y-%m-%d")) and (as_of_time[11:16] < "15:00")
+
+        # 昨收（真实价）：新浪优先，失败回落日线不复权
+        prev_close = _sina_prev_close(ts_code)
+        prev_vol_shou: Optional[float] = None
+        if not prev_close or True:  # 昨收和昨量都从日线取一次（不复权真实价）
+            try:
+                bars = json.loads(get_daily_price(ts_code, adj="none"))
+                prev_bars = [b for b in bars if str(b.get("trade_date")) != trade_date]
+                if prev_bars:
+                    if not prev_close:
+                        prev_close = float(prev_bars[-1]["close"])
+                    prev_vol_shou = float(prev_bars[-1].get("vol") or 0)
+            except Exception:
+                pass
+
+        bars_list = []
+        for _, r in today_df.iterrows():
+            bars_list.append({
+                "time": str(r["day"]),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "vol": float(r["volume"]),
+                "amount": float(r["amount"]),
+            })
+
+        out = {
+            "trade_date": trade_date,
+            "as_of_time": as_of_time,
+            "is_intraday": is_intraday,
+            "prev_close": round(prev_close, 2) if prev_close else None,
+            "prev_vol_shou": prev_vol_shou,
+            "bars": bars_list,
+        }
+    except Exception:
+        pass
+    return out
+
+
+def _intraday_session_segments(bars: list[dict], prev_close: Optional[float]) -> Optional[list[dict]]:
+    """量价段分析：把当日分为早盘(09:30-10:30)/中盘(10:30-11:30,13:00-14:00)/尾盘(14:00-15:00)。
+
+    每段算：起止价涨跌%（相对段开盘）、成交量占全天比。返回 3 段摘要。
+    """
+    if not bars or not prev_close:
+        return None
+
+    def _seg(bars_seg: list[dict], name: str) -> dict:
+        if not bars_seg:
+            return {"name": name, "chg_pct": None, "vol_pct": None}
+        seg_open = bars_seg[0]["close"]
+        seg_close = bars_seg[-1]["close"]
+        chg = (seg_close - seg_open) / seg_open * 100 if seg_open > 0 else None
+        vol = sum(b["vol"] for b in bars_seg)
+        return {"name": name, "chg_pct": round(chg, 2) if chg is not None else None,
+                "close": round(seg_close, 2), "vol": vol}
+
+    total_vol = sum(b["vol"] for b in bars) or 1
+    early, mid, late = [], [], []
+    for b in bars:
+        hm = b["time"][11:16]
+        if "09:30" <= hm < "10:30":
+            early.append(b)
+        elif "10:30" <= hm < "11:30" or "13:00" <= hm < "14:00":
+            mid.append(b)
+        elif "14:00" <= hm <= "15:00":
+            late.append(b)
+    segs = [_seg(early, "早盘"), _seg(mid, "中盘"), _seg(late, "尾盘")]
+    for s in segs:
+        s["vol_pct"] = round(s["vol"] / total_vol * 100, 1) if s.get("vol") else None
+        s.pop("vol", None)
+    return segs
+
+
+def _intraday_swing(bars: list[dict], prev_close: Optional[float]) -> Optional[dict]:
+    """盘中拐点/回吐：找盘中最高/最低点，算从极值到现价的回吐/反弹幅度。
+
+    返回 {high_time, high_pct, high_to_now_pct, low_time, low_pct, low_to_now_pct, verdict}
+    high_pct/low_pct 相对昨收；*_to_now_pct 为从极值到最新价的变动（正=从高点回吐，负=从低点反弹）。
+    """
+    if not bars or not prev_close:
+        return None
+    last_price = bars[-1]["close"]
+    # 盘中最高/最低用 close 序列
+    closes = [(b["time"], b["close"]) for b in bars]
+    hi_time, hi_price = max(closes, key=lambda x: x[1])
+    lo_time, lo_price = min(closes, key=lambda x: x[1])
+    hi_pct = (hi_price - prev_close) / prev_close * 100
+    lo_pct = (lo_price - prev_close) / prev_close * 100
+    hi_to_now = (last_price - hi_price) / hi_price * 100  # 负值=从高点回落
+    lo_to_now = (last_price - lo_price) / lo_price * 100  # 正值=从低点反弹
+    # 判定：现价离高点近还是离低点近
+    verdict = ""
+    if hi_to_now < -1.0:
+        verdict = f"从盘中高点({hi_pct:+.1f}%)回落{abs(hi_to_now):.1f}%"
+    elif lo_to_now > 1.0:
+        verdict = f"从盘中低点({lo_pct:+.1f}%)反弹{lo_to_now:.1f}%"
+    else:
+        verdict = "现价接近盘中极值，趋势延续"
+    return {
+        "high_time": hi_time[11:16], "high_pct": round(hi_pct, 2),
+        "high_to_now_pct": round(hi_to_now, 2),
+        "low_time": lo_time[11:16], "low_pct": round(lo_pct, 2),
+        "low_to_now_pct": round(lo_to_now, 2),
+        "verdict": verdict,
+    }
+
+
+def _intraday_vol_price_match(bars: list[dict]) -> Optional[dict]:
+    """量价配合：统计放量上涨 vs 放量下跌的分钟数，判断主动买/卖盘主导。
+
+    放量阈值 = 当日分钟均量的 1.5 倍。上涨/下跌按当根 close vs open。
+    返回 {up_vol_mins, down_vol_mins, verdict} verdict ∈ {主动买盘主导/主动卖盘主导/多空均衡}。
+    """
+    if not bars or len(bars) < 10:
+        return None
+    avg_vol = sum(b["vol"] for b in bars) / len(bars)
+    threshold = avg_vol * 1.5
+    if threshold <= 0:
+        return None
+    up_mins = down_mins = 0
+    for b in bars:
+        if b["vol"] < threshold:
+            continue
+        if b["close"] > b["open"]:
+            up_mins += 1
+        elif b["close"] < b["open"]:
+            down_mins += 1
+    total = up_mins + down_mins
+    if total == 0:
+        verdict = "无明显放量分钟，多空均衡"
+    elif up_mins > down_mins * 1.5:
+        verdict = f"主动买盘主导（放量上涨{up_mins}分钟 vs 放量下跌{down_mins}分钟）"
+    elif down_mins > up_mins * 1.5:
+        verdict = f"主动卖盘主导（放量下跌{down_mins}分钟 vs 放量上涨{up_mins}分钟）"
+    else:
+        verdict = f"多空均衡（放量上涨{up_mins}分钟 vs 放量下跌{down_mins}分钟）"
+    return {"up_vol_mins": up_mins, "down_vol_mins": down_mins, "verdict": verdict}
+
+
+def get_intraday_snapshot(ts_code: str) -> str:
+    """获取个股当日盘中分时走势快照（akshare 1分钟线 + 新浪昨收，Python 预计算特征）。
+
+    盘中时为实时走势快照，收盘后为当日完整走势。fail-soft：任何失败返回空 dict。
+    与 get_realtime_price 不同，这里返回"走势特征"（开盘/最高/最低/VWAP/形态/量能 + 量价段/拐点/量价配合），
+    供 analyze.py 注入 prompt，不注册为 AI tool（避免漏调，与 get_market_context 同设计）。
+
+    返回 JSON 字符串。注意：分时数据为真实价（不复权），昨收取新浪真实价，口径一致。
+    """
+    result: dict = {}
+    raw = get_intraday_bars(ts_code)
+    if not raw or not raw.get("bars"):
+        return json.dumps(result, ensure_ascii=False)
+    try:
+        bars = raw["bars"]
+        prev_close = raw.get("prev_close")
+        prev_vol_shou = raw.get("prev_vol_shou")
+        as_of_time = raw["as_of_time"]
+        trade_date = raw["trade_date"]
+        is_intraday = raw["is_intraday"]
+
+        last_price = bars[-1]["close"]
+        open_price = bars[0]["open"]
+        high = max(b["high"] for b in bars)
+        low = min(b["low"] for b in bars)
+        total_amount = sum(b["amount"] for b in bars)
+        total_vol_shares = sum(b["vol"] for b in bars)
+        total_vol_shou = total_vol_shares / 100.0  # 股 → 手
+        vwap = (total_amount / total_vol_shares) if total_vol_shares > 0 else last_price
+
+        day_chg_pct = ((last_price - prev_close) / prev_close * 100) if prev_close else None
+        vwap_position_pct = ((last_price - vwap) / vwap * 100) if vwap > 0 else None
+        amplitude_pct = ((high - low) / prev_close * 100) if prev_close else None
+
+        # 量比：当前累计量 / 昨日全天量，按时间进度修正（收盘后 progress=1 即正常量比）
+        vol_ratio: Optional[float] = None
+        vol_label: Optional[str] = None
+        if prev_vol_shou and prev_vol_shou > 0 and len(bars) > 0:
+            progress = len(bars) / 240.0
+            if progress > 0.02:
+                vol_ratio = round((total_vol_shou / prev_vol_shou) / progress, 2)
+                if vol_ratio >= 1.2:
+                    vol_label = "放量"
+                elif vol_ratio <= 0.8:
+                    vol_label = "缩量"
+                else:
+                    vol_label = "平量"
+
+        shape = _intraday_shape(open_price, last_price, prev_close, high, low)
+        segments = _intraday_session_segments(bars, prev_close)
+        swing = _intraday_swing(bars, prev_close)
+        vol_price = _intraday_vol_price_match(bars)
+
+        result = {
+            "trade_date": trade_date,
+            "as_of_time": as_of_time,
+            "is_intraday": is_intraday,
+            "last_price": round(last_price, 2),
+            "prev_close": round(prev_close, 2) if prev_close else None,
+            "open": round(open_price, 2),
+            "high": round(high, 2),
+            "low": round(low, 2),
+            "day_chg_pct": round(day_chg_pct, 2) if day_chg_pct is not None else None,
+            "vwap": round(vwap, 2),
+            "vwap_position_pct": round(vwap_position_pct, 2) if vwap_position_pct is not None else None,
+            "amplitude_pct": round(amplitude_pct, 2) if amplitude_pct is not None else None,
+            "amount_yi": round(total_amount / 1e8, 2),
+            "vol_ratio": vol_ratio,
+            "vol_label": vol_label,
+            "shape": shape,
+            "session_segments": segments,
+            "swing": swing,
+            "vol_price_match": vol_price,
+        }
+    except Exception:
+        pass
+    return json.dumps(result, ensure_ascii=False)
+
+
 # 博查结果信任度分级：数字越小越高信任
 _SITE_TRUST: dict[str, int] = {
     # 官方公告源

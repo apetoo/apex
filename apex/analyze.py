@@ -7,11 +7,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-_TZ_CN = timezone(timedelta(hours=8))
-
 from openai import OpenAI
 
-from apex import config, data, journal, calibration, evidence_attribution, trace as trace_mod
+_TZ_CN = timezone(timedelta(hours=8))
+
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod
 from apex.schemas import VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS
 
 
@@ -347,7 +347,7 @@ TOOLS = [
 
 
 def _load_system_prompt() -> str:
-    cfg = config.get()
+    cfg = _cfg_mod.get()
     prompt_path = Path(cfg["paths"]["prompt_file"]).expanduser()
     if prompt_path.exists():
         base = prompt_path.read_text(encoding="utf-8")
@@ -388,7 +388,7 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
 def _make_client(cfg: dict) -> OpenAI:
     return OpenAI(
         api_key=cfg["deepseek"]["api_key"],
-        base_url="https://api.deepseek.com",
+        base_url=cfg["deepseek"].get("base_url", "https://api.deepseek.com"),
     )
 
 
@@ -817,6 +817,84 @@ def _format_portfolio_context(candidate_ts_code: str) -> str:
         return f"## 你的当前持仓上下文\n（加载失败: {type(e).__name__}: {e}）"
 
 
+def _format_intraday_block(ts_code: str) -> tuple[str, dict]:
+    """个股盘中分时走势快照，注入 prompt。返回 (formatted_str, raw_dict)。
+
+    盘中时为实时走势（当日尚未收盘），收盘后为当日完整走势。
+    fail-soft：加载失败时提示 AI 以 get_daily_price 最新 bar 为准。
+    """
+    try:
+        raw = data.get_intraday_snapshot(ts_code)
+        ctx = json.loads(raw)
+    except Exception as e:
+        return f"## 盘中实时走势\n（加载失败: {type(e).__name__}: {e}）", {}
+
+    if not ctx or not ctx.get("last_price"):
+        return ("## 盘中实时走势\n（数据加载失败，请以 get_daily_price 最新 bar 为准）", ctx)
+
+    intra_label = "盘中实时" if ctx.get("is_intraday") else "当日"
+    lines = [f"## {intra_label}走势（截至 {ctx.get('as_of_time', '?')}）"]
+
+    parts = [f"现价 {ctx['last_price']}"]
+    if ctx.get("prev_close") is not None:
+        parts.append(f"昨收 {ctx['prev_close']}")
+    if ctx.get("day_chg_pct") is not None:
+        parts.append(f"日内 {ctx['day_chg_pct']:+.2f}%")
+    if ctx.get("open") is not None:
+        parts.append(f"开盘 {ctx['open']}")
+    if ctx.get("high") is not None and ctx.get("low") is not None:
+        parts.append(f"高/低 {ctx['high']}/{ctx['low']}")
+    if ctx.get("amplitude_pct") is not None:
+        parts.append(f"振幅 {ctx['amplitude_pct']:.2f}%")
+    lines.append(f"- {' / '.join(parts)}")
+
+    parts2 = []
+    if ctx.get("vwap") is not None:
+        parts2.append(f"VWAP {ctx['vwap']}")
+    if ctx.get("vwap_position_pct") is not None:
+        pos = ctx["vwap_position_pct"]
+        pos_label = "盘上偏强" if pos > 0 else "盘下偏弱"
+        parts2.append(f"现价{pos_label}({pos:+.2f}%)")
+    if ctx.get("shape"):
+        parts2.append(f"形态 {ctx['shape']}")
+    if ctx.get("vol_ratio") is not None:
+        parts2.append(f"量比{ctx['vol_ratio']:.2f}({ctx.get('vol_label') or ''})")
+    if ctx.get("amount_yi") is not None:
+        parts2.append(f"成交额 {ctx['amount_yi']:.2f}亿")
+    if parts2:
+        lines.append(f"- {' / '.join(parts2)}")
+
+    if ctx.get("is_intraday"):
+        lines.append("- ⚠ 盘中数据，尚未收盘；需与 get_daily_price 最新 bar（上一交易日）结合判断当日强弱。")
+    else:
+        lines.append("- 当日已收盘，可与日线最新 bar 对齐。")
+
+    # 量价段分析（早/中/尾盘）
+    segs = ctx.get("session_segments")
+    if segs:
+        seg_parts = []
+        for s in segs:
+            if s.get("chg_pct") is None:
+                continue
+            vol_pct = s.get("vol_pct")
+            vol_str = f"量占{vol_pct:.0f}%" if vol_pct is not None else ""
+            seg_parts.append(f"{s['name']}{s['chg_pct']:+.2f}%{vol_str}")
+        if seg_parts:
+            lines.append(f"- 分段：{' / '.join(seg_parts)}")
+
+    # 盘中拐点/回吐
+    sw = ctx.get("swing")
+    if sw and sw.get("verdict"):
+        lines.append(f"- 拐点：{sw['verdict']}（高{sw.get('high_time')} {sw.get('high_pct')}% / 低{sw.get('low_time')} {sw.get('low_pct')}%）")
+
+    # 量价配合
+    vp = ctx.get("vol_price_match")
+    if vp and vp.get("verdict"):
+        lines.append(f"- 量价：{vp['verdict']}")
+
+    return "\n".join(lines), ctx
+
+
 def _format_market_context(ts_code: str) -> tuple[str, dict]:
     """大盘 / 板块 / 资金面 / 个股相对强度 context。
 
@@ -841,7 +919,8 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
         for idx in ctx["indices"]:
             parts = [f"{idx['name']} {idx['close']}"]
             if idx.get("daily_chg_pct") is not None:
-                parts.append(f"今日 {idx['daily_chg_pct']:+.2f}%")
+                trade_date_label = idx.get("trade_date", "上一个交易日")
+                parts.append(f"{trade_date_label} {idx['daily_chg_pct']:+.2f}%")
             if idx.get("chg_5d_pct") is not None:
                 parts.append(f"5日 {idx['chg_5d_pct']:+.2f}%")
             if idx.get("chg_20d_pct") is not None:
@@ -859,7 +938,8 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
     if sector:
         parts = []
         if sector.get("daily_chg_pct") is not None:
-            parts.append(f"今日 {sector['daily_chg_pct']:+.2f}%")
+                trade_date_label = sector.get("trade_date", "上一个交易日")
+                parts.append(f"{trade_date_label} {sector['daily_chg_pct']:+.2f}%")
         if sector.get("chg_5d_pct") is not None:
             parts.append(f"5日 {sector['chg_5d_pct']:+.2f}%")
         if sector.get("chg_20d_pct") is not None:
@@ -895,7 +975,9 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
         parts = []
         if nm.get("today_yi") is not None:
             t = nm["today_yi"]
-            parts.append(f"今日{'净流入' if t >= 0 else '净流出'} {abs(t):.2f} 亿")
+            trade_dates = nm.get("trade_dates", [])
+            label_date = trade_dates[-1] if trade_dates else "上一个交易日"
+            parts.append(f"{label_date}{'净流入' if t >= 0 else '净流出'} {abs(t):.2f} 亿")
         if nm.get("cumulative_5d_yi") is not None:
             c = nm["cumulative_5d_yi"]
             parts.append(f"5日累计{'净流入' if c >= 0 else '净流出'} {abs(c):.2f} 亿")
@@ -961,7 +1043,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     AI assistant text / tool call / tool result / verdict). See apex/trace.py
     for event schema. Returns the parsed verdict dict. Saves to journal if save=True.
     """
-    cfg = config.get()
+    cfg = _cfg_mod.get()
     model = cfg["deepseek"]["model"]
     max_iter = cfg["deepseek"]["max_tool_iterations"]
     client = _make_client(cfg)
@@ -981,9 +1063,14 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         journal.load_entries(ts_code=ts_code), ts_code=ts_code,
     )
     portfolio_block = _format_portfolio_context(ts_code)
+    intraday_block, intraday_ctx = _format_intraday_block(ts_code)
     market_block, market_ctx = _format_market_context(ts_code)
+    # 把盘中走势快照并入 market_context，事后复盘一处看全
+    if intraday_ctx:
+        market_ctx["intraday"] = intraday_ctx
     _emit({"type": "context", "name": "history", "content": history_block})
     _emit({"type": "context", "name": "portfolio", "content": portfolio_block})
+    _emit({"type": "context", "name": "intraday", "content": intraday_block})
     _emit({"type": "context", "name": "market", "content": market_block})
 
     messages = [
@@ -994,6 +1081,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"请分析股票 {ts_code}。\n\n"
                 f"## 该标的过往判断（最近 5 次，含实际后续表现）\n{history_block}\n\n"
                 f"{portfolio_block}\n\n"
+                f"{intraday_block}\n\n"
                 f"{market_block}\n\n"
                 "步骤：\n"
                 "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"

@@ -214,7 +214,7 @@ def select(regime: Optional[dict],
     use_model = (
         cfg.get("strategy_selector", {}).get("model")
         or cfg.get("screener", {}).get("ai_model")
-        or "deepseek-chat"
+        or cfg.get("deepseek", {}).get("model", "deepseek-chat")
     )
 
     # 候选全 0 → 不调用 AI
@@ -222,7 +222,7 @@ def select(regime: Optional[dict],
     if total_cands == 0:
         return _equal_weights(), "今日无候选，使用等权重（无影响）"
 
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
     prompt = _build_prompt(regime, candidates_count)
     tool = _build_tool_schema()
 
