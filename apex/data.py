@@ -1045,6 +1045,32 @@ def _fetch_index_bars(codes: list[str], days: int = 30) -> dict[str, list[dict]]
     return result
 
 
+def get_index_daily(code: str, days: int = 2) -> str:
+    """取指数日线(ED13 端点), 返回 JSON 字符串。
+
+    Args:
+        code: 指数代码(000001.SH 上证 / 399001.SZ 深证)
+        days: 取最近 N 天(默认 2, 够算当日 vol + 昨收对比)
+
+    Returns:
+        JSON 字符串: {
+            "code": "000001.SH",
+            "name": "上证指数",  # 已知指数直接给名字, 不另查
+            "bars": [{"trade_date": "20260625", "close": 3245.67, "vol": 12345678, "pct_chg": 0.79}, ...]
+        }
+        失败返 "{}" 字符串(后端 parse_json 解包成空 dict)
+    """
+    INDEX_NAMES = {"000001.SH": "上证指数", "399001.SZ": "深证成指", "399006.SZ": "创业板指"}
+    payload = {"code": code, "name": INDEX_NAMES.get(code, ""), "bars": []}
+    bars_map = _fetch_index_bars([code], days=days)
+    bars = bars_map.get(code, [])
+    if not bars:
+        return json.dumps(payload, ensure_ascii=False)
+    # 把 tushare 字段标准化(原样返回, 字段名是 trade_date/close/vol/pct_chg)
+    payload["bars"] = bars
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _get_sw_l1_for_stock(ts_code: str) -> Optional[str]:
     """查股票所属 申万 L1 行业指数代码。失败返 None（如基础账户没权限）。"""
     try:

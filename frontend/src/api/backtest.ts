@@ -124,14 +124,45 @@ const MOCK_SIGNALS: BacktestSignal[] = [
 export interface BacktestRealized {
   ts_code: string;
   name?: string;
+  strategy?: string;
+  regime?: string;
   entry_date: string;
   exit_date: string;
-  entry_price: number;
+  // 兼容: 真后端 fill_price, 老 mock entry_price
+  fill_price?: number;
+  entry_price?: number;
   exit_price: number;
-  net_return: number;
-  exit_reason: string;
-  hold_days: number;
+  // 兼容: 真后端 net_pnl_pct / gross_pnl_pct, 老 mock net_return
+  net_pnl_pct?: number;
+  net_return?: number;
+  gross_pnl_pct?: number;
+  exit_reason: string; // 英文 code 或中文, 由显示层映射
+  // 兼容: 真后端 days_held, 老 mock hold_days
+  days_held?: number;
+  hold_days?: number;
   hit: boolean;
+  ai_verdict?: string;
+  ai_confidence?: number;
+}
+
+/** exit_reason 英文 code → 中文(用户可读) + 方向色 */
+const EXIT_REASON_MAP: Record<
+  string,
+  { label: string; tone: "up" | "down" | "flat" }
+> = {
+  stop_hit: { label: "止损", tone: "down" },
+  target_hit: { label: "止盈", tone: "up" },
+  manual: { label: "手动", tone: "flat" },
+  expired: { label: "到期", tone: "flat" },
+  // 老 mock 中文(向后兼容)
+  止盈: { label: "止盈", tone: "up" },
+  止损: { label: "止损", tone: "down" },
+};
+
+export function resolveExitReason(
+  raw: string,
+): { label: string; tone: "up" | "down" | "flat" } {
+  return EXIT_REASON_MAP[raw] ?? { label: raw, tone: "flat" };
 }
 
 const MOCK_REALIZED: BacktestRealized[] = [

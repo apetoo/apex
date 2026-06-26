@@ -32,6 +32,14 @@ export interface ScreenerReport {
     passed_filters: number;
     total_filters: number;
     notes?: string;
+    // 真后端 top_scored 富字段(可选, 详情页可展示)
+    strategy?: string;
+    strategy_reasoning?: string;
+    one_liner?: string;
+    ai_score?: number;
+    verdict?: string;
+    actionable?: string;
+    red_flag?: boolean;
   }>;
   summary: {
     total_screened: number;
@@ -39,6 +47,15 @@ export interface ScreenerReport {
     by_strategy: Record<string, number>;
   };
   ai_summary?: string;
+  // 真后端独有字段
+  regime?: {
+    label: string;
+    summary: string;
+  };
+  stats?: {
+    total_candidates: number;
+    top_n: number;
+  };
 }
 
 const MOCK_STRATEGIES: ScreenerStrategy[] = [
@@ -107,9 +124,83 @@ export async function getDefaultWeights(): Promise<ScreenerWeights> {
 
 export async function getReport(date?: string): Promise<ScreenerReport | null> {
   if (USE_MOCK) return MOCK_REPORT;
-  return api.get<ScreenerReport | null>(
+  const raw = await api.get<Record<string, unknown> | null>(
     date ? `/screener/report?date=${date}` : "/screener/report",
   );
+  if (!raw) return null;
+  return adaptScreenerReport(raw);
+}
+
+/**
+ * 把真后端 /api/screener/report 响应适配成前端 ScreenerReport 形状。
+ *
+ * 真后端返回(backend/routers/screener.py + apex/screener.py):
+ *   { trade_date, generated_at, regime, strategy_weights, weights_source,
+ *     selector_reasoning, by_strategy: { <name>: { n_candidates, weight, top_5 } },
+ *     top_scored: [...], all_candidates_summary, stats: { total_candidates, top_n } }
+ *
+ * 前端期望: { date, picks, summary, ai_summary?, regime?, stats? }
+ */
+function adaptScreenerReport(
+  raw: Record<string, unknown>,
+): ScreenerReport {
+  const topScored = (raw.top_scored as Array<Record<string, unknown>>) ?? [];
+  const byStrategy =
+    (raw.by_strategy as Record<string, Record<string, unknown>>) ?? {};
+  const stats = (raw.stats as { total_candidates?: number; top_n?: number }) ?? {};
+
+  // picks: 把 top_scored 拍平, 通过率用 strategy 命中数 / 5(每策略 top_5)
+  const picks = topScored.map((p) => {
+    const strategy = p.strategy as string | undefined;
+    const strat = strategy ? byStrategy[strategy] : undefined;
+    const n = (strat?.n_candidates as number) ?? 0;
+    return {
+      ts_code: p.ts_code as string,
+      name: (p.name as string) ?? (p.ts_code as string),
+      score: (p._weighted_score as number) ?? (p.strategy_score as number) ?? 0,
+      passed_filters: n > 0 ? Math.min(5, Math.ceil((p.ai_score as number) ?? 3)) : 1,
+      total_filters: 5,
+      notes:
+        (p.one_liner as string) ??
+        (p.strategy_reasoning as string) ??
+        (strategy ?? ""),
+      strategy,
+      strategy_reasoning: p.strategy_reasoning as string | undefined,
+      one_liner: p.one_liner as string | undefined,
+      ai_score: p.ai_score as number | undefined,
+      verdict: p.verdict as string | undefined,
+      actionable: p.actionable as string | undefined,
+      red_flag: p.red_flag as boolean | undefined,
+    };
+  });
+
+  // summary: total_screened 没法精确(后端不返回)用 stats.total_candidates 兜底
+  // passed = top_scored.length, by_strategy = n_candidates 倒填
+  const byStrategyCounts: Record<string, number> = {};
+  for (const [k, v] of Object.entries(byStrategy)) {
+    byStrategyCounts[k] = (v.n_candidates as number) ?? 0;
+  }
+  const totalCandidates =
+    stats.total_candidates ??
+    Object.values(byStrategy).reduce(
+      (a, v) => a + ((v.n_candidates as number) ?? 0),
+      0,
+    );
+
+  return {
+    date: (raw.trade_date as string) ?? "",
+    picks,
+    summary: {
+      total_screened: totalCandidates,
+      passed: topScored.length,
+      by_strategy: byStrategyCounts,
+    },
+    // selector_reasoning 是后端给 AI 选的"为什么这样配权重", 不是 AI summary,
+    // 但前端没专门的字段就先塞进 ai_summary 让用户看到
+    ai_summary: (raw.selector_reasoning as string) ?? undefined,
+    regime: raw.regime as { label: string; summary: string } | undefined,
+    stats,
+  };
 }
 
 export async function getAvailableDates(): Promise<string[]> {

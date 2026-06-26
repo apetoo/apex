@@ -159,12 +159,25 @@ def run(ts_code: Optional[str] = None,
             continue
 
         end_date = _add_days(entry_date, lookforward_days + 10)
-        raw = data.get_daily_price(code,
-                                   start_date=entry_date.replace("-", ""),
-                                   end_date=end_date.replace("-", ""))
+        try:
+            raw = data.get_daily_price(code,
+                                       start_date=entry_date.replace("-", ""),
+                                       end_date=end_date.replace("-", ""))
+        except Exception as exc:
+            # 防御: tushare 限流/akshare 代理挂掉, 单条 code 失败不要拖垮整次回测
+            print(f"  ⚠ {code} {entry_date} 拉行情失败: {type(exc).__name__}: {exc}")
+            continue
         try:
             records = json.loads(raw)
         except Exception:
+            continue
+
+        # 防御: get_daily_price 在出错时可能返回 dict ({"error": "..."} 或
+        # {"detail": "..."}), 而不是 list[dict]; pd.DataFrame(dict) 出来的
+        # 列名是 dict 的 key, 后面 df["trade_date"] 直接 KeyError。
+        if not isinstance(records, list) or not records:
+            continue
+        if "trade_date" not in records[0]:
             continue
 
         if not records or len(records) < 3:

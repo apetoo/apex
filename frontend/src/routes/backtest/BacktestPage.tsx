@@ -10,7 +10,7 @@ import {
   Button,
 } from "@/components/base";
 import { VerdictTag } from "@/components/a-share";
-import { getBacktestSignals, getBacktestRealized } from "@/api/backtest";
+import { getBacktestSignals, getBacktestRealized, resolveExitReason } from "@/api/backtest";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
 
 /**
@@ -225,7 +225,20 @@ export function BacktestPage() {
             <p className="py-4 text-center text-sm text-flat">暂无实盘</p>
           ) : (
             <div className="divide-y divide-border">
-              {(realized.data ?? []).map((r, i) => (
+              {(realized.data ?? []).map((r, i) => {
+                // 真后端字段优先(更准): fill_price / net_pnl_pct / days_held
+                // 老 mock 字段(向后兼容): entry_price / net_return / hold_days
+                const fillPrice = r.fill_price ?? r.entry_price ?? null;
+                const netReturn = r.net_pnl_pct ?? r.net_return ?? 0;
+                const heldDays = r.days_held ?? r.hold_days ?? 0;
+                const reason = resolveExitReason(r.exit_reason);
+                const ReasonIcon =
+                  reason.tone === "up"
+                    ? Target
+                    : reason.tone === "down"
+                      ? ShieldAlert
+                      : Clock;
+                return (
                 <div
                   key={i}
                   className="flex items-center justify-between gap-3 py-3"
@@ -234,30 +247,31 @@ export function BacktestPage() {
                     <p className="font-medium">{r.name ?? r.ts_code}</p>
                     <p className="num mt-0.5 text-xs text-text-secondary">
                       {r.ts_code} · {r.entry_date} → {r.exit_date} ·{" "}
-                      {r.entry_price.toFixed(2)} → {r.exit_price.toFixed(2)}
+                      {fillPrice != null ? fillPrice.toFixed(2) : "—"} →{" "}
+                      {r.exit_price.toFixed(2)}
                     </p>
                     <div className="mt-1 flex items-center gap-2 text-[11px] text-text-secondary">
-                      {r.exit_reason === "止盈" ? (
-                        <Target className="h-3 w-3 text-up" />
-                      ) : r.exit_reason === "止损" ? (
-                        <ShieldAlert className="h-3 w-3 text-down" />
-                      ) : (
-                        <Clock className="h-3 w-3 text-flat" />
-                      )}
-                      <span>{r.exit_reason}</span>
-                      <span>· 持仓 {r.hold_days} 天</span>
+                      <ReasonIcon
+                        className={cn(
+                          "h-3 w-3",
+                          reason.tone === "up" && "text-up",
+                          reason.tone === "down" && "text-down",
+                        )}
+                      />
+                      <span>{reason.label}</span>
+                      <span>· 持仓 {heldDays} 天</span>
                     </div>
                   </div>
                   <p
                     className={cn(
                       "num text-right font-medium",
-                      r.net_return >= 0 ? "text-up" : "text-down",
+                      netReturn >= 0 ? "text-up" : "text-down",
                     )}
                   >
-                    {formatPercent(r.net_return)}
+                    {formatPercent(netReturn)}
                   </p>
                 </div>
-              ))}
+              );})}
             </div>
           )}
         </CardContent>

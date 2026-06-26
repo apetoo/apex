@@ -54,3 +54,45 @@ export async function getDailyPrices(
     `/market/prices/daily?codes=${codes.join(",")}`,
   );
 }
+
+/** 指数日线(ED13): 返回 { code, name, bars: [{ trade_date, close, vol, pct_chg }] } */
+export interface IndexDailyBar {
+  trade_date: string;
+  close: number;
+  vol: number;
+  pct_chg: number;
+}
+export interface IndexDaily {
+  code: string;
+  name: string;
+  bars: IndexDailyBar[];
+}
+
+const MOCK_INDEX_DAILY: Record<string, IndexDaily> = {
+  "000001.SH": {
+    code: "000001.SH",
+    name: "上证指数",
+    bars: [
+      { trade_date: "20260624", close: 4110.81, vol: 644527518, pct_chg: 0.11 },
+      { trade_date: "20260625", close: 4120.28, vol: 670459917, pct_chg: 0.23 },
+    ],
+  },
+  "399001.SZ": {
+    code: "399001.SZ",
+    name: "深证成指",
+    bars: [
+      { trade_date: "20260624", close: 16051.32, vol: 790129563, pct_chg: 1.24 },
+      { trade_date: "20260625", close: 16344.08, vol: 830525212, pct_chg: 1.82 },
+    ],
+  },
+};
+
+export async function getIndexDaily(
+  code: string,
+  days = 2,
+): Promise<IndexDaily> {
+  if (USE_MOCK) {
+    return MOCK_INDEX_DAILY[code] ?? { code, name: "", bars: [] };
+  }
+  return api.get<IndexDaily>(`/market/index-daily?code=${code}&days=${days}`);
+}
