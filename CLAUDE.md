@@ -6,18 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Personal A-share (Chinese stock market) trading loop: DeepSeek AI analysis + watchlist tracking + vectorbt backtesting. Single-user tool, file-based storage.
 
-The project is mid-migration from a Streamlit monolith (`app.py`) to a decoupled frontend/backend. Both entry points currently coexist; new work targets the FastAPI backend + a separate frontend.
+The project is decoupled: FastAPI backend (`backend/`) + Vite/React frontend (`frontend/`). Streamlit UI retired in commit `675807e`.
 
 ## Run
 
 ```bash
 pip install -r requirements.txt                       # deps (Python 3.12+)
 
-# Backend (FastAPI) — the going-forward API layer
+# Backend (FastAPI)
 uvicorn backend.main:app --reload --port 8000         # http://localhost:8000/docs
 
-# Legacy Streamlit UI — still works, reads/writes the same files as the backend
-streamlit run app.py                                   # http://localhost:8501
+# Frontend (Vite + React)
+cd frontend && npm install && npm run dev             # http://localhost:5173
 ```
 
 `main.py` referenced in the README does not exist; ignore those CLI examples. There is no test suite, lint config, or build step. Validate syntax with `python -c "import ast; ast.parse(open('<file>').read())"`; smoke-test behavior against `apex.watchlist` / `apex.journal` in a tempdir, or hit the backend's read-only endpoints after `uvicorn` starts.
@@ -32,7 +32,7 @@ Default storage paths (all outside the repo, in `$HOME`):
 
 ## Architecture
 
-No framework glue, no DB. `apex/` is the service layer (used by both `app.py` and `backend/`); `backend/` is a thin HTTP routing layer over it.
+No framework glue, no DB. `apex/` is the service layer; `backend/` is a thin HTTP routing layer over it; `frontend/` is the Vite + React UI talking to `backend/`.
 
 ### `apex/` — service layer
 
@@ -69,9 +69,38 @@ Design rules:
 - **Streaming.** `analyze.run` / `screener.run` are blocking calls that take an `on_progress` callback — bridged via a worker thread + `queue.Queue` to an async SSE generator. `llm.chat_stream` is already a sync generator — wrapped with `run_in_executor`. SSE events: `trace` / `progress` / `chunk` / `done` / `error`.
 - **Every endpoint that takes a ts_code normalizes it first** via `data.normalize_ts_code()`.
 
-### `app.py` — legacy Streamlit UI
+### `frontend/` — Vite + React UI
 
-Single-file Streamlit app, four tabs (Watchlist / Analyze / Backtest / Screener) plus an AI chat sidebar. Still functional and shares the same on-disk state as the backend. Being replaced by the decoupled frontend; avoid adding new features here.
+雪球风 (Xueqiu) — light background, card-based, restrained red/green, monospace numbers. **A-share convention: 红涨绿跌** (red up, green down) — opposite of US markets.
+
+Stack: Vite 8 + React 19 + TypeScript 6 + Tailwind v4 + TanStack Query v5 + react-router v6 + lightweight-charts (candlestick) + lucide-react. Tests: Vitest + @testing-library/react. 62 unit tests covering a-share primitives, useSSE, useChatContext, query keys, utils, mutations.
+
+```
+frontend/src/
+├── api/                    # REST client + per-domain modules
+│   ├── client.ts           # fetch wrapper with ApiError class (409 from watchlist carries existing record)
+│   ├── query-keys.ts       # ED3 invalidation matrix (SSOT for all keys)
+│   ├── mutations.ts        # 6 react-query mutations (addCandidate/addPosition/replace/promote/close/archive)
+│   ├── market.ts watchlist.ts account.ts analyze.ts chat.ts screener.ts backtest.ts
+├── components/
+│   ├── base/               # shadcn-style Card / Button / ChatPanel foundation
+│   └── a-share/            # A-share primitives: PriceTag / VerdictTag / PositionCard / CandidateCard / MarketIndexBar
+├── routes/                 # 5 pages: overview / watchlist / analyze / backtest / screener
+├── hooks/                  # useSSE (hand-written, no MSW) + useChatContext (single-injection hash tracking)
+├── lib/utils.ts            # cn / directionClass / formatPrice / formatDelta / formatPercent / formatRatio
+└── types/verdict.ts        # VERDICT_COLOR TS const
+```
+
+Vite proxy (`/api` → 127.0.0.1:8000) for dev. Production: `VITE_USE_MOCK=0 npm run build` + nginx from `docs/deploy/nginx.conf`.
+
+Routes:
+- `/` Overview — market index bar (ED13 single source) + positions + chat trigger
+- `/watchlist` — active / candidates / archived tabs with inline add form
+- `/analyze` — SSE trace stream + verdict card + journal history
+- `/backtest` — per-signal bar chart + stats table + realized closed trades
+- `/screener` — strategy weight sliders (localStorage) + report with regime/by_strategy/top_scored
+
+SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `chunk` / `done` / `error`. The frontend's `useSSE` is hand-written (no `@microsoft/fetch-event-source` — default auto-reconnect re-runs DeepSeek + double-writes journal). All SSE paths support a `fetchFn` injection for dev mock (no MSW).
 
 ## Critical conventions
 
@@ -84,10 +113,10 @@ Single-file Streamlit app, four tabs (Watchlist / Analyze / Backtest / Screener)
 
 **Soft delete via `archive_entry`.** Nothing is hard-deleted from the watchlist. The `status` field on archived items records the reason: `archived_manual`, `archived_replaced`, `archived_promoted`, `archived_dedup`, `expired`.
 
-**One-shot migration.** `migrate_and_backfill()` normalizes legacy ts_codes, backfills missing names via tushare, merges legacy unsuffixed journal files, and dedups duplicate active positions. In Streamlit it runs once per session; in the backend it runs in `lifespan` at startup. Add new one-shot fixes here rather than scattering migration logic.
+**One-shot migration.** `migrate_and_backfill()` normalizes legacy ts_codes, backfills missing names via tushare, merges legacy unsuffixed journal files, and dedups duplicate active positions. Runs once per session; in the backend it runs in `lifespan` at startup. Add new one-shot fixes here rather than scattering migration logic.
 
 **Realtime vs daily price.** `get_realtime_price` (Sina, intraday) is the primary; `get_latest_price` (tushare daily close) is the fallback used when realtime returns None (suspended / API failure). `GET /api/market/prices` replicates this priority; `GET /api/market/prices/realtime` and `/daily` expose each source directly.
 
-**Closing a position triggers postmortem + recalibration.** `close_position` writes a closed record; the backend's `POST /api/watchlist/close` then runs `postmortem.run_and_patch` (AI diagnosis) and `calibration.compute()` when `postmortem=true` (default), matching the Streamlit flow. `POST /api/postmortem/run` re-runs diagnosis on an existing closed record by `closed_at`.
+**Closing a position triggers postmortem + recalibration.** `close_position` writes a closed record; the backend's `POST /api/watchlist/close` then runs `postmortem.run_and_patch` (AI diagnosis) and `calibration.compute()` when `postmortem=true` (default). `POST /api/postmortem/run` re-runs diagnosis on an existing closed record by `closed_at`.
 
 **Adding an AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The agent dispatches by name through `_dispatch_tool` which only looks at `TOOL_FUNCTIONS`.
