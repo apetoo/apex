@@ -93,3 +93,9 @@ target/
 
 # CLAUDE AI
 .claude/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+.gstack/

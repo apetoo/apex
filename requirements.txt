@@ -6,3 +6,9 @@ pandas>=2.0.0
 numpy>=1.24.0
 click>=8.0.0
 pyyaml>=6.0
+
+# ── 后端 API ──────────────────────────────────────────────────────────────
+fastapi>=0.110
+uvicorn[standard]>=0.27
+sse-starlette>=2.0
+

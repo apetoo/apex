@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+/*
+ * Apex 雪球风 design tokens
+ * 来源: 设计文档 ED(雪球风 = 浅色卡片流 + 克制红绿 + 等宽数字)
+ * 红涨绿跌是 A 股铁律(已锁)
+ */
+@theme {
+  /* 底色: 浅米近白, 不刺眼 */
+  --color-bg-base: #fafaf7;
+  --color-bg-card: #ffffff;
+  --color-border: #ecece6;
+
+  /* 文字 */
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #6b6b6b;
+
+  /* A 股涨跌: 克制红绿, 不做整行染色 */
+  --color-up: #e14b4b; /* 涨 */
+  --color-down: #2ba84a; /* 跌 */
+  --color-flat: #9b9b9b; /* 平/停牌 */
+
+  /* 字体 */
+  --font-sans: -apple-system, "PingFang SC", "Source Han Sans", system-ui, sans-serif;
+  --font-serif: "Source Han Serif", "Songti SC", serif;
+  --font-mono: "SF Mono", "Roboto Mono", ui-monospace, monospace;
+
+  /* 圆角/阴影: 卡片极轻, 不浮夸 */
+  --radius-card: 12px;
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+/* 等宽数字: 全局 tabular-nums(A 股价格/涨跌额必须等宽对齐) */
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: var(--color-bg-base);
+    color: var(--color-text-primary);
+    font-feature-settings: "tnum";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  /* 数字专用 class: 价格/涨跌额/百分比 */
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+}

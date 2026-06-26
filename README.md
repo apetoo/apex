@@ -30,19 +30,36 @@ paths:
   prompt_file: "~/.claude/skills/stock-analyze/prompts/expert-persona.md"
 ```
 
-## 启动 Web UI（推荐）
+## 启动 Web UI
+
+后端 (FastAPI):
 
 ```bash
-streamlit run app.py
+uvicorn backend.main:app --reload --port 8000
 ```
 
-浏览器打开 http://localhost:8501
+前端 (Vite + React, 雪球风):
 
-| Tab | 功能 |
-|-----|------|
-| 📋 Watchlist | 持仓 + 候选状态，价格实时刷新，触发提醒 |
-| 🔍 个股分析 | 输入代码，AI 自动拉数据分析，结果保存日志 |
-| 📊 回测 | 历史 AI 判断胜率 + 收益率图表 |
+```bash
+cd frontend
+npm install        # 首次
+npm run dev        # http://localhost:5173
+```
+
+dev 模式默认走 mock 数据(后端不在也能跑可视化),要切真后端:
+
+```bash
+VITE_USE_MOCK=0 npm run dev
+```
+
+| 路由 | 功能 |
+|---|---|
+| `/` | 概览(联调/市场温度) |
+| `/watchlist` | 持仓 + 候选(价格/止损目标/盈亏/触发) |
+| `/analyze` | 个股分析(SSE trace 流式 + verdict 注入 chat) |
+| `/backtest` | 逐笔 P&L + 统计(柱状图替代净值曲线) |
+| `/screener` | 多策略粗筛(权重可调 + SSE 进度 + AI 综合) |
+| 右下角 | 全局 chat(单次注入当前页上下文) |
 
 ## CLI 命令
 
