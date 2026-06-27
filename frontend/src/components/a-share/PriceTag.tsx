@@ -79,7 +79,7 @@ export function PriceTag({
   return (
     <span className={cn("inline-flex flex-col gap-0.5 leading-tight", className)}>
       <span className="flex items-baseline gap-1.5">
-        <span className={cn("num font-medium", sizeCls, directionClass(delta))}>
+        <span className={cn("num font-medium", sizeCls, "text-text-primary")}>
           {formatPrice(price)}
         </span>
         {isOutside && (

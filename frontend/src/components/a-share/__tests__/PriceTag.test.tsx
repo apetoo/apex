@@ -9,29 +9,31 @@ import { PriceTag } from "../PriceTag";
  */
 
 describe("PriceTag", () => {
-  it("涨: price > prevClose → 红色(up) + 正涨跌额/幅", () => {
+  it("涨: price > prevClose → 当前价黑色(text-text-primary) + 正涨跌额/幅红字", () => {
     render(<PriceTag price={10.5} prevClose={10.0} />);
     const priceEl = screen.getByText("10.50");
-    // tailwind class text-up = 红
-    expect(priceEl.className).toContain("text-up");
-    // 涨跌额 +0.50, 涨幅 +5.00%
+    // 当前价 = 事实, 中性黑色, 不染红
+    expect(priceEl.className).toContain("text-text-primary");
+    expect(priceEl.className).not.toContain("text-up");
+    // 涨跌额/幅 = 评价, 仍红字
     expect(screen.getByText(/\+0\.50/)).toBeTruthy();
     expect(screen.getByText(/\+5\.00%/)).toBeTruthy();
   });
 
-  it("跌: price < prevClose → 绿色(down) + 负涨跌额/幅", () => {
+  it("跌: price < prevClose → 当前价黑色 + 负涨跌额/幅绿字", () => {
     render(<PriceTag price={9.5} prevClose={10.0} />);
     const priceEl = screen.getByText("9.50");
-    expect(priceEl.className).toContain("text-down");
+    expect(priceEl.className).toContain("text-text-primary");
+    expect(priceEl.className).not.toContain("text-down");
     expect(screen.getByText(/-0\.50/)).toBeTruthy();
     expect(screen.getByText(/-5\.00%/)).toBeTruthy();
   });
 
-  it("平: price == prevClose 且非盘外判定 → flat(灰)", () => {
-    // price === prevClose 时 isOutside=true, 但 delta=0 → directionClass 返回 flat
+  it("平: price == prevClose → 当前价黑色(非 flat)", () => {
     render(<PriceTag price={10.0} prevClose={10.0} />);
     const priceEl = screen.getByText("10.00");
-    expect(priceEl.className).toContain("text-flat");
+    expect(priceEl.className).toContain("text-text-primary");
+    expect(priceEl.className).not.toContain("text-flat");
   });
 
   it("盘外态: price === prevClose → 显示「盘外·昨收」标识", () => {
