@@ -1034,7 +1034,7 @@ def _fetch_index_bars(codes: list[str], days: int = 30) -> dict[str, list[dict]]
         try:
             df = pro.index_daily(
                 ts_code=code, start_date=start, end_date=end,
-                fields="trade_date,close,vol,pct_chg",
+                fields="trade_date,close,vol,pct_chg,amount",
             )
             if df is None or df.empty:
                 continue
@@ -1069,6 +1069,24 @@ def get_index_daily(code: str, days: int = 2) -> str:
     # 把 tushare 字段标准化(原样返回, 字段名是 trade_date/close/vol/pct_chg)
     payload["bars"] = bars
     return json.dumps(payload, ensure_ascii=False)
+
+
+def get_index_daily_batch(codes: list[str], days: int = 2) -> str:
+    """批量取指数日线, 返回 JSON 字符串 { [code]: { code, name, bars } }。
+
+    用于市场温度卡一次拉多只指数。失败的 code 对应空 bars。
+    bars 字段: trade_date / close / vol / pct_chg / amount(千元)。
+    """
+    INDEX_NAMES = {
+        "000001.SH": "上证指数", "399001.SZ": "深证成指", "399006.SZ": "创业板指",
+        "000300.SH": "沪深300", "000905.SH": "中证500", "000688.SH": "科创50",
+        "399106.SZ": "深证综指",
+    }
+    bars_map = _fetch_index_bars(codes, days=days)
+    result: dict[str, dict] = {}
+    for c in codes:
+        result[c] = {"code": c, "name": INDEX_NAMES.get(c, ""), "bars": bars_map.get(c, [])}
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _get_sw_l1_for_stock(ts_code: str) -> Optional[str]:

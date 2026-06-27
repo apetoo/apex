@@ -55,7 +55,20 @@ def get_index_daily(
     返回结构: { code, name, bars: [{ trade_date, close, vol, pct_chg }] }
     后端 parse_json 自动解 JSON 字符串。
     """
-    return data.get_index_daily(code.strip(), days=days)
+    return parse_json(data.get_index_daily(code.strip(), days=days))
+
+
+@router.get("/index-daily/batch")
+def get_index_daily_batch(
+    codes: str = Query(..., description="逗号分隔指数代码"),
+    days: int = Query(2, ge=1, le=30, description="最近 N 天"),
+):
+    """批量指数日线(ED13): 一次返回多只, 用于市场温度卡。
+
+    返回 { [code]: { code, name, bars: [{ trade_date, close, vol, pct_chg, amount }] } }。
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    return parse_json(data.get_index_daily_batch(code_list, days=days))
 
 
 # ── 分时 ──────────────────────────────────────────────────────────────────────
