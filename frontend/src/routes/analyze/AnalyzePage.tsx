@@ -1,31 +1,59 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { History, Sparkles } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription, Button } from "@/components/base";
-import { AnalyzeTraceStream, VerdictTag, PriceTag } from "@/components/a-share";
+import { History, Search } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/base";
+import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PriceTag } from "@/components/a-share";
 import { getJournal } from "@/api/analyze";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { qk } from "@/api/query-keys";
 import { useChatContext } from "@/hooks/useChatContext";
-import { formatPrice } from "@/lib/utils";
 
 /**
  * /analyze 个股分析页
  *
- * 流程: 选 ts_code → 跑 AI 分析(trace 流式) → 展示 verdict
- *       → 写入 journal(后端 save=true) → 历史 journal 列表
+ * 流程: 输入 ts_code → (防抖)自动 commit → 自动跑 AI 分析(trace 流式)
+ *       → 展示 verdict(VerdictDetailCard) → 写入 journal(后端 save=true) → 历史 journal 列表
+ *
+ * UX:
+ *   - **无按钮**: 输入代码停顿即自动分析(回车立即开始)。原流程要点两次按钮, 不合理。
+ *   - **结果用 VerdictDetailCard**: 正确读 price_advice 嵌套 + analysis_text(markdown)。
+ *   - **过程默认折叠**: 见 <AnalyzeTraceStream>。
  *
  * ED1: useSSE hook, 都关自动重连, 断流手动重试
  * ED2: setContext(verdict 摘要) → chat 呼出时自动注入
  */
+
+/** 前端 ts_code 归一化(镜像后端 data.normalize_ts_code: 6→SH, 0/3→SZ, 4/8→BJ)。非法返回 null。 */
+function normalizeTsCode(raw: string): string | null {
+  const s = raw.trim().toUpperCase();
+  if (!/^\d{6}(\.(SH|SZ|BJ))?$/.test(s)) return null;
+  if (s.length === 6) {
+    const d = s[0];
+    const suf = d === "6" ? "SH" : d === "0" || d === "3" ? "SZ" : d === "4" || d === "8" ? "BJ" : null;
+    return suf ? `${s}.${suf}` : null;
+  }
+  return s;
+}
+
 export function AnalyzePage() {
   const [tsCode, setTsCode] = useState("");
   const [committedCode, setCommittedCode] = useState<string | null>(null);
   const [latestVerdict, setLatestVerdict] = useState<Record<string, unknown> | null>(null);
 
-  const canRun = tsCode.trim().length > 0;
-
   const { setContext } = useChatContext();
+
+  // 防抖自动 commit: 输入停顿 500ms 且归一化结果变化才 commit(避免补后缀时抖动)。
+  // commit 只决定「下方内容」(行情/历史/分析区占位)是否展示, 不触发 AI 分析 ——
+  // 分析需点 <AnalyzeTraceStream> 头部的「开始分析」按钮。
+  useEffect(() => {
+    const norm = normalizeTsCode(tsCode);
+    if (!norm || norm === committedCode) return;
+    const t = setTimeout(() => {
+      setCommittedCode(norm);
+      setLatestVerdict(null);
+    }, 500);
+    return () => clearTimeout(t);
+  }, [tsCode, committedCode]);
 
   // 跑分析时, 实时价 + 昨收(给分析面板旁边显示, 也让 chat 上下文带)
   const prices = useQuery({
@@ -49,11 +77,11 @@ export function AnalyzePage() {
   // 把当前分析的 verdict 摘要注入 chat 上下文(ED2)
   useEffect(() => {
     if (latestVerdict && committedCode) {
+      const pa = (latestVerdict.price_advice ?? {}) as Record<string, unknown>;
       const summary = [
         `标的: ${committedCode}`,
         `最新 verdict: ${latestVerdict.verdict ?? "—"} (置信度 ${latestVerdict.confidence ?? "—"})`,
-        `入场: ${latestVerdict.entry_price ?? "—"} / 止损: ${latestVerdict.stop_loss ?? "—"} / 目标: ${latestVerdict.target ?? "—"}`,
-        `regime: ${latestVerdict.regime ?? "—"}`,
+        `入场: ${pa.entry ?? "—"} / 止损: ${pa.stop_loss ?? "—"} / 目标: ${pa.target ?? "—"}`,
       ].join("\n");
       setContext(summary);
     }
@@ -65,42 +93,34 @@ export function AnalyzePage() {
   return (
     <div className="mx-auto max-w-6xl space-y-6 px-6 py-8">
       <div>
-        <h1 className="font-serif text-3xl font-semibold tracking-tight">
-          个股分析
-        </h1>
+        <h1 className="font-serif text-3xl font-semibold tracking-tight">个股分析</h1>
         <p className="mt-1 text-sm text-text-secondary">
-          选 ts_code · AI trace 流式 · verdict 自动注入 chat 上下文
+          输入代码自动分析 · 过程可展开 · 结果自动注入 chat 上下文
         </p>
       </div>
 
-      {/* 输入区 */}
+      {/* 输入区: 仅展示下方内容, 不自动分析 —— 点分析卡里的「开始分析」才跑 */}
       <Card>
         <CardContent className="flex items-center gap-2 py-4">
+          <Search className="h-4 w-4 flex-shrink-0 text-flat" />
           <input
             type="text"
             value={tsCode}
             onChange={(e) => setTsCode(e.target.value.toUpperCase())}
-            placeholder="000001.SZ"
+            placeholder="输入代码, e.g. 000001 或 000001.SZ"
+            autoFocus
             className="num flex-1 rounded-md border border-border bg-bg-card px-3 py-2 text-sm focus:border-text-secondary focus:outline-none"
           />
-          <Button
-            variant="primary"
-            disabled={!canRun}
-            onClick={() => {
-              setCommittedCode(tsCode);
-              setLatestVerdict(null);
-            }}
-          >
-            <Sparkles className="mr-1 h-3.5 w-3.5" />
-            跑分析
-          </Button>
+          <span className="hidden text-xs text-flat sm:inline">
+            输入代码展示下方信息 · 点「开始分析」跑 AI
+          </span>
         </CardContent>
       </Card>
 
-      {/* 行情 + trace 联调 */}
       {committedCode && (
         <div className="grid gap-4 lg:grid-cols-3">
-          <Card>
+          {/* 左: 行情速览 */}
+          <Card className="lg:col-span-1">
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-normal text-text-secondary">
                 {committedCode}
@@ -114,26 +134,27 @@ export function AnalyzePage() {
                 error={prices.isError || daily.isError}
                 size="lg"
               />
-              {latestVerdict && (
-                <div className="mt-3 space-y-1.5 border-t border-border pt-3">
-                  <div className="flex items-center gap-2">
-                    <VerdictTag verdict={String(latestVerdict.verdict ?? "")} />
-                    <span className="num text-xs text-text-secondary">
-                      置信度 {String(latestVerdict.confidence)}
-                    </span>
-                  </div>
-                  <p className="num text-xs text-text-secondary">
-                    入场 {formatPrice(Number(latestVerdict.entry_price))} · 止损{" "}
-                    {formatPrice(Number(latestVerdict.stop_loss))} · 目标{" "}
-                    {formatPrice(Number(latestVerdict.target))}
-                  </p>
-                </div>
-              )}
             </CardContent>
           </Card>
 
-          <div className="lg:col-span-2">
+          {/* 右: 分析结果(VerdictDetailCard) / 未分析占位 */}
+          <div className="space-y-4 lg:col-span-2">
+            {latestVerdict ? (
+              <VerdictDetailCard verdict={latestVerdict} />
+            ) : (
+              <Card>
+                <CardContent className="flex items-center gap-3 py-10">
+                  <p className="text-sm text-text-secondary">
+                    点下方「开始分析」跑 AI 工具链
+                    <span className="text-flat">（过程可展开查看）</span>
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* 分析过程(默认折叠) */}
             <AnalyzeTraceStream
+              key={committedCode}
               tsCode={committedCode}
               onVerdict={setLatestVerdict}
             />
@@ -158,24 +179,27 @@ export function AnalyzePage() {
               <div className="divide-y divide-border">
                 {journal.data.map((entry: unknown, i: number) => {
                   const e = entry as Record<string, unknown>;
+                  const pa = (e.price_advice ?? {}) as Record<string, unknown>;
                   return (
-                    <div
-                      key={i}
-                      className="flex items-center justify-between py-3"
-                    >
-                      <div>
+                    <div key={i} className="flex items-center justify-between py-3">
+                      <div className="min-w-0">
                         <p className="num text-xs text-text-secondary">
                           {String(e.analyzed_at ?? "")}
                         </p>
-                        <p className="mt-0.5 text-sm">
-                          {String(e.note ?? "")}
+                        <p className="mt-0.5 truncate text-sm">
+                          {String(e.note ?? e.analysis_text ?? "")}
                         </p>
                       </div>
-                      <div className="text-right">
+                      <div className="ml-3 flex-shrink-0 text-right">
                         <VerdictTag verdict={String(e.verdict ?? "")} />
                         <p className="num mt-0.5 text-xs text-text-secondary">
                           置信度 {String(e.confidence ?? "—")}
                         </p>
+                        {pa.entry !== undefined && (
+                          <p className="num text-[11px] text-flat">
+                            入 {String(pa.entry)} · 止 {String(pa.stop_loss)} · 目 {String(pa.target)}
+                          </p>
+                        )}
                       </div>
                     </div>
                   );

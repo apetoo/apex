@@ -84,18 +84,25 @@ const MOCK_TRACE_EVENTS: Array<Record<string, unknown>> = [
 ];
 
 const MOCK_VERDICT: Record<string, unknown> = {
+  ts_code: "002466.SZ",
+  analyzed_at: "2026-06-28T10:30:00",
   verdict: "看多",
-  confidence: 3.5,
-  entry_price: 68.5,
-  stop_loss: 65.0,
-  target: 75.0,
-  horizon: "swing",
-  regime: "bull",
+  confidence: 4,
+  calibrated_confidence: 3.5,
+  calibration_explanation: "同行业已持仓 2 只 → 置信度 -0.5",
+  price_advice: {
+    entry: 68.5,
+    stop_loss: 65.0,
+    target: 75.0,
+    position_size_pct: 15,
+  },
   evidence: [
     "MA20 支撑 → 多头趋势延续",
     "PE-TTM 18.5 → 估值合理偏低",
     "近 3 日成交量放大 30% → 资金关注",
   ],
+  analysis_text:
+    "## 结论\n**看多**，置信度 4（校准 3.5）。\n\n### 依据\n- 技术面站上 MA20，趋势转多\n- 估值 PE-TTM 18.5 处于历史中低位\n- 量能放大，资金关注度高\n\n### 风险\n- 同行业已持仓 2 只，集中度偏高，建议小仓位跟进",
 };
 
 function sseEncode(event: string, data: unknown): string {
