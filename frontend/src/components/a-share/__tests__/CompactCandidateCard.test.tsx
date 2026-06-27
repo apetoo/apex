@@ -39,7 +39,7 @@ describe("CompactCandidateCard", () => {
   });
 
   it("接近触发(|pct|<2) → 距触发行黄字(text-amber-600)", async () => {
-    mockPrice["601012.SH"] = 22.2; // (22.2-22.5)/22.5 = -1.33% → 接近
+    mockPrice["601012.SH"] = 22.8; // (22.8-22.5)/22.5 = +1.33% → 高于触发价(below 未触发)且 |pct|<2 → 接近
     withClient(<CompactCandidateCard candidate={base} />);
     const distEl = await screen.findByText(/距触发/);
     expect(distEl.className).toContain("text-amber-600");

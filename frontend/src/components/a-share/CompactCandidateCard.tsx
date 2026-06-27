@@ -33,11 +33,9 @@ export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
       ? (distance! / trigger_price) * 100
       : null;
 
-  // 已触发: 沿触发方向穿越 > 2% 才算(允许 2% 内"接近"态)
+  // 触发判断: below 触发 → 当前价 <= 触发价; above → 当前价 >= 触发价(严格规则, 穿越即触发)
   const isTriggered =
     currentPrice != null &&
-    distancePct != null &&
-    Math.abs(distancePct) > 2 &&
     (trigger_direction === "below"
       ? currentPrice <= trigger_price
       : currentPrice >= trigger_price);
