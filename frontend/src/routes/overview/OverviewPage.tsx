@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { RefreshCw, ArrowUpRight, ArrowDownRight, Target, ShieldAlert, Wallet, Clock } from "lucide-react";
+import { RefreshCw, Wallet, Clock } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import {
   Card,
@@ -8,12 +8,13 @@ import {
   CardTitle,
   Button,
 } from "@/components/base";
-import { PriceTag, MarketIndexBar } from "@/components/a-share";
+import { MarketIndexBar } from "@/components/a-share";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { getWatchlist } from "@/api/watchlist";
 import { getAccount } from "@/api/account";
 import { qk } from "@/api/query-keys";
-import { cn, formatPrice, formatPercent } from "@/lib/utils";
+import { cn, formatPercent } from "@/lib/utils";
+import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 
 /**
  * / 概览首页
@@ -107,33 +108,6 @@ export function OverviewPage() {
     }
     return worst;
   })();
-
-  /* ── 全部持仓行情映射 ──────────────────────────────── */
-
-  const pnlMap = new Map<string, { pnl: number | null; pnlPct: number | null }>();
-  for (const pos of positions) {
-    const cur = prices.data?.[pos.ts_code] ?? null;
-    if (cur != null && pos.entry_price != null && pos.position_size_shares != null) {
-      const pnl = (cur - pos.entry_price) * pos.position_size_shares;
-      const pnlPct = ((cur - pos.entry_price) / pos.entry_price) * 100;
-      pnlMap.set(pos.ts_code, { pnl, pnlPct });
-    } else {
-      pnlMap.set(pos.ts_code, { pnl: null, pnlPct: null });
-    }
-  }
-
-  const todayPnlMap = new Map<string, { pnl: number | null; pnlPct: number | null }>();
-  for (const pos of positions) {
-    const cur = prices.data?.[pos.ts_code] ?? null;
-    const prev = daily.data?.[pos.ts_code] ?? null;
-    if (cur != null && prev != null && prev !== 0 && pos.position_size_shares != null) {
-      const pnl = (cur - prev) * pos.position_size_shares;
-      const pnlPct = ((cur - prev) / prev) * 100;
-      todayPnlMap.set(pos.ts_code, { pnl, pnlPct });
-    } else {
-      todayPnlMap.set(pos.ts_code, { pnl: null, pnlPct: null });
-    }
-  }
 
   const pnlLoading = codes.length > 0 && (prices.isLoading || daily.isLoading);
   const pnlError = codes.length > 0 && (prices.isError || daily.isError);
@@ -294,105 +268,11 @@ export function OverviewPage() {
               添加
             </p>
           ) : (
-            positions.map((pos) => {
-              const cur = prices.data?.[pos.ts_code] ?? null;
-              const prev = daily.data?.[pos.ts_code] ?? null;
-              const loading = prices.isLoading || daily.isLoading;
-              const error = prices.isError || daily.isError;
-              const delta = cur != null && prev != null ? cur - prev : null;
-              const pnlInfo = pnlMap.get(pos.ts_code);
-              const todayPnlInfo = todayPnlMap.get(pos.ts_code);
-
-              return (
-                <div
-                  key={pos.ts_code}
-                  className="flex items-center justify-between gap-4 border-b border-border py-4 last:border-0"
-                >
-                  {/* 左侧 */}
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <p className="truncate font-medium">{pos.name}</p>
-                      {pos.strategy && (
-                        <span className="rounded bg-bg-base px-1.5 py-0.5 text-[10px] text-text-secondary">
-                          {pos.strategy}
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-0.5 text-xs text-text-secondary">
-                      {pos.ts_code}
-                    </p>
-                    {(pos.stop_loss != null || pos.target != null) && (
-                    <div className="mt-1.5 flex items-center gap-3 text-[11px] text-text-secondary">
-                      <span className="flex items-center gap-0.5">
-                        <ShieldAlert className="h-3 w-3 text-down" />
-                        止损 {formatPrice(pos.stop_loss)}
-                      </span>
-                      <span className="flex items-center gap-0.5">
-                        <Target className="h-3 w-3 text-up" />
-                        目标 {formatPrice(pos.target)}
-                      </span>
-                    </div>
-                    )}
-                  </div>
-
-                  {/* 右侧: 价格 + 盈亏 */}
-                  <div className="text-right">
-                    <PriceTag
-                      price={cur}
-                      prevClose={prev}
-                      loading={loading}
-                      error={error}
-                      size="md"
-                      showChange
-                    />
-                    {pnlInfo?.pnl != null && (
-                      <div
-                        className={cn(
-                          "mt-1 flex items-center justify-end gap-0.5 num text-xs",
-                          pnlInfo.pnl >= 0 ? "text-up" : "text-down",
-                        )}
-                      >
-                        {pnlInfo.pnl >= 0 ? (
-                          <ArrowUpRight className="h-3 w-3" />
-                        ) : (
-                          <ArrowDownRight className="h-3 w-3" />
-                        )}
-                        <span>
-                          {pnlInfo.pnl >= 0 ? "+" : ""}
-                          {pnlInfo.pnl.toFixed(0)} 元
-                        </span>
-                        {pnlInfo.pnlPct != null && (
-                          <span className="ml-1 opacity-80">
-                            ({pnlInfo.pnlPct >= 0 ? "+" : ""}
-                            {pnlInfo.pnlPct.toFixed(2)}%)
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    {todayPnlInfo?.pnl != null && (
-                      <div
-                        className={cn(
-                          "mt-0.5 flex items-center justify-end gap-0.5 num text-[10px]",
-                          todayPnlInfo.pnl >= 0 ? "text-up" : "text-down",
-                        )}
-                      >
-                        <span>今日</span>
-                        <span>
-                          {todayPnlInfo.pnl >= 0 ? "+" : ""}
-                          {todayPnlInfo.pnl.toFixed(0)} 元
-                        </span>
-                        {todayPnlInfo.pnlPct != null && (
-                          <span className="opacity-80">
-                            ({todayPnlInfo.pnlPct >= 0 ? "+" : ""}
-                            {todayPnlInfo.pnlPct.toFixed(2)}%)
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {positions.map((pos) => (
+                <CompactPositionCard key={pos.ts_code} position={pos} />
+              ))}
+            </div>
           )}
         </CardContent>
       </Card>
