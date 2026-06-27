@@ -55,34 +55,70 @@ export async function getDailyPrices(
   );
 }
 
-/** 指数日线(ED13): 返回 { code, name, bars: [{ trade_date, close, vol, pct_chg }] } */
+/** 指数日线(ED13): 返回 { code, name, bars: [{ trade_date, close, vol, pct_chg, amount }] } */
 export interface IndexDailyBar {
   trade_date: string;
   close: number;
   vol: number;
   pct_chg: number;
+  amount?: number; // 成交额, 千元(tushare 原单位)
 }
 export interface IndexDaily {
   code: string;
   name: string;
   bars: IndexDailyBar[];
 }
+/** 批量指数日线: { [code]: IndexDaily } */
+export type IndexDailyMap = Record<string, IndexDaily>;
 
 const MOCK_INDEX_DAILY: Record<string, IndexDaily> = {
   "000001.SH": {
-    code: "000001.SH",
-    name: "上证指数",
+    code: "000001.SH", name: "上证指数",
     bars: [
-      { trade_date: "20260624", close: 4110.81, vol: 644527518, pct_chg: 0.11 },
-      { trade_date: "20260625", close: 4120.28, vol: 670459917, pct_chg: 0.23 },
+      { trade_date: "20260625", close: 4120.28, vol: 6.7e8, pct_chg: 0.23, amount: 6.5e7 },
+      { trade_date: "20260626", close: 4027.26, vol: 6.6e8, pct_chg: -2.26, amount: 5.8e7 },
     ],
   },
   "399001.SZ": {
-    code: "399001.SZ",
-    name: "深证成指",
+    code: "399001.SZ", name: "深证成指",
     bars: [
-      { trade_date: "20260624", close: 16051.32, vol: 790129563, pct_chg: 1.24 },
-      { trade_date: "20260625", close: 16344.08, vol: 830525212, pct_chg: 1.82 },
+      { trade_date: "20260625", close: 16344.08, vol: 8.31e8, pct_chg: 1.82, amount: 7.2e7 },
+      { trade_date: "20260626", close: 16000.0, vol: 8.1e8, pct_chg: -2.11, amount: 6.9e7 },
+    ],
+  },
+  "399006.SZ": {
+    code: "399006.SZ", name: "创业板指",
+    bars: [
+      { trade_date: "20260625", close: 2050.0, vol: 4.0e8, pct_chg: 2.1, amount: 3.5e7 },
+      { trade_date: "20260626", close: 2000.0, vol: 3.9e8, pct_chg: -2.44, amount: 3.3e7 },
+    ],
+  },
+  "000300.SH": {
+    code: "000300.SH", name: "沪深300",
+    bars: [
+      { trade_date: "20260625", close: 4200.0, vol: 3.5e8, pct_chg: 0.8, amount: 4.0e7 },
+      { trade_date: "20260626", close: 4150.0, vol: 3.4e8, pct_chg: -1.19, amount: 3.8e7 },
+    ],
+  },
+  "000905.SH": {
+    code: "000905.SH", name: "中证500",
+    bars: [
+      { trade_date: "20260625", close: 5500.0, vol: 2.8e8, pct_chg: 1.2, amount: 3.0e7 },
+      { trade_date: "20260626", close: 5450.0, vol: 2.7e8, pct_chg: -0.91, amount: 2.9e7 },
+    ],
+  },
+  "000688.SH": {
+    code: "000688.SH", name: "科创50",
+    bars: [
+      { trade_date: "20260625", close: 980.0, vol: 1.2e8, pct_chg: 1.5, amount: 1.2e7 },
+      { trade_date: "20260626", close: 965.0, vol: 1.1e8, pct_chg: -1.53, amount: 1.1e7 },
+    ],
+  },
+  "399106.SZ": {
+    code: "399106.SZ", name: "深证综指",
+    bars: [
+      { trade_date: "20260625", close: 1900.0, vol: 8.5e8, pct_chg: 1.7, amount: 7.5e7 },
+      { trade_date: "20260626", close: 1860.0, vol: 8.3e8, pct_chg: -2.11, amount: 7.1e7 },
     ],
   },
 };
@@ -95,4 +131,20 @@ export async function getIndexDaily(
     return MOCK_INDEX_DAILY[code] ?? { code, name: "", bars: [] };
   }
   return api.get<IndexDaily>(`/market/index-daily?code=${code}&days=${days}`);
+}
+
+export async function getIndexDailyBatch(
+  codes: string[],
+  days = 2,
+): Promise<IndexDailyMap> {
+  if (USE_MOCK) {
+    const out: IndexDailyMap = {};
+    codes.forEach((c) => {
+      out[c] = MOCK_INDEX_DAILY[c] ?? { code: c, name: "", bars: [] };
+    });
+    return out;
+  }
+  return api.get<IndexDailyMap>(
+    `/market/index-daily/batch?codes=${codes.join(",")}&days=${days}`,
+  );
 }
