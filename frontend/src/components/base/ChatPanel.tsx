@@ -35,24 +35,31 @@ export function ChatPanel() {
   const { events, status, error, connect, abort, reset } = useSSE<ChunkEvent>();
 
   // 累积 chunk 事件 → streaming reply
+  // 全量派生(不增量 append): useSSE 一次 reader.read() 可能批量追加多个 chunk,
+  // 增量只取最后一个会把中间 chunk 丢掉(表现=少字/断续); done 事件追加时也会
+  // 误把上一块再 append 一次(重复)。直接从 events 重算最稳。
   useEffect(() => {
     if (events.length === 0) return;
-    const lastChunk = [...events]
-      .reverse()
-      .find((e) => e.event === "chunk");
-    if (lastChunk) {
-      const data = lastChunk.data as { content?: string };
-      if (data?.content) setStreamingReply((s) => s + data.content!);
-    }
+    const text = events
+      .filter((e) => e.event === "chunk")
+      .map((e) => (e.data as { content?: string })?.content ?? "")
+      .join("");
+    setStreamingReply(text);
   }, [events]);
 
-  // 终态: 拼到 history
+  // 终态: 拼到 history。只依赖 status(避免 streamingReply 变化重复触发);
+  // done 时从 events 全量重算, 避免读 streamingReply 旧值漏掉最后一批 chunk。
   useEffect(() => {
-    if (status === "done" && streamingReply) {
-      setHistory((h) => [...h, { role: "assistant", content: streamingReply }]);
+    if (status !== "done") return;
+    const text = events
+      .filter((e) => e.event === "chunk")
+      .map((e) => (e.data as { content?: string })?.content ?? "")
+      .join("");
+    if (text) {
+      setHistory((h) => [...h, { role: "assistant", content: text }]);
       setStreamingReply("");
     }
-  }, [status, streamingReply]);
+  }, [status, events]);
 
   // 自动滚到底
   useEffect(() => {

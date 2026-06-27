@@ -93,7 +93,9 @@ function parseSSEChunk<T>(buffer: string): {
   rest: string;
 } {
   const events: SSEEvent<T>[] = [];
-  const parts = buffer.split("\n\n");
+  // sse_starlette 行尾 \r\n(事件间 \r\n\r\n); dev mock sseEncode 用 \n。
+  // 必须用 /\r?\n\r?\n/ 兼容两者, 否则真后端事件全堆 buffer、mock 单测却全过。
+  const parts = buffer.split(/\r?\n\r?\n/);
   // 最后一段可能不完整, 留作 buffer
   const rest = parts.pop() ?? "";
 
@@ -101,7 +103,7 @@ function parseSSEChunk<T>(buffer: string): {
     if (!part.trim()) continue;
     let eventName: string | undefined;
     let dataRaw: string | undefined;
-    for (const line of part.split("\n")) {
+    for (const line of part.split(/\r?\n/)) {
       const parsed = parseSSELine(line);
       if (parsed.event) eventName = parsed.event;
       if (parsed.data !== undefined) dataRaw = parsed.data;
