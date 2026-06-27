@@ -506,7 +506,8 @@ def close_position(ts_code: str,
 
     entry_date = pos.get("entry_date") or today_str
     entry_price = float(pos.get("entry_price") or 0)
-    fill_price = float(actual_fill_price) if actual_fill_price is not None else entry_price
+    avg_cost = float(pos.get("avg_cost") or entry_price)
+    fill_price = float(actual_fill_price) if actual_fill_price is not None else avg_cost
     shares = int(pos.get("position_size_shares") or 0)
 
     extremes = _fetch_holding_period_extremes(ts_code, entry_date, exit_date)
@@ -534,6 +535,7 @@ def close_position(ts_code: str,
         "open": {
             "entry_date": entry_date,
             "entry_price": entry_price or None,
+            "avg_cost": avg_cost or None,
             "actual_fill_price": fill_price or None,
             "position_size_shares": shares or None,
             "stop_loss": pos.get("stop_loss"),
