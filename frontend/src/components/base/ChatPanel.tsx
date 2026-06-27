@@ -3,7 +3,7 @@ import { MessageCircle, X, Send, Square, AlertCircle, RefreshCw, Trash2 } from "
 import { useSSE } from "@/hooks/useSSE";
 import { useChatContext } from "@/hooks/useChatContext";
 import { chatFetchFn } from "@/api/chat";
-import { Button } from "@/components/base";
+import { Button, Markdown } from "@/components/base";
 import { cn } from "@/lib/utils";
 
 /**
@@ -66,6 +66,16 @@ export function ChatPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [history, streamingReply]);
 
+  // ESC 关闭(去掉了全屏遮罩的 click-to-close, 改由 ESC + 关闭按钮)
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
   const running = status === "connecting" || status === "streaming";
 
   const send = async () => {
@@ -105,80 +115,93 @@ export function ChatPanel() {
         </button>
       )}
 
-      {/* 抽屉 */}
+      {/* 抽屉 — 不遮背景: 无全屏遮罩, 用户可继续看/操作后面页面; ESC 或关闭按钮退出 */}
       {open && (
-        <>
-          {/* 遮罩 */}
-          <div
-            className="fixed inset-0 z-40 bg-text-primary/20 backdrop-blur-sm"
-            onClick={() => setOpen(false)}
-          />
-          {/* 面板 */}
-          <div className="fixed bottom-0 right-0 top-0 z-50 flex w-full max-w-md flex-col border-l border-border bg-bg-card shadow-xl">
-            {/* Header */}
-            <header className="flex items-center justify-between border-b border-border px-4 py-3">
-              <div>
-                <h2 className="font-serif text-lg font-medium">AI 对话</h2>
-                <p className="text-xs text-text-secondary">
-                  ED2 上下文单次注入 · ED1 断流手动重试
-                </p>
-              </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
-                  onClick={clearChat}
-                  aria-label="清空"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
-                  onClick={() => setOpen(false)}
-                  aria-label="关闭"
-                >
-                  <X className="h-4 w-4" />
-                </Button>
-              </div>
-            </header>
+        <div className="fixed bottom-0 right-0 top-0 z-50 flex w-full max-w-2xl flex-col border-l border-border bg-bg-card shadow-xl">
+          {/* Header */}
+          <header className="flex items-center justify-between border-b border-border px-4 py-3">
+            <div>
+              <h2 className="font-serif text-lg font-medium">AI 对话</h2>
+              <p className="text-xs text-text-secondary">
+                复盘助理 · ESC 关闭
+              </p>
+            </div>
+            <div className="flex items-center gap-1">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={clearChat}
+                aria-label="清空"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => setOpen(false)}
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          </header>
 
-            {/* 消息区 */}
-            <div className="flex-1 overflow-y-auto px-4 py-3">
-              {history.length === 0 && !streamingReply && (
-                <p className="mt-12 text-center text-sm text-flat">
-                  输入问题, AI 会结合当前页面上下文回答
-                </p>
-              )}
+          {/* 消息区 */}
+          <div className="flex-1 overflow-y-auto px-4 py-3">
+            {history.length === 0 && !streamingReply && !running && (
+              <p className="mt-12 text-center text-sm text-flat">
+                输入问题, AI 会结合当前页面上下文回答
+              </p>
+            )}
 
-              {history.map((m, i) => (
+            {history.map((m, i) => (
+              <div
+                key={i}
+                className={cn(
+                  "mb-3 flex",
+                  m.role === "user" ? "justify-end" : "justify-start",
+                )}
+              >
                 <div
-                  key={i}
                   className={cn(
-                    "mb-3 flex",
-                    m.role === "user" ? "justify-end" : "justify-start",
+                    "max-w-[85%] rounded-lg px-3 py-2 text-sm",
+                    m.role === "user"
+                      ? "bg-text-primary text-bg-card"
+                      : "bg-bg-base text-text-primary",
                   )}
                 >
-                  <div
-                    className={cn(
-                      "max-w-[85%] rounded-lg px-3 py-2 text-sm",
-                      m.role === "user"
-                        ? "bg-text-primary text-bg-card"
-                        : "bg-bg-base text-text-primary",
-                    )}
-                  >
+                  {m.role === "user" ? (
                     <p className="whitespace-pre-wrap">{m.content}</p>
+                  ) : (
+                    <Markdown>{m.content}</Markdown>
+                  )}
+                </div>
+              </div>
+            ))}
+
+              {/* 思考中: running 但还没出 chunk(两阶段里 phase1 工具决策/phase2 首字前) */}
+              {running && !streamingReply && (
+                <div className="mb-3 flex justify-start">
+                  <div className="rounded-lg bg-bg-base px-3 py-2.5 text-sm text-text-secondary">
+                    <span className="inline-flex items-center gap-1.5">
+                      AI 正在思考
+                      <span className="inline-flex gap-0.5">
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
+                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
+                      </span>
+                    </span>
                   </div>
                 </div>
-              ))}
+              )}
 
               {streamingReply && (
                 <div className="mb-3 flex justify-start">
                   <div className="max-w-[85%] rounded-lg bg-bg-base px-3 py-2 text-sm text-text-primary">
-                    <p className="whitespace-pre-wrap">{streamingReply}</p>
-                    <span className="mt-1 inline-block h-2 w-1 animate-pulse bg-text-secondary" />
+                    <Markdown>{streamingReply}</Markdown>
+                    <span className="mt-1 inline-block h-3 w-1 animate-pulse bg-text-secondary align-middle" />
                   </div>
                 </div>
               )}
@@ -244,8 +267,7 @@ export function ChatPanel() {
                 )}
               </div>
             </footer>
-          </div>
-        </>
+        </div>
       )}
     </>
   );
