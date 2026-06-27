@@ -123,6 +123,11 @@ def migrate_and_backfill() -> dict:
                             changed = True
                 except Exception:
                     pass
+            if section == "active_positions" and not item.get("avg_cost"):
+                ep = item.get("entry_price")
+                if ep is not None:
+                    item["avg_cost"] = float(ep)
+                    changed = True
     if changed:
         _save(wl)
 
