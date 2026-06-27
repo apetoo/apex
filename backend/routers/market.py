@@ -52,7 +52,7 @@ def get_index_daily(
 ):
     """指数日线(ED13 端点): 用于概览首页市场温度的 vol/成交。
 
-    返回结构: { code, name, bars: [{ trade_date, close, vol, pct_chg }] }
+    返回结构: { code, name, bars: [{ trade_date, close, vol, pct_chg, amount }] }
     后端 parse_json 自动解 JSON 字符串。
     """
     return parse_json(data.get_index_daily(code.strip(), days=days))
