@@ -6,11 +6,17 @@ import {
   promoteCandidate,
   closePosition,
   archiveEntry,
+  buy,
+  sell,
   type AddCandidatePayload,
   type AddPositionPayload,
   type PromotePayload,
   type ClosePositionPayload,
   type ArchivePayload,
+  type BuyPayload,
+  type SellPayload,
+  type BuyResponse,
+  type SellResponse,
 } from "./watchlist";
 import { qk } from "./query-keys";
 
@@ -42,6 +48,17 @@ const INVALIDATE: Record<string, string[][]> = {
   // 平仓 → 影响最大(触发 postmortem + calibration)
   closePosition: [
     [...qk.watchlist],
+    [...qk.account],
+    [...qk.closed],
+    [...qk.calibration],
+    [...qk.triggers],
+  ],
+  // 买入(开仓/加仓) → 持仓 + 流水(账户总风险也变)
+  buy: [[...qk.watchlist], [...qk.trades], [...qk.account], [...qk.triggers]],
+  // 卖出:减仓 → 持仓+流水;卖光 → 还影响 closed+calibration。统一全失效, 简单正确。
+  sell: [
+    [...qk.watchlist],
+    [...qk.trades],
     [...qk.account],
     [...qk.closed],
     [...qk.calibration],
@@ -122,6 +139,24 @@ export function useClosePosition(): UseMutationResult<
   return useMutation({
     mutationFn: closePosition,
     onSuccess: () => invalidateAll(qc, "closePosition"),
+  });
+}
+
+export function useBuy(): UseMutationResult<BuyResponse, Error, BuyPayload> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: buy,
+    retry: false,
+    onSuccess: () => invalidateAll(qc, "buy"),
+  });
+}
+
+export function useSell(): UseMutationResult<SellResponse, Error, SellPayload> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: sell,
+    retry: false,
+    onSuccess: () => invalidateAll(qc, "sell"),
   });
 }
 
