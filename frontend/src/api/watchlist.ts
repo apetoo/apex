@@ -26,6 +26,7 @@ export interface ActivePosition {
   ts_code: string;
   name: string;
   entry_price: number;
+  avg_cost?: number;
   entry_date: string;
   stop_loss: number;
   target: number;
@@ -56,6 +57,62 @@ export interface WatchlistData {
   candidates: Candidate[];
   archived: Array<Record<string, unknown>>;
 }
+
+export interface Trade {
+  trade_id: string;
+  ts_code: string;
+  name: string;
+  side: "buy" | "sell";
+  fill_price: number;
+  shares: number;
+  amount: number;
+  realized_pnl: number | null;
+  realized_pnl_pct: number | null;
+  avg_cost_after: number | null;
+  shares_after: number | null;
+  strategy: string | null;
+  regime: string | null;
+  journal_ref: { verdict: string | null; confidence: number | null; analyzed_at: string | null } | null;
+  note: string;
+  traded_at: string;
+}
+
+export interface BuyPayload {
+  ts_code: string;
+  fill_price: number;
+  shares: number;
+  stop_loss?: number;
+  target?: number;
+  note?: string;
+  strategy?: string;
+}
+
+export interface SellPayload {
+  ts_code: string;
+  fill_price: number;
+  shares: number;
+  exit_reason?: string;
+  note?: string;
+  postmortem?: boolean;
+}
+
+export interface BuyResponse {
+  position: ActivePosition;
+  trade: Trade;
+}
+
+export interface SellResponsePartial {
+  position: ActivePosition;
+  trade: Trade;
+}
+
+export interface SellResponseClosed {
+  trade: Trade;
+  closed_record: Record<string, unknown>;
+  diagnosis: unknown;
+}
+
+export type SellResponse = SellResponsePartial | SellResponseClosed;
 
 const MOCK_DATA: WatchlistData = {
   active_positions: [
@@ -325,6 +382,30 @@ export async function archiveEntry(
     return { message: moved ? "Entry archived (mock)" : "Entry not found", moved };
   }
   return api.post("/watchlist/archive", payload);
+}
+
+/** POST /api/watchlist/buy */
+export async function buy(payload: BuyPayload): Promise<BuyResponse> {
+  return api.post("/watchlist/buy", payload);
+}
+
+/** POST /api/watchlist/sell — 减仓或卖光 */
+export async function sell(payload: SellPayload): Promise<SellResponse> {
+  return api.post("/watchlist/sell", payload);
+}
+
+/** GET /api/watchlist/trades — 交易流水(倒序) */
+export async function getTrades(params?: {
+  ts_code?: string;
+  limit?: number;
+  since_days?: number;
+}): Promise<Trade[]> {
+  const qs = new URLSearchParams();
+  if (params?.ts_code) qs.set("ts_code", params.ts_code);
+  if (params?.limit) qs.set("limit", String(params.limit));
+  if (params?.since_days) qs.set("since_days", String(params.since_days));
+  const q = qs.toString();
+  return api.get<Trade[]>(`/watchlist/trades${q ? `?${q}` : ""}`);
 }
 
 // Re-export ApiError for callers
