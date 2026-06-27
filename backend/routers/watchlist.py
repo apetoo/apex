@@ -11,6 +11,7 @@ from apex import calibration as cal_mod
 from apex import data as data_mod
 from apex import monitor as monitor_mod
 from apex import postmortem as pm_mod
+from apex import trades as trades_mod
 from apex import watchlist as wl
 
 from backend.core.response import parse_json
@@ -19,9 +20,11 @@ from backend.schemas.watchlist import (
     AddCandidateRequest,
     AddPositionRequest,
     ArchiveRequest,
+    BuyRequest,
     ClosePositionRequest,
     PromoteCandidateRequest,
     ReplacePositionRequest,
+    SellRequest,
 )
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
@@ -156,6 +159,38 @@ def archive_entry(req: ArchiveRequest):
     ts_code = data_mod.normalize_ts_code(req.ts_code)
     moved = wl.archive_entry(ts_code=ts_code, section=req.section, reason=req.reason)
     return {"message": "Entry archived" if moved else "Entry not found", "moved": moved}
+
+
+@router.post("/buy")
+def buy(req: BuyRequest):
+    """买入:开仓或加仓。返回 {position, trade}。"""
+    ts_code = data_mod.normalize_ts_code(req.ts_code)
+    return wl.buy(
+        ts_code=ts_code, fill_price=req.fill_price, shares=req.shares,
+        stop_loss=req.stop_loss, target=req.target,
+        note=req.note, strategy=req.strategy,
+    )
+
+
+@router.post("/sell")
+def sell(req: SellRequest):
+    """卖出:减仓返回 {position, trade};卖光返回 {trade, closed_record, diagnosis}。"""
+    ts_code = data_mod.normalize_ts_code(req.ts_code)
+    return wl.sell(
+        ts_code=ts_code, fill_price=req.fill_price, shares=req.shares,
+        exit_reason=req.exit_reason, note=req.note, postmortem=req.postmortem,
+    )
+
+
+@router.get("/trades")
+def list_trades(
+    ts_code: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=1000),
+    since_days: Optional[int] = Query(None, ge=1, le=3650),
+):
+    """交易流水(按 traded_at 倒序)。可按 ts_code / limit / since_days 过滤。"""
+    code = data_mod.normalize_ts_code(ts_code) if ts_code else None
+    return trades_mod.load_trades(ts_code=code, limit=limit, since_days=since_days)
 
 
 @router.get("/closed")
