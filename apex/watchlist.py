@@ -256,6 +256,123 @@ def promote_candidate(ts_code: str, entry_price: float,
                  regime_at_open=regime_at_open)
 
 
+def _today_regime() -> Optional[str]:
+    """今日 regime label(无缓存返回 None, 不主动 collect 避免延迟)。"""
+    try:
+        from apex import regime as _regime_mod
+        today_iso = date.today().isoformat()
+        r = _regime_mod.load(today_iso)
+        if r and r.get("label"):
+            return r["label"]
+    except Exception:
+        pass
+    return None
+
+
+def _journal_ref_for(ts_code: str) -> Optional[dict]:
+    """下单时该股最近一条 journal entry(无则 None)。供 AI 诊断关联开仓上下文。"""
+    try:
+        from apex import journal as _journal
+        entries = _journal.load_entries(ts_code=ts_code)
+        if not entries:
+            return None
+        latest = sorted(entries, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
+        return {
+            "verdict": latest.get("verdict"),
+            "confidence": latest.get("confidence"),
+            "analyzed_at": latest.get("analyzed_at") or latest.get("date"),
+        }
+    except Exception:
+        return None
+
+
+def buy(ts_code: str, fill_price: float, shares: int,
+        stop_loss: Optional[float] = None, target: Optional[float] = None,
+        note: str = "", strategy: str = "manual",
+        regime: Optional[str] = None) -> dict:
+    """买入:持仓存在则加仓(重算 avg_cost),不存在则开仓。同时追加一条 buy trade 留痕。
+
+    返回 {"position": <更新后 record>, "trade": <写入的 trade>}。
+
+    Raises:
+      ValueError: fill_price<=0 或 shares<=0
+    """
+    from apex import data as _data
+    from apex import trades as _trades
+
+    if fill_price is None or float(fill_price) <= 0:
+        raise ValueError(f"fill_price 必须 > 0, got {fill_price}")
+    if shares is None or int(shares) <= 0:
+        raise ValueError(f"shares 必须 > 0, got {shares}")
+
+    fill_price = float(fill_price)
+    shares = int(shares)
+    wl = _load()
+    existing = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
+
+    regime_label = regime if regime is not None else _today_regime()
+    journal_ref = _journal_ref_for(ts_code)
+
+    if existing is not None:
+        # 加仓
+        old_shares = int(existing.get("position_size_shares") or 0)
+        old_avg = float(existing.get("avg_cost") or existing.get("entry_price") or 0)
+        new_shares = old_shares + shares
+        if new_shares > 0:
+            new_avg = (old_avg * old_shares + fill_price * shares) / new_shares
+        else:
+            new_avg = fill_price
+        existing["position_size_shares"] = new_shares
+        existing["avg_cost"] = round(new_avg, 4)
+        if stop_loss is not None:
+            existing["stop_loss"] = float(stop_loss)
+        if target is not None:
+            existing["target"] = float(target)
+        position = existing
+    else:
+        # 开仓: 反查名称
+        name = ""
+        try:
+            info_raw = _data.get_stock_info(ts_code=ts_code)
+            info_list = json.loads(info_raw) if isinstance(info_raw, str) else info_raw
+            if isinstance(info_list, list) and info_list:
+                name = info_list[0].get("name", "") or ""
+        except Exception:
+            pass
+        record = {
+            "ts_code": ts_code,
+            "name": name,
+            "entry_price": fill_price,
+            "avg_cost": fill_price,
+            "entry_date": date.today().isoformat(),
+            "trigger_price": None,
+            "trigger_direction": "below",
+            "expires_at": (date.today() + timedelta(days=10)).isoformat(),
+            "status": "active",
+        }
+        if stop_loss is not None:
+            record["stop_loss"] = float(stop_loss)
+        if target is not None:
+            record["target"] = float(target)
+        record["position_size_shares"] = shares
+        if strategy:
+            record["strategy"] = str(strategy)
+        wl["active_positions"].append(record)
+        position = record
+        new_shares = shares
+        new_avg = fill_price
+
+    _save(wl)
+    trade = _trades.append_trade(
+        ts_code=ts_code, name=position.get("name", ""),
+        side="buy", fill_price=fill_price, shares=shares,
+        avg_cost_after=position.get("avg_cost"), shares_after=position.get("position_size_shares"),
+        strategy=position.get("strategy") or strategy, regime=regime_label,
+        journal_ref=journal_ref, realized_pnl=None, note=note,
+    )
+    return {"position": position, "trade": trade}
+
+
 def dedup_active_positions() -> int:
     """
     Collapse duplicate ts_codes in active_positions: keep the one with the
