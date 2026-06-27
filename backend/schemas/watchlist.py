@@ -11,8 +11,8 @@ class AddPositionRequest(BaseModel):
     ts_code: str
     name: Optional[str] = None
     entry_price: float
-    stop_loss: float
-    target: float
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
     trigger_price: Optional[float] = None
     trigger_direction: str = "below"
     expires_days: int = 10
@@ -61,6 +61,27 @@ class ClosePositionRequest(BaseModel):
     exit_date: Optional[str] = None
     user_notes: str = ""
     actual_fill_price: Optional[float] = None
+    postmortem: bool = True
+
+
+class BuyRequest(BaseModel):
+    """买入:开仓(新代码)或加仓(已有持仓)。每笔追加 buy trade 留痕。"""
+    ts_code: str
+    fill_price: float
+    shares: int
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    note: str = ""
+    strategy: str = "manual"
+
+
+class SellRequest(BaseModel):
+    """卖出:减仓或卖光。卖光自动走 close_position + postmortem + calibration。"""
+    ts_code: str
+    fill_price: float
+    shares: int
+    exit_reason: str = "manual"
+    note: str = ""
     postmortem: bool = True
 
 
