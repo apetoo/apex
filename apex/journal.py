@@ -47,7 +47,13 @@ def load_entries(ts_code: Optional[str] = None) -> list[dict]:
     if ts_code:
         paths = [_entry_path(ts_code)]
     else:
-        paths = sorted(journal_dir.glob("*.jsonl"))
+        # 排除 *.trace.jsonl —— 它是 trace.write_trace 写的完整事件流，
+        # 形如 {ts_code, analyzed_at, events}，没有 verdict/features/evidence，
+        # 混进来会污染 list_all_journal / health.check_journal / evidence_attribution。
+        paths = sorted(
+            p for p in journal_dir.glob("*.jsonl")
+            if not p.name.endswith(".trace.jsonl")
+        )
 
     for path in paths:
         if not path.exists():
