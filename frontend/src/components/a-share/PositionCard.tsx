@@ -18,8 +18,16 @@ import type { ActivePosition } from "@/api/watchlist";
  * 红涨绿跌铁律: 当前价 vs entry_price 决定盈亏方向。
  * 字段语义见 apex/watchlist.py:add_position。
  */
-export function PositionCard({ position }: { position: ActivePosition }) {
-  const { ts_code, name, entry_price, stop_loss, target, position_size_shares, strategy } =
+export function PositionCard({
+  position,
+  onAdd,
+  onReduce,
+}: {
+  position: ActivePosition;
+  onAdd?: (p: ActivePosition) => void;
+  onReduce?: (p: ActivePosition) => void;
+}) {
+  const { ts_code, name, entry_price, avg_cost, stop_loss, target, position_size_shares, strategy } =
     position;
 
   const prices = useQuery({
@@ -36,12 +44,13 @@ export function PositionCard({ position }: { position: ActivePosition }) {
   const loading = prices.isLoading || daily.isLoading;
   const error = prices.isError || daily.isError;
 
-  // 盈亏 = (当前价 - 入场价) * 股数
+  const cost = avg_cost ?? entry_price;
+  // 盈亏 = (当前价 - 成本) * 股数
   const pnl =
     currentPrice != null && position_size_shares != null
-      ? (currentPrice - entry_price) * position_size_shares
+      ? (currentPrice - cost) * position_size_shares
       : null;
-  const pnlDelta = currentPrice != null ? currentPrice - entry_price : null;
+  const pnlDelta = currentPrice != null ? currentPrice - cost : null;
 
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border py-4 last:border-0">
@@ -65,6 +74,14 @@ export function PositionCard({ position }: { position: ActivePosition }) {
             <Target className="h-3 w-3 text-up" />
             目标 {formatPrice(target)}
           </span>
+        </div>
+        <div className="mt-1 flex items-center gap-3 text-[11px] text-text-secondary">
+          {position_size_shares != null && (
+            <span className="num">{position_size_shares} 股</span>
+          )}
+          {avg_cost != null && (
+            <span className="num">均价 {formatPrice(avg_cost)}</span>
+          )}
         </div>
       </div>
 
@@ -95,8 +112,30 @@ export function PositionCard({ position }: { position: ActivePosition }) {
               {pnl.toFixed(0)} 元
             </span>
             <span className="ml-1 opacity-80">
-              ({pnlDelta != null ? ((pnlDelta / entry_price) * 100).toFixed(2) : "—"}%)
+              ({pnlDelta != null ? ((pnlDelta / cost) * 100).toFixed(2) : "—"}%)
             </span>
+          </div>
+        )}
+      {(onAdd || onReduce) && (
+          <div className="mt-1.5 flex items-center justify-end gap-1.5">
+            {onAdd && (
+              <button
+                type="button"
+                onClick={() => onAdd(position)}
+                className="rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base"
+              >
+                加仓
+              </button>
+            )}
+            {onReduce && (
+              <button
+                type="button"
+                onClick={() => onReduce(position)}
+                className="rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base"
+              >
+                减仓
+              </button>
+            )}
           </div>
         )}
       </div>
