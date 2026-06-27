@@ -373,6 +373,92 @@ def buy(ts_code: str, fill_price: float, shares: int,
     return {"position": position, "trade": trade}
 
 
+def sell(ts_code: str, fill_price: float, shares: int,
+         exit_reason: str = "manual", note: str = "",
+         postmortem: bool = True) -> dict:
+    """卖出:减仓(改股数+实现 pnl,不复盘)或卖光(走 close_position + postmortem + calibration)。
+    同时追加一条 sell trade 留痕。
+
+    返回:
+      减仓: {"position": <更新后 pos>, "trade": <sell trade>}
+      卖光: {"trade": <sell trade>, "closed_record": <closed record>, "diagnosis": <diagnosis or None>}
+
+    Raises:
+      PositionNotFoundError: ts_code 不在 active_positions
+      ValueError: fill_price<=0 / shares<=0 / shares > 持有
+    """
+    from apex import trades as _trades
+    from apex.schemas import EXIT_REASON_ENUM
+
+    if fill_price is None or float(fill_price) <= 0:
+        raise ValueError(f"fill_price 必须 > 0, got {fill_price}")
+    if shares is None or int(shares) <= 0:
+        raise ValueError(f"shares 必须 > 0, got {shares}")
+    if exit_reason not in EXIT_REASON_ENUM:
+        exit_reason = "other"
+
+    fill_price = float(fill_price)
+    shares = int(shares)
+    wl = _load()
+    pos = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
+    if pos is None:
+        raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
+
+    holding = int(pos.get("position_size_shares") or 0)
+    if shares > holding:
+        raise ValueError(f"卖出股数 {shares} 超过持有 {holding}")
+
+    avg_cost_before = float(pos.get("avg_cost") or pos.get("entry_price") or 0)
+    regime_label = _today_regime()
+    journal_ref = _journal_ref_for(ts_code)
+    name = pos.get("name", "")
+    strategy = pos.get("strategy")
+
+    if shares >= holding:
+        # 卖光 → 留痕 + 走 close_position(actual_fill_price=avg_cost_before 使 pnl 基准正确)
+        realized = round((fill_price - avg_cost_before) * holding, 2) if avg_cost_before > 0 else None
+        realized_pct = round((fill_price / avg_cost_before - 1), 4) if avg_cost_before > 0 else None
+        trade = _trades.append_trade(
+            ts_code=ts_code, name=name, side="sell",
+            fill_price=fill_price, shares=holding,
+            avg_cost_after=None, shares_after=0,
+            strategy=strategy, regime=regime_label, journal_ref=journal_ref,
+            realized_pnl=realized, realized_pnl_pct=realized_pct, note=note,
+        )
+        closed_record = close_position(
+            ts_code=ts_code, exit_price=fill_price, exit_reason=exit_reason,
+            actual_fill_price=avg_cost_before,
+        )
+        diagnosis = None
+        if postmortem:
+            try:
+                from apex import postmortem as _pm
+                diagnosis = _pm.run_and_patch(closed_record)
+            except Exception:
+                diagnosis = None
+            try:
+                from apex import calibration as _cal
+                _cal.compute()
+            except Exception:
+                pass
+        return {"trade": trade, "closed_record": closed_record, "diagnosis": diagnosis}
+
+    # 减仓 → 留痕 + 改状态, 不复盘
+    realized = round((fill_price - avg_cost_before) * shares, 2) if avg_cost_before > 0 else None
+    realized_pct = round((fill_price / avg_cost_before - 1), 4) if avg_cost_before > 0 else None
+    new_shares = holding - shares
+    pos["position_size_shares"] = new_shares  # avg_cost 不变
+    _save(wl)
+    trade = _trades.append_trade(
+        ts_code=ts_code, name=name, side="sell",
+        fill_price=fill_price, shares=shares,
+        avg_cost_after=avg_cost_before, shares_after=new_shares,
+        strategy=strategy, regime=regime_label, journal_ref=journal_ref,
+        realized_pnl=realized, realized_pnl_pct=realized_pct, note=note,
+    )
+    return {"position": pos, "trade": trade}
+
+
 def dedup_active_positions() -> int:
     """
     Collapse duplicate ts_codes in active_positions: keep the one with the
