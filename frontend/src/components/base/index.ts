@@ -9,3 +9,8 @@ export {
 export { Button, buttonVariants } from "./button";
 export type { ButtonProps } from "./button";
 export { ChatPanel } from "./ChatPanel";
+export { Drawer } from "./Drawer";
+export type { DrawerProps } from "./Drawer";
+export { Markdown } from "./Markdown";
+export type { MarkdownProps } from "./Markdown";
+export { ErrorBoundary } from "./ErrorBoundary";

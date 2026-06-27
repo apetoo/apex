@@ -1,11 +1,12 @@
 import { NavLink, Route, Routes } from "react-router-dom";
-import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch } from "lucide-react";
+import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ChatPanel } from "@/components/base";
 import { ChatContextProvider } from "@/hooks/useChatContext";
 import { OverviewPage } from "@/routes/overview/OverviewPage";
 import { WatchlistPage } from "@/routes/watchlist/WatchlistPage";
 import { AnalyzePage } from "@/routes/analyze/AnalyzePage";
+import { JournalPage } from "@/routes/journal/JournalPage";
 import { BacktestPage } from "@/routes/backtest/BacktestPage";
 import { ScreenerPage } from "@/routes/screener/ScreenerPage";
 
@@ -15,6 +16,7 @@ import { ScreenerPage } from "@/routes/screener/ScreenerPage";
  * /                概览(PR3)
  * /watchlist       持仓(PR1b)
  * /analyze         分析(PR2)
+ * /journal         分析历史(跨股)
  * /backtest        回测(PR4)
  * /screener        筛选(PR5)
  *
@@ -25,6 +27,7 @@ const NAV = [
   { to: "/", label: "概览", icon: LayoutDashboard, end: true },
   { to: "/watchlist", label: "持仓", icon: Wallet, end: false },
   { to: "/analyze", label: "分析", icon: Search, end: false },
+  { to: "/journal", label: "历史", icon: History, end: false },
   { to: "/backtest", label: "回测", icon: LineChart, end: false },
   { to: "/screener", label: "筛选", icon: ScanSearch, end: false },
 ];
@@ -67,6 +70,7 @@ function App() {
             <Route path="/" element={<OverviewPage />} />
             <Route path="/watchlist" element={<WatchlistPage />} />
             <Route path="/analyze" element={<AnalyzePage />} />
+            <Route path="/journal" element={<JournalPage />} />
             <Route
               path="/backtest"
               element={<BacktestPage />}

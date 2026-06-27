@@ -93,6 +93,7 @@ target/
 
 # CLAUDE AI
 .claude/
+.superpowers/
 
 # Node / frontend
 node_modules/

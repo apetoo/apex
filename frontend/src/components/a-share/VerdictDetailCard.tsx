@@ -1,0 +1,112 @@
+import { Sparkles, Target, ShieldAlert, Flag, ListChecks } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle, Markdown } from "@/components/base";
+import { VerdictTag } from "./VerdictTag";
+import { cn, formatPrice } from "@/lib/utils";
+
+/**
+ * <VerdictDetailCard> — 分析结果详情卡(共享)
+ *
+ * 复用于: /analyze 当前分析落地 + /journal 历史详情抽屉。
+ * verdict 字段形状(后端 apex/analyze.py:run 返回的 entry):
+ *   { ts_code, analyzed_at, verdict, confidence, calibrated_confidence,
+ *     calibration_explanation, price_advice: { entry, stop_loss, target, ... },
+ *     evidence: string[], analysis_text, ... }
+ */
+
+export function fmtPrice(v: unknown): string {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  return Number.isFinite(n) ? formatPrice(n) : String(v);
+}
+
+export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown> }) {
+  const pa = (verdict.price_advice ?? {}) as Record<string, unknown>;
+  const evidence = Array.isArray(verdict.evidence) ? (verdict.evidence as unknown[]) : [];
+  const analysisText = typeof verdict.analysis_text === "string" ? verdict.analysis_text : "";
+  const calibrated = verdict.calibrated_confidence;
+  const calExplanation =
+    typeof verdict.calibration_explanation === "string" ? verdict.calibration_explanation : "";
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-up" />
+          <CardTitle>分析结果</CardTitle>
+        </div>
+        <div className="flex items-center gap-2">
+          <VerdictTag verdict={String(verdict.verdict ?? "")} />
+          <span className="num text-xs text-text-secondary">
+            置信度 {String(verdict.confidence ?? "—")}
+            {calibrated !== undefined && calibrated !== null && (
+              <span className="text-flat"> / 校准 {String(calibrated)}</span>
+            )}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4 pt-0">
+        {/* 价位建议 */}
+        <div className="grid grid-cols-3 gap-3">
+          <PriceCell icon={Target} label="入场" value={fmtPrice(pa.entry)} tone="text-text-primary" />
+          <PriceCell icon={ShieldAlert} label="止损" value={fmtPrice(pa.stop_loss)} tone="text-down" />
+          <PriceCell icon={Flag} label="目标" value={fmtPrice(pa.target)} tone="text-up" />
+        </div>
+
+        {/* 证据链 */}
+        {evidence.length > 0 && (
+          <div>
+            <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-text-secondary">
+              <ListChecks className="h-3.5 w-3.5" />
+              证据链
+            </div>
+            <ul className="space-y-1">
+              {evidence.map((ev, i) => (
+                <li key={i} className="flex items-start gap-2 text-sm">
+                  <span className="num mt-0.5 text-[10px] text-flat">{i + 1}.</span>
+                  <span className="text-text-primary">{String(ev)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* AI 叙述 */}
+        {analysisText && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">AI 分析</div>
+            <Markdown>{analysisText}</Markdown>
+          </div>
+        )}
+
+        {/* 校准说明 */}
+        {calExplanation && (
+          <p className="rounded-md bg-bg-base p-2 text-[11px] text-flat">
+            校准: {calExplanation}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PriceCell({
+  icon: Icon,
+  label,
+  value,
+  tone,
+}: {
+  icon: typeof Target;
+  label: string;
+  value: string;
+  tone: string;
+}) {
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="flex items-center gap-1.5 text-xs text-text-secondary">
+        <Icon className="h-3.5 w-3.5" />
+        {label}
+      </div>
+      <p className={cn("num mt-1 text-lg font-semibold", tone)}>{value}</p>
+    </div>
+  );
+}

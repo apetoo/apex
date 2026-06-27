@@ -153,6 +153,33 @@ export function analyzeMockFetchFn() {
   return async (): Promise<Response> => buildMockAnalyzeFetcher()();
 }
 
+/** GET /api/journal — 全部标的历史分析(跨股, 倒序)。供 /journal 历史页。 */
+export async function getAllJournal(): Promise<unknown[]> {
+  if (USE_MOCK) {
+    return [
+      {
+        ts_code: "002466.SZ",
+        name: "天齐锂业",
+        verdict: "看多",
+        confidence: 3.5,
+        price_advice: { entry: 66.04, stop_loss: 60.71, target: 72.0 },
+        analyzed_at: "2026-06-24T10:30:00",
+        analysis_text: "MA20 支撑, 锂电板块情绪转暖",
+      },
+      {
+        ts_code: "002050.SZ",
+        name: "三花智控",
+        verdict: "偏空",
+        confidence: 2.0,
+        price_advice: { entry: 28.0, stop_loss: 30.0, target: 24.0 },
+        analyzed_at: "2026-06-20T14:00:00",
+        analysis_text: "放量跌破 MA20, 短期承压",
+      },
+    ];
+  }
+  return api.get<unknown[]>("/journal");
+}
+
 /** GET /api/journal/{ts_code} — 历史 journal 列表 */
 export async function getJournal(tsCode: string): Promise<unknown[]> {
   if (USE_MOCK) {

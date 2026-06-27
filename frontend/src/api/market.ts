@@ -148,3 +148,62 @@ export async function getIndexDailyBatch(
     `/market/index-daily/batch?codes=${codes.join(",")}&days=${days}`,
   );
 }
+
+/** 当日分时 1 分钟 K 线(后端 get_intraday_bars, akshare 1min 不复权) */
+export interface IntradayBar {
+  time: string; // "YYYY-MM-DD HH:MM:SS" 北京时间
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  vol: number;
+  amount: number;
+}
+export interface IntradayBars {
+  trade_date?: string;
+  as_of_time?: string;
+  is_intraday?: boolean;
+  prev_close?: number | null;
+  prev_vol_shou?: number | null;
+  bars: IntradayBar[];
+}
+
+/** GET /api/market/intraday/{ts_code}/bars — 当日分时 */
+export async function getIntradayBars(tsCode: string): Promise<IntradayBars> {
+  if (USE_MOCK) {
+    // mock: 9:30-15:00 每分钟一根, 价格在 prev 附近随机游走
+    const prev = MOCK_DATA[tsCode]?.price ?? 10;
+    const bars: IntradayBar[] = [];
+    let p = prev;
+    const sessions = [
+      ["09:30", "11:30"],
+      ["13:00", "15:00"],
+    ];
+    for (const [s, e] of sessions) {
+      const [sh, sm] = s.split(":").map(Number);
+      const [eh, em] = e.split(":").map(Number);
+      let m = sh * 60 + sm;
+      const end = eh * 60 + em;
+      for (; m < end; m++) {
+        const hh = String(Math.floor(m / 60)).padStart(2, "0");
+        const mm = String(m % 60).padStart(2, "0");
+        const open = p;
+        p = Math.max(0.01, p + (Math.sin(m) - 0.5) * 0.02);
+        const close = p;
+        bars.push({
+          time: `2026-06-27 ${hh}:${mm}:00`,
+          open,
+          high: Math.max(open, close) + 0.01,
+          low: Math.min(open, close) - 0.01,
+          close,
+          vol: 1000 + Math.abs(Math.sin(m)) * 500,
+          amount: close * 1000,
+        });
+      }
+    }
+    return { trade_date: "20260627", is_intraday: true, prev_close: prev, bars };
+  }
+  return api.get<IntradayBars>(
+    `/market/intraday/${encodeURIComponent(tsCode)}/bars`,
+  );
+}
