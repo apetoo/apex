@@ -141,7 +141,7 @@ def migrate_and_backfill() -> dict:
 
 
 def add_position(ts_code: str, name: str, entry_price: float,
-                 stop_loss: float, target: float,
+                 stop_loss: Optional[float], target: Optional[float],
                  trigger_price: Optional[float] = None,
                  trigger_direction: str = "below",
                  expires_days: int = 10,
@@ -169,13 +169,15 @@ def add_position(ts_code: str, name: str, entry_price: float,
         "entry_price": entry_price,
         "avg_cost": float(entry_price),
         "entry_date": date.today().isoformat(),
-        "stop_loss": stop_loss,
-        "target": target,
         "trigger_price": trigger_price,
         "trigger_direction": trigger_direction,
         "expires_at": expires,
         "status": "active",
     }
+    if stop_loss is not None:
+        record["stop_loss"] = float(stop_loss)
+    if target is not None:
+        record["target"] = float(target)
     if position_size_shares is not None and position_size_shares > 0:
         record["position_size_shares"] = int(position_size_shares)
     if risk_amount is not None:
