@@ -10,7 +10,8 @@ import {
   CardDescription,
   Button,
 } from "@/components/base";
-import { PositionCard, CandidateCard } from "@/components/a-share";
+import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
+import { CompactCandidateCard } from "@/components/a-share/CompactCandidateCard";
 import { getWatchlist, getTrades, type ActivePosition, type Trade } from "@/api/watchlist";
 import { useAddCandidate, useBuy, useSell } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
@@ -340,66 +341,72 @@ export function WatchlistPage() {
         </Card>
       ) : data ? (
         <>
-          {/* 持仓 section */}
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0">
-              <div className="flex items-center gap-2">
-                <Wallet className="h-4 w-4 text-text-secondary" />
-                <CardTitle>持仓</CardTitle>
-                <span className="num text-xs text-text-secondary">
-                  {data.active_positions.length} 只
-                </span>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => navigate("/analyze")}
-              >
-                去分析 →
-              </Button>
-            </CardHeader>
-            {data.active_positions.length === 0 ? (
-              <CardContent>
-                <p className="py-6 text-center text-sm text-flat">暂无持仓</p>
-              </CardContent>
-            ) : (
-              <CardContent className="pt-0">
-                {data.active_positions.map((p) => (
-                  <PositionCard
-                    key={p.ts_code}
-                    position={p}
-                    onAdd={(pos) => openTradeForm(pos, "buy")}
-                    onReduce={(pos) => openTradeForm(pos, "sell")}
-                  />
-                ))}
-              </CardContent>
-            )}
-          </Card>
+          <div className="grid gap-4 lg:grid-cols-2">
+            {/* 持仓 section */}
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between space-y-0">
+                <div className="flex items-center gap-2">
+                  <Wallet className="h-4 w-4 text-text-secondary" />
+                  <CardTitle>持仓</CardTitle>
+                  <span className="num text-xs text-text-secondary">
+                    {data.active_positions.length} 只
+                  </span>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => navigate("/analyze")}
+                >
+                  去分析 →
+                </Button>
+              </CardHeader>
+              {data.active_positions.length === 0 ? (
+                <CardContent>
+                  <p className="py-6 text-center text-sm text-flat">暂无持仓</p>
+                </CardContent>
+              ) : (
+                <CardContent className="pt-0">
+                  <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+                    {data.active_positions.map((p) => (
+                      <CompactPositionCard
+                        key={p.ts_code}
+                        position={p}
+                        onAdd={(pos) => openTradeForm(pos, "buy")}
+                        onReduce={(pos) => openTradeForm(pos, "sell")}
+                      />
+                    ))}
+                  </div>
+                </CardContent>
+              )}
+            </Card>
 
-          {/* 候选 section */}
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0">
-              <div className="flex items-center gap-2">
-                <Bell className="h-4 w-4 text-text-secondary" />
-                <CardTitle>候选</CardTitle>
-                <span className="num text-xs text-text-secondary">
-                  {data.candidates.length} 只
-                </span>
-              </div>
-              <CardDescription>触发价 + 方向, 接近时高亮</CardDescription>
-            </CardHeader>
-            {data.candidates.length === 0 ? (
-              <CardContent>
-                <p className="py-6 text-center text-sm text-flat">暂无候选</p>
-              </CardContent>
-            ) : (
-              <CardContent className="pt-0">
-                {data.candidates.map((c) => (
-                  <CandidateCard key={c.ts_code} candidate={c} />
-                ))}
-              </CardContent>
-            )}
-          </Card>
+            {/* 候选 section */}
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between space-y-0">
+                <div className="flex items-center gap-2">
+                  <Bell className="h-4 w-4 text-text-secondary" />
+                  <CardTitle>候选</CardTitle>
+                  <span className="num text-xs text-text-secondary">
+                    {data.candidates.length} 只
+                  </span>
+                </div>
+                <CardDescription>触发价 + 方向, 接近时高亮</CardDescription>
+              </CardHeader>
+              {data.candidates.length === 0 ? (
+                <CardContent>
+                  <p className="py-6 text-center text-sm text-flat">暂无候选</p>
+                </CardContent>
+              ) : (
+                <CardContent className="pt-0">
+                  <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+                    {data.candidates.map((c) => (
+                      <CompactCandidateCard key={c.ts_code} candidate={c} />
+                    ))}
+                  </div>
+                </CardContent>
+              )}
+            </Card>
+          </div>
         </>
       ) : null}
 
