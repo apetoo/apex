@@ -12,7 +12,7 @@ import {
 } from "@/components/base";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 import { CompactCandidateCard } from "@/components/a-share/CompactCandidateCard";
-import { getWatchlist, getTrades, type ActivePosition, type Trade } from "@/api/watchlist";
+import { getWatchlist, getTrades, type ActivePosition } from "@/api/watchlist";
 import { useAddCandidate, useBuy, useSell } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
 import { formatPrice } from "@/lib/utils";

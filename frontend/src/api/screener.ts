@@ -199,7 +199,10 @@ function adaptScreenerReport(
     // 但前端没专门的字段就先塞进 ai_summary 让用户看到
     ai_summary: (raw.selector_reasoning as string) ?? undefined,
     regime: raw.regime as { label: string; summary: string } | undefined,
-    stats,
+    stats: {
+      total_candidates: stats.total_candidates ?? 0,
+      top_n: stats.top_n ?? 0,
+    },
   };
 }
 
