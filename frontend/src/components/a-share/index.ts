@@ -1,6 +1,8 @@
 export { PriceTag } from "./PriceTag";
 export { VerdictTag } from "./VerdictTag";
 export { MarketIndexBar } from "./MarketIndexBar";
-export { PositionCard } from "./PositionCard";
-export { CandidateCard } from "./CandidateCard";
+export { CompactPositionCard } from "./CompactPositionCard";
+export { CompactCandidateCard } from "./CompactCandidateCard";
 export { AnalyzeTraceStream } from "./AnalyzeTraceStream";
+export { VerdictDetailCard, fmtPrice } from "./VerdictDetailCard";
+export { IntradayChart } from "./IntradayChart";
