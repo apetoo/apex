@@ -15,7 +15,7 @@ import type { ActivePosition } from "@/api/watchlist";
  *   - 距入场价的盈亏金额(若知道股数)
  *   - 策略归属(strategy tag)
  *
- * 红涨绿跌铁律: 当前价 vs entry_price 决定盈亏方向。
+ * 红涨绿跌铁律: 当前价 vs avg_cost(??entry_price) 决定盈亏方向。
  * 字段语义见 apex/watchlist.py:add_position。
  */
 export function PositionCard({
@@ -65,6 +65,7 @@ export function PositionCard({
           )}
         </div>
         <p className="mt-0.5 text-xs text-text-secondary">{ts_code}</p>
+        {(stop_loss != null || target != null) && (
         <div className="mt-1.5 flex items-center gap-3 text-[11px] text-text-secondary">
           <span className="flex items-center gap-0.5">
             <ShieldAlert className="h-3 w-3 text-down" />
@@ -75,6 +76,7 @@ export function PositionCard({
             目标 {formatPrice(target)}
           </span>
         </div>
+        )}
         <div className="mt-1 flex items-center gap-3 text-[11px] text-text-secondary">
           {position_size_shares != null && (
             <span className="num">{position_size_shares} 股</span>

@@ -4,7 +4,7 @@
 字段形状见 docs/superpowers/specs/2026-06-27-manual-positions-trades-design.md。
 """
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 

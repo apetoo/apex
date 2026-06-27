@@ -28,8 +28,8 @@ export interface ActivePosition {
   entry_price: number;
   avg_cost?: number;
   entry_date: string;
-  stop_loss: number;
-  target: number;
+  stop_loss?: number;
+  target?: number;
   trigger_price: number | null;
   trigger_direction: "below" | "above";
   expires_at: string;

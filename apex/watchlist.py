@@ -364,8 +364,6 @@ def buy(ts_code: str, fill_price: float, shares: int,
             record["strategy"] = str(strategy)
         wl["active_positions"].append(record)
         position = record
-        new_shares = shares
-        new_avg = fill_price
 
     _save(wl)
     trade = _trades.append_trade(
