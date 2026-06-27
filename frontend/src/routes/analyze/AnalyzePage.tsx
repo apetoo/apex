@@ -19,9 +19,11 @@ import { formatPrice } from "@/lib/utils";
  * ED2: setContext(verdict 摘要) → chat 呼出时自动注入
  */
 export function AnalyzePage() {
-  const [tsCode, setTsCode] = useState("002466.SZ");
+  const [tsCode, setTsCode] = useState("");
   const [committedCode, setCommittedCode] = useState<string | null>(null);
   const [latestVerdict, setLatestVerdict] = useState<Record<string, unknown> | null>(null);
+
+  const canRun = tsCode.trim().length > 0;
 
   const { setContext } = useChatContext();
 
@@ -83,6 +85,7 @@ export function AnalyzePage() {
           />
           <Button
             variant="primary"
+            disabled={!canRun}
             onClick={() => {
               setCommittedCode(tsCode);
               setLatestVerdict(null);

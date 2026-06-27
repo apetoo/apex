@@ -127,7 +127,7 @@ export function ScreenerPage() {
   const startScreener = () => {
     setProgressMessages([]);
     void connect({
-      path: "/screener/run",
+      path: "/api/screener/run",
       method: "POST",
       body: { strategy_weights: weights, skip_ai: false, skip_selector: false },
       fetchFn: screenerFetchFn(weights),

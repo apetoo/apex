@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Wrench, MessageSquare, FileText, CheckCircle2, Loader2, AlertCircle, RefreshCw, Square } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, Button } from "@/components/base";
 import { useSSE } from "@/hooks/useSSE";
-import { analyzeFetchFn } from "@/api/analyze";
+import { analyzeFetchFn, analyzeRunPath } from "@/api/analyze";
 import { cn } from "@/lib/utils";
 
 /**
@@ -77,7 +77,7 @@ export function AnalyzeTraceStream({ tsCode, onVerdict, className }: AnalyzeTrac
 
   const start = () => {
     void connect({
-      path: `/analyze/run?ts_code=${encodeURIComponent(tsCode)}&save=true`,
+      path: analyzeRunPath(tsCode, true),
       method: "GET",
       fetchFn: analyzeFetchFn(),
     });

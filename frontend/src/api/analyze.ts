@@ -21,7 +21,9 @@ import { api } from "./client";
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "0";
 
 export function analyzeRunPath(tsCode: string, save: boolean = true): string {
-  return `/analyze/run?ts_code=${encodeURIComponent(tsCode)}&save=${save}`;
+  // 必须带 /api 前缀 —— Vite proxy 只转发 /api 到 FastAPI,
+  // 否则请求落到 dev server SPA fallback,返回 304/403/502(useSSE 报 HTTP <status>)。
+  return `/api/analyze/run?ts_code=${encodeURIComponent(tsCode)}&save=${save}`;
 }
 
 const MOCK_TRACE_EVENTS: Array<Record<string, unknown>> = [
