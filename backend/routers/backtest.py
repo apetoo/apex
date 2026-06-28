@@ -1,17 +1,25 @@
-"""回测接口：实际平仓 + 信号模拟 + 持有期扫描 + 校准切片 + 组合净值。"""
+"""回测接口：实际平仓 + 信号模拟 + 持有期扫描 + 校准切片 + 组合净值 + AI 复盘。"""
 from __future__ import annotations
 
 from typing import Optional
 
 from fastapi import APIRouter, Query
+from pydantic import BaseModel
 
 from apex import backtest as bt
+from apex import backtest_review as review_mod
 from apex import data as data_mod
 from apex import watchlist as wl
 
 from backend.core.response import dataframe_records
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
+
+
+class ReviewRequest(BaseModel):
+    ts_code: Optional[str] = None
+    lookforward_days: Optional[int] = None
+    model: Optional[str] = None
 
 
 @router.get("/signals")
@@ -67,3 +75,19 @@ def backtest_realized():
     """实际平仓分析：真实成交，含佣金印花税。"""
     df = bt.run_realized()
     return dataframe_records(df)
+
+
+@router.post("/review")
+def backtest_review(req: ReviewRequest):
+    """AI 复盘：对一批回测信号跑 DeepSeek，产出结构化结论 + 落盘策略统计。
+
+    返回 summary / findings / prompt_injection / strategy_weight_hint /
+    strategy_stats / aggregate / model / generated_at。BacktestReviewError
+    （未配 api_key / 无可成交信号 / AI 调用失败）由全局 handler 映射为 502。
+    """
+    code = data_mod.normalize_ts_code(req.ts_code) if req.ts_code else None
+    return review_mod.review(
+        ts_code=code,
+        lookforward_days=req.lookforward_days,
+        model=req.model,
+    )

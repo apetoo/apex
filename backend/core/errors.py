@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from apex import analyze as ana_mod
+from apex import backtest_review as br_mod
 from apex import postmortem as pm_mod
 from apex import watchlist as wl_mod
 
@@ -45,6 +46,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(pm_mod.PostmortemError)
     async def _postmortem(_req: Request, exc: pm_mod.PostmortemError) -> JSONResponse:
         return _json(500, {"detail": f"复盘失败: {exc}"})
+
+    @app.exception_handler(br_mod.BacktestReviewError)
+    async def _backtest_review(_req: Request, exc: br_mod.BacktestReviewError) -> JSONResponse:
+        # 502 = 上游 AI 调用语义（含未配 key / 无可成交信号 / AI 未产出结论）
+        return _json(502, {"detail": f"AI 回测复盘失败: {exc}"})
 
     @app.exception_handler(ValueError)
     async def _value_error(_req: Request, exc: ValueError) -> JSONResponse:

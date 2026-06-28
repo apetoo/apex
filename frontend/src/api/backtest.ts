@@ -373,3 +373,66 @@ export async function getBacktestPortfolio(
   params.set("lookforward_days", String(lookforwardDays));
   return api.get<PortfolioResult>(`/backtest/portfolio?${params}`);
 }
+
+/* ── AI 回测复盘 ────────────────────────────────────────── */
+/*
+ * POST /api/backtest/review — 对 aggregate 切片跑 DeepSeek，产出结构化结论。
+ * 字段形状以 apex/backtest_review.py:review() 的返回 dict 为准（非 mock）。
+ * 阻塞调用（AI 几秒），不进 query cache，走 mutation。
+ */
+
+export type ReviewCategory =
+  | "calibration"
+  | "exit"
+  | "strategy"
+  | "regime"
+  | "risk"
+  | "entry";
+
+export type ReviewSeverity = "high" | "medium" | "low";
+export type WeightHint = "increase" | "decrease" | "hold";
+
+export interface BacktestFinding {
+  category: ReviewCategory;
+  severity: ReviewSeverity;
+  description: string;
+  suggestion: string;
+}
+
+export interface BacktestReviewResult {
+  summary: string;
+  findings: BacktestFinding[];
+  prompt_injection: string;
+  strategy_weight_hint: Record<string, WeightHint>;
+  strategy_stats?: {
+    generated_at: string;
+    lookforward_days?: number | null;
+    total_signals?: number;
+    by_strategy?: Record<
+      string,
+      {
+        n: number;
+        win_rate: number | null;
+        avg_net_return: number | null;
+        avg_excess_return: number | null;
+        weight_hint: WeightHint;
+      }
+    >;
+  } | null;
+  aggregate?: AggregateResult | null;
+  model?: string;
+  generated_at: string;
+}
+
+export async function reviewBacktest(
+  tsCode: string | null,
+  lookforwardDays: number,
+  model?: string,
+): Promise<BacktestReviewResult> {
+  // AI 调用不走 mock（mock 无意义），仅真后端可用。
+  return api.post<BacktestReviewResult>("/backtest/review", {
+    ts_code: tsCode ?? null,
+    lookforward_days: lookforwardDays,
+    model: model ?? null,
+  });
+}

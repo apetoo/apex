@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   BarChart3,
   History,
@@ -11,6 +11,8 @@ import {
   TrendingUp,
   Gauge,
   Activity,
+  Sparkles,
+  AlertTriangle,
 } from "lucide-react";
 import {
   Card,
@@ -27,12 +29,17 @@ import {
   getBacktestSweep,
   getBacktestAggregate,
   getBacktestPortfolio,
+  reviewBacktest,
   resolveExitReason,
   type SweepByPeriod,
   type AggregateBucket,
   type AggregateResult,
   type PortfolioResult,
+  type BacktestReviewResult,
+  type ReviewSeverity,
+  type WeightHint,
 } from "@/api/backtest";
+import { ApiError } from "@/api/client";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
 
 /**
@@ -169,6 +176,9 @@ export function BacktestPage() {
 
       {/* P3: AI 校准 */}
       <AggregateCard query={aggregate} />
+
+      {/* AI 复盘: 对 aggregate 切片跑 DeepSeek，产出可执行结论 + prompt_injection */}
+      <ReviewCard tsCode={committedCode} lookforwardDays={lookforwardDays} />
 
       {/* 逐笔收益柱状图(ED11 修正) */}
       <Card>
@@ -703,6 +713,170 @@ function CalibInsight({ buckets }: { buckets: AggregateBucket[] }) {
           ? `✗ 高置信胜率反而更低，AI 自评失真`
           : `高/低置信胜率接近，AI 自评区分度有限`}
     </p>
+  );
+}
+
+/* ── AI 复盘 ──────────────────────────────────────────────── */
+
+const SEVERITY_STYLE: Record<ReviewSeverity, string> = {
+  high: "text-down border-down/40 bg-down/5",
+  medium: "text-amber-600 border-amber-500/40 bg-amber-500/5",
+  low: "text-text-secondary border-border bg-bg-elevated",
+};
+
+const SEVERITY_LABEL: Record<ReviewSeverity, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
+};
+
+const CATEGORY_LABEL: Record<string, string> = {
+  calibration: "置信度校准",
+  exit: "止损止盈",
+  strategy: "策略来源",
+  regime: "市场环境",
+  risk: "风控仓位",
+  entry: "入场点",
+};
+
+const WEIGHT_STYLE: Record<WeightHint, string> = {
+  increase: "text-up",
+  decrease: "text-down",
+  hold: "text-text-secondary",
+};
+
+const WEIGHT_LABEL: Record<WeightHint, string> = {
+  increase: "↑ 增权",
+  decrease: "↓ 降权",
+  hold: "= 持平",
+};
+
+function ReviewCard({
+  tsCode,
+  lookforwardDays,
+}: {
+  tsCode: string | null;
+  lookforwardDays: number;
+}) {
+  const mutation = useMutation({
+    mutationFn: () => reviewBacktest(tsCode, lookforwardDays),
+  });
+  const d = mutation.data;
+  const err =
+    mutation.error instanceof ApiError
+      ? mutation.error.message
+      : mutation.error instanceof Error
+        ? mutation.error.message
+        : null;
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-2">
+        <Sparkles className="h-4 w-4 text-text-secondary" />
+        <CardTitle>AI 复盘</CardTitle>
+        <CardDescription>
+          把校准切片喂给 DeepSeek · 诊断系统性问题 + 反哺下次分析
+        </CardDescription>
+        <div className="ml-auto">
+          <Button
+            variant="primary"
+            disabled={mutation.isPending}
+            onClick={() => mutation.mutate()}
+          >
+            {mutation.isPending ? "复盘中…" : "跑 AI 复盘"}
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {mutation.isIdle && !d && (
+          <p className="py-6 text-center text-sm text-flat">
+            点击「跑 AI 复盘」· 基于当前标的/前瞻天数的 aggregate 切片
+          </p>
+        )}
+        {mutation.isPending && (
+          <p className="py-6 text-center text-sm text-flat">
+            DeepSeek 分析中（约数秒）…
+          </p>
+        )}
+        {err && !mutation.isPending && (
+          <p className="flex items-center justify-center gap-1.5 py-4 text-sm text-down">
+            <AlertTriangle className="h-4 w-4" />
+            {err}
+          </p>
+        )}
+        {d && !mutation.isPending && (
+          <div className="space-y-4">
+            <p className="text-sm leading-relaxed">{d.summary}</p>
+
+            {d.findings.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-text-secondary">
+                  发现的问题（{d.findings.length}）
+                </p>
+                {d.findings.map((f, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "rounded-md border px-3 py-2",
+                      SEVERITY_STYLE[f.severity],
+                    )}
+                  >
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-medium">
+                        {CATEGORY_LABEL[f.category] ?? f.category}
+                      </span>
+                      <span className="rounded bg-bg-elevated px-1.5 py-0.5">
+                        {SEVERITY_LABEL[f.severity]}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm">{f.description}</p>
+                    <p className="mt-1 text-xs text-text-secondary">
+                      建议：{f.suggestion}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {d.prompt_injection && (
+              <div className="rounded-md border border-border bg-bg-elevated px-3 py-2">
+                <p className="text-xs font-medium text-text-secondary">
+                  下次分析注入提醒（已落盘，analyze 自动读取）
+                </p>
+                <p className="mt-1 text-sm leading-relaxed">
+                  {d.prompt_injection}
+                </p>
+              </div>
+            )}
+
+            {Object.keys(d.strategy_weight_hint).length > 0 && (
+              <div>
+                <p className="mb-1.5 text-xs font-medium text-text-secondary">
+                  策略权重建议（已落盘 backtest_strategy_stats.json）
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(d.strategy_weight_hint).map(([src, hint]) => (
+                    <span
+                      key={src}
+                      className="num rounded-md border border-border bg-bg-elevated px-2 py-1 text-xs"
+                    >
+                      {src}{" "}
+                      <span className={WEIGHT_STYLE[hint]}>
+                        {WEIGHT_LABEL[hint]}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <p className="text-[11px] text-flat">
+              模型 {d.model ?? "—"} · {d.generated_at}
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
