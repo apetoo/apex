@@ -210,3 +210,166 @@ export async function getBacktestRealized(): Promise<BacktestRealized[]> {
   if (USE_MOCK) return MOCK_REALIZED;
   return api.get<BacktestRealized[]>("/backtest/realized");
 }
+
+/* ── P2: 持有期扫描 ─────────────────────────────────────── */
+
+export interface SweepByPeriod {
+  holding_period: number;
+  n: number;
+  fillable_n: number;
+  unfillable_count: number;
+  win_rate: number | null;
+  avg_net_return: number | null;
+  avg_max_drawdown: number | null;
+  avg_excess_return: number | null;
+}
+
+export interface SweepResult {
+  per_signal: BacktestSignal[];
+  by_period: SweepByPeriod[];
+}
+
+const MOCK_SWEEP: SweepResult = {
+  per_signal: [],
+  by_period: [
+    { holding_period: 1, n: 18, fillable_n: 16, unfillable_count: 2, win_rate: 0.5625, avg_net_return: 0.0042, avg_max_drawdown: -0.015, avg_excess_return: 0.0011 },
+    { holding_period: 3, n: 18, fillable_n: 16, unfillable_count: 2, win_rate: 0.5, avg_net_return: 0.0089, avg_max_drawdown: -0.028, avg_excess_return: 0.0034 },
+    { holding_period: 5, n: 18, fillable_n: 16, unfillable_count: 2, win_rate: 0.5625, avg_net_return: 0.0151, avg_max_drawdown: -0.041, avg_excess_return: 0.0068 },
+    { holding_period: 10, n: 18, fillable_n: 16, unfillable_count: 2, win_rate: 0.5, avg_net_return: 0.0188, avg_max_drawdown: -0.072, avg_excess_return: 0.0042 },
+    { holding_period: 20, n: 18, fillable_n: 16, unfillable_count: 2, win_rate: 0.4375, avg_net_return: 0.0113, avg_max_drawdown: -0.121, avg_excess_return: -0.0021 },
+  ],
+};
+
+export async function getBacktestSweep(
+  tsCode: string | null,
+  holdingPeriods?: number[],
+): Promise<SweepResult> {
+  if (USE_MOCK) return MOCK_SWEEP;
+  const params = new URLSearchParams();
+  if (tsCode) params.set("ts_code", tsCode);
+  if (holdingPeriods && holdingPeriods.length)
+    params.set("holding_periods", holdingPeriods.join(","));
+  return api.get<SweepResult>(`/backtest/signals/sweep?${params}`);
+}
+
+/* ── P3: 校准切片 ─────────────────────────────────────── */
+
+export interface AggregateBucket {
+  key: string;
+  n: number;
+  win_rate: number | null;
+  avg_net_return: number | null;
+  avg_excess_return: number | null;
+}
+
+export interface AggregateResult {
+  lookforward_days: number;
+  total_signals: number;
+  fillable_count: number;
+  unfillable_count: number;
+  by_confidence_bucket: AggregateBucket[];
+  by_verdict: AggregateBucket[];
+  by_strategy: AggregateBucket[];
+}
+
+const MOCK_AGGREGATE: AggregateResult = {
+  lookforward_days: 10,
+  total_signals: 42,
+  fillable_count: 38,
+  unfillable_count: 4,
+  by_confidence_bucket: [
+    { key: "1-3", n: 8, win_rate: 0.375, avg_net_return: -0.012, avg_excess_return: -0.018 },
+    { key: "4-6", n: 17, win_rate: 0.529, avg_net_return: 0.008, avg_excess_return: 0.002 },
+    { key: "7-10", n: 13, win_rate: 0.692, avg_net_return: 0.034, avg_excess_return: 0.027 },
+  ],
+  by_verdict: [
+    { key: "看多", n: 21, win_rate: 0.667, avg_net_return: 0.028, avg_excess_return: 0.021 },
+    { key: "偏多", n: 12, win_rate: 0.5, avg_net_return: 0.005, avg_excess_return: -0.002 },
+    { key: "观望偏多", n: 5, win_rate: 0.4, avg_net_return: -0.011, avg_excess_return: -0.015 },
+  ],
+  by_strategy: [{ key: "standalone", n: 38, win_rate: 0.553, avg_net_return: 0.014, avg_excess_return: 0.008 }],
+};
+
+export async function getBacktestAggregate(
+  tsCode: string | null,
+  lookforwardDays: number,
+): Promise<AggregateResult> {
+  if (USE_MOCK) return MOCK_AGGREGATE;
+  const params = new URLSearchParams();
+  if (tsCode) params.set("ts_code", tsCode);
+  params.set("lookforward_days", String(lookforwardDays));
+  return api.get<AggregateResult>(`/backtest/signals/aggregate?${params}`);
+}
+
+/* ── P4: 组合级净值 ─────────────────────────────────────── */
+
+export interface EquityPoint {
+  date: string;
+  equity: number;
+}
+
+export interface PortfolioTrade {
+  ts_code: string;
+  entry_date: string;
+  exit_date: string;
+  return: number;
+}
+
+export interface PortfolioStats {
+  total_return: number;
+  max_drawdown: number;
+  sharpe: number;
+  n_trades: number;
+  win_rate: number;
+  init_cash: number;
+  final_equity: number | null;
+}
+
+export interface PortfolioResult {
+  equity_curve: EquityPoint[];
+  stats: Partial<PortfolioStats>;
+  trades: PortfolioTrade[];
+  error?: string;
+}
+
+function mkMockEquity(): EquityPoint[] {
+  // 单调上升带波动的合成净值
+  const pts: EquityPoint[] = [];
+  let v = 1000000;
+  const start = new Date("2026-01-05");
+  for (let i = 0; i < 24; i++) {
+    v *= 1 + (0.004 + (i % 5 === 0 ? -0.012 : 0));
+    const d = new Date(start);
+    d.setDate(d.getDate() + i * 7);
+    pts.push({ date: d.toISOString().slice(0, 10), equity: Math.round(v) });
+  }
+  return pts;
+}
+
+const MOCK_PORTFOLIO: PortfolioResult = {
+  equity_curve: mkMockEquity(),
+  stats: {
+    total_return: 0.082,
+    max_drawdown: -0.038,
+    sharpe: 1.42,
+    n_trades: 6,
+    win_rate: 0.667,
+    init_cash: 1000000,
+    final_equity: 1082000,
+  },
+  trades: [
+    { ts_code: "002050.SZ", entry_date: "2026-01-08", exit_date: "2026-01-22", return: 0.034 },
+    { ts_code: "600519.SH", entry_date: "2026-01-15", exit_date: "2026-01-29", return: -0.012 },
+  ],
+};
+
+export async function getBacktestPortfolio(
+  tsCode: string | null,
+  lookforwardDays: number,
+): Promise<PortfolioResult> {
+  if (USE_MOCK) return MOCK_PORTFOLIO;
+  const params = new URLSearchParams();
+  if (tsCode) params.set("ts_code", tsCode);
+  params.set("lookforward_days", String(lookforwardDays));
+  return api.get<PortfolioResult>(`/backtest/portfolio?${params}`);
+}

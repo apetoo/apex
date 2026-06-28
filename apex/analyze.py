@@ -12,6 +12,7 @@ from openai import OpenAI
 _TZ_CN = timezone(timedelta(hours=8))
 
 from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod
+from apex.journal_views import history_digest
 from apex.schemas import VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS
 
 
@@ -558,7 +559,7 @@ def _resolve_outcome_for_entry(entry: dict,
     return " → 未跟进（未开仓）"
 
 
-def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
+def _format_history(entries: list[dict], ts_code: str, limit: int = 8) -> str:
     """Format past journal entries for injection into the user prompt.
 
     B1: 每条历史尾部追加"实际后续表现"——从 closed/active positions 反查实际盈亏。
@@ -698,17 +699,8 @@ def _format_history(entries: list[dict], ts_code: str, limit: int = 5) -> str:
     lines = []
     for e in recent:
         j_idx = idx_by_id.get(id(e), -1)
-        when = (e.get("analyzed_at") or e.get("date") or "?")[:16].replace("T", " ")
-        verdict = e.get("verdict", "?")
-        conf = e.get("confidence", "?")
-        pa = e.get("price_advice") or {}
-        entry_p = pa.get("entry") if pa.get("entry") is not None else "-"
-        stop = pa.get("stop_loss") if pa.get("stop_loss") is not None else "-"
-        target = pa.get("target") if pa.get("target") is not None else "-"
         outcome = outcome_by_idx.get(j_idx, " → 未跟进（未开仓）")
-        lines.append(
-            f"- {when} | {verdict} (置信度 {conf}/10) | 建议买入 {entry_p} 止损 {stop} 目标 {target}{outcome}"
-        )
+        lines.append(history_digest(e, outcome))
     return stat_block + "\n".join(lines)
 
 
@@ -1046,6 +1038,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     cfg = _cfg_mod.get()
     model = cfg["deepseek"]["model"]
     max_iter = cfg["deepseek"]["max_tool_iterations"]
+    history_limit = cfg["deepseek"].get("history_limit", 8)
     client = _make_client(cfg)
     system = _load_system_prompt()
 
@@ -1060,7 +1053,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 pass
 
     history_block = _format_history(
-        journal.load_entries(ts_code=ts_code), ts_code=ts_code,
+        journal.load_entries(ts_code=ts_code), ts_code=ts_code, limit=history_limit,
     )
     portfolio_block = _format_portfolio_context(ts_code)
     intraday_block, intraday_ctx = _format_intraday_block(ts_code)
@@ -1079,7 +1072,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "role": "user",
             "content": (
                 f"请分析股票 {ts_code}。\n\n"
-                f"## 该标的过往判断（最近 5 次，含实际后续表现）\n{history_block}\n\n"
+                f"## 该标的过往判断（最近 {history_limit} 次，含实际后续表现）\n{history_block}\n\n"
                 f"{portfolio_block}\n\n"
                 f"{intraday_block}\n\n"
                 f"{market_block}\n\n"

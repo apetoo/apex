@@ -32,7 +32,17 @@ def _trace_path(ts_code: str) -> Path:
 
 
 def write_trace(ts_code: str, analyzed_at: str, events: list[dict]) -> None:
-    """Append one record to <ts_code>.trace.jsonl. Each record wraps the full event list."""
+    """Append one record to <ts_code>.trace.jsonl. Each record wraps the full event list.
+
+    C: 顶层形状校验。trace 是调试数据, 不深校验 event 内部, 但顶层三字段必须对,
+    否则 load_trace 按 (ts_code, analyzed_at) 查会查不到。
+    """
+    if not ts_code:
+        raise ValueError("write_trace: ts_code 不能为空")
+    if not analyzed_at:
+        raise ValueError("write_trace: analyzed_at 不能为空")
+    if not isinstance(events, list):
+        raise ValueError(f"write_trace: events 必须是 list, got {type(events).__name__}")
     path = _trace_path(ts_code)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {

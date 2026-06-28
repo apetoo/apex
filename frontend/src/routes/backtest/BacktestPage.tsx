@@ -1,6 +1,17 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { BarChart3, History, Target, ShieldAlert, Clock, CheckCircle2, XCircle } from "lucide-react";
+import {
+  BarChart3,
+  History,
+  Target,
+  ShieldAlert,
+  Clock,
+  CheckCircle2,
+  XCircle,
+  TrendingUp,
+  Gauge,
+  Activity,
+} from "lucide-react";
 import {
   Card,
   CardContent,
@@ -10,22 +21,31 @@ import {
   Button,
 } from "@/components/base";
 import { VerdictTag } from "@/components/a-share";
-import { getBacktestSignals, getBacktestRealized, resolveExitReason } from "@/api/backtest";
+import {
+  getBacktestSignals,
+  getBacktestRealized,
+  getBacktestSweep,
+  getBacktestAggregate,
+  getBacktestPortfolio,
+  resolveExitReason,
+  type SweepByPeriod,
+  type AggregateBucket,
+  type AggregateResult,
+  type PortfolioResult,
+} from "@/api/backtest";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
 
 /**
  * /backtest 回测页
  *
- * ED11(修正): 逐笔收益柱状图 + 统计表(不画错的净值曲线)。
- * 统计: 胜率 / 平均净收益 / 平均超额 / 平均回撤 / 平均夏普。
+ * 五个视图:
+ *  - 组合净值(P4): 全部信号喂进单个 Portfolio(共享资金池) → 净值曲线 + stats
+ *  - 持有期扫描(P2): 每条信号 × 多档持有期 → 最优持有几天
+ *  - AI 校准(P3): 按 置信度桶/verdict/source 切片 → AI 自信时准不准
+ *  - 逐笔收益(ED11): 柱状图(不画客户端累乘净值, 组合净值已由 P4 服务端算)
+ *  - 实盘平仓: 真实成交
  *
- * 1:1 对应 streamlit tab_bt:
- *   - 选 ts_code + lookforward_days
- *   - 信号列表(逐笔交易)
- *   - 净值曲线(改: 逐笔柱状图)
- *   - 已实现收益(实盘平仓)
- *
- * 柱状图: 纯 SVG(不引图表库, ED11 决策轻量)
+ * A 股: 红涨绿跌。图表纯 SVG(ED11 决策轻量)。
  */
 export function BacktestPage() {
   const [tsCode, setTsCode] = useState("");
@@ -40,6 +60,18 @@ export function BacktestPage() {
     queryKey: ["backtest", "realized"],
     queryFn: getBacktestRealized,
   });
+  const sweep = useQuery({
+    queryKey: ["backtest", "sweep", committedCode],
+    queryFn: () => getBacktestSweep(committedCode),
+  });
+  const aggregate = useQuery({
+    queryKey: ["backtest", "aggregate", committedCode, lookforwardDays],
+    queryFn: () => getBacktestAggregate(committedCode, lookforwardDays),
+  });
+  const portfolio = useQuery({
+    queryKey: ["backtest", "portfolio", committedCode, lookforwardDays],
+    queryFn: () => getBacktestPortfolio(committedCode, lookforwardDays),
+  });
 
   const data = signals.data ?? [];
   const stats = computeStats(data);
@@ -51,7 +83,7 @@ export function BacktestPage() {
           回测
         </h1>
         <p className="mt-1 text-sm text-text-secondary">
-          AI 多头信号的逐笔 P&amp;L · 统计表 · 实盘平仓复盘
+          组合净值 · 持有期扫描 · AI 校准 · 逐笔 P&amp;L · 实盘平仓
         </p>
       </div>
 
@@ -129,13 +161,22 @@ export function BacktestPage() {
         </div>
       )}
 
+      {/* P4: 组合净值 */}
+      <PortfolioCard query={portfolio} />
+
+      {/* P2: 持有期扫描 */}
+      <SweepCard query={sweep} />
+
+      {/* P3: AI 校准 */}
+      <AggregateCard query={aggregate} />
+
       {/* 逐笔收益柱状图(ED11 修正) */}
       <Card>
         <CardHeader className="flex flex-row items-center gap-2">
           <BarChart3 className="h-4 w-4 text-text-secondary" />
           <CardTitle>逐笔收益</CardTitle>
           <CardDescription>
-            {data.length} 笔 · ED11 不画错的净值曲线, 用柱状图直观对比
+            {data.length} 笔 · T+1 开盘入场 · 涨停不可成交已剔除
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-0">
@@ -226,8 +267,6 @@ export function BacktestPage() {
           ) : (
             <div className="divide-y divide-border">
               {(realized.data ?? []).map((r, i) => {
-                // 真后端字段优先(更准): fill_price / net_pnl_pct / days_held
-                // 老 mock 字段(向后兼容): entry_price / net_return / hold_days
                 const fillPrice = r.fill_price ?? r.entry_price ?? null;
                 const netReturn = r.net_pnl_pct ?? r.net_return ?? 0;
                 const heldDays = r.days_held ?? r.hold_days ?? 0;
@@ -277,6 +316,393 @@ export function BacktestPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+/* ── P4: 组合净值 ──────────────────────────────────────────── */
+
+function PortfolioCard({
+  query,
+}: {
+  query: ReturnType<typeof useQuery<PortfolioResult>>;
+}) {
+  const d = query.data;
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-2">
+        <TrendingUp className="h-4 w-4 text-text-secondary" />
+        <CardTitle>组合净值</CardTitle>
+        <CardDescription>
+          全部信号喂进单个 Portfolio（共享资金池 · 每笔 20% 仓位 · T+1 开盘成交）·
+          服务端 vectorbt 算，非客户端累乘
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {query.isLoading ? (
+          <p className="py-8 text-center text-sm text-flat">回测中...</p>
+        ) : !d || d.equity_curve.length === 0 ? (
+          <p className="py-8 text-center text-sm text-flat">
+            {d?.error ?? "无信号或数据不足"}
+          </p>
+        ) : (
+          <div className="space-y-4">
+            <EquityChart points={d.equity_curve} />
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              <StatCard
+                label="总收益"
+                value={formatPercent(d.stats.total_return ?? 0)}
+                tone={(d.stats.total_return ?? 0) >= 0 ? "up" : "down"}
+              />
+              <StatCard
+                label="最大回撤"
+                value={formatPercent(d.stats.max_drawdown ?? 0)}
+                tone="down"
+              />
+              <StatCard label="夏普" value={(d.stats.sharpe ?? 0).toFixed(2)} />
+              <StatCard label="交易数" value={String(d.stats.n_trades ?? 0)} />
+              <StatCard
+                label="胜率"
+                value={formatRatio(d.stats.win_rate ?? 0)}
+                tone={(d.stats.win_rate ?? 0) >= 0.5 ? "up" : "down"}
+              />
+              <StatCard
+                label="终值"
+                value={
+                  d.stats.final_equity != null
+                    ? d.stats.final_equity.toLocaleString()
+                    : "—"
+                }
+              />
+            </div>
+            {d.trades.length > 0 && (
+              <div className="divide-y divide-border">
+                {d.trades.slice(0, 12).map((t, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center justify-between gap-3 py-2"
+                  >
+                    <p className="num text-xs text-text-secondary">
+                      {t.ts_code} · {t.entry_date} → {t.exit_date}
+                    </p>
+                    <p
+                      className={cn(
+                        "num text-sm font-medium",
+                        t.return >= 0 ? "text-up" : "text-down",
+                      )}
+                    >
+                      {formatPercent(t.return)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EquityChart({
+  points,
+}: {
+  points: { date: string; equity: number }[];
+}) {
+  const W = 720;
+  const H = 220;
+  const PAD = { l: 56, r: 12, t: 12, b: 28 };
+  const innerW = W - PAD.l - PAD.r;
+  const innerH = H - PAD.t - PAD.b;
+  const eqs = points.map((p) => p.equity);
+  const min = Math.min(...eqs);
+  const max = Math.max(...eqs);
+  const range = max - min || 1;
+  const x = (i: number) => PAD.l + (i / (points.length - 1 || 1)) * innerW;
+  const y = (v: number) => PAD.t + (1 - (v - min) / range) * innerH;
+  const path = points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.equity).toFixed(1)}`)
+    .join(" ");
+  const up = eqs[eqs.length - 1] >= eqs[0];
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="组合净值曲线">
+      {/* 基线(起始值) */}
+      <line
+        x1={PAD.l}
+        x2={W - PAD.r}
+        y1={y(eqs[0])}
+        y2={y(eqs[0])}
+        stroke="currentColor"
+        className="text-border"
+        strokeDasharray="3 3"
+        strokeWidth={1}
+      />
+      <path d={path} fill="none" stroke="var(--color-up)" strokeWidth={1.8} />
+      {/* 起止标注 */}
+      <text x={PAD.l - 6} y={y(eqs[0]) + 3} textAnchor="end" className="fill-text-secondary text-[10px]">
+        {eqs[0].toLocaleString()}
+      </text>
+      <text x={W - PAD.r} y={y(eqs[eqs.length - 1]) - 4} textAnchor="end" className="fill-text-secondary text-[10px]">
+        {eqs[eqs.length - 1].toLocaleString()}
+      </text>
+      <text x={PAD.l} y={H - 8} className="fill-flat text-[10px]">
+        {points[0].date}
+      </text>
+      <text x={W - PAD.r} y={H - 8} textAnchor="end" className="fill-flat text-[10px]">
+        {points[points.length - 1].date}
+      </text>
+      <text x={W - PAD.r} y={PAD.t + 10} textAnchor="end" className={cn("text-[10px]", up ? "fill-up" : "fill-down")}>
+        {up ? "▲" : "▼"} {((eqs[eqs.length - 1] / eqs[0] - 1) * 100).toFixed(2)}%
+      </text>
+    </svg>
+  );
+}
+
+/* ── P2: 持有期扫描 ────────────────────────────────────────── */
+
+function SweepCard({
+  query,
+}: {
+  query: ReturnType<typeof useQuery<{ per_signal: unknown[]; by_period: SweepByPeriod[] }>>;
+}) {
+  const rows = query.data?.by_period ?? [];
+  const fillable = rows.filter((r) => r.avg_net_return != null);
+  const best =
+    fillable.length === 0
+      ? null
+      : fillable.reduce((m, r) =>
+          (r.avg_net_return ?? -Infinity) > (m.avg_net_return ?? -Infinity) ? r : m,
+        ).holding_period;
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-2">
+        <Activity className="h-4 w-4 text-text-secondary" />
+        <CardTitle>持有期扫描</CardTitle>
+        <CardDescription>
+          每条信号 × 多档持有期 · 回答"AI 信号最优持有几天"
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {query.isLoading ? (
+          <p className="py-6 text-center text-sm text-flat">回测中...</p>
+        ) : rows.length === 0 ? (
+          <p className="py-6 text-center text-sm text-flat">无信号</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="num w-full text-sm">
+              <thead>
+                <tr className="border-b border-border text-left text-xs text-text-secondary">
+                  <th className="py-2 pr-3 font-normal">持有天数</th>
+                  <th className="py-2 pr-3 font-normal">可成交</th>
+                  <th className="py-2 pr-3 font-normal">不可成交</th>
+                  <th className="py-2 pr-3 font-normal">胜率</th>
+                  <th className="py-2 pr-3 font-normal">平均净收益</th>
+                  <th className="py-2 pr-3 font-normal">平均超额</th>
+                  <th className="py-2 pr-3 font-normal">平均回撤</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => {
+                  const isBest = r.holding_period === best;
+                  return (
+                    <tr
+                      key={r.holding_period}
+                      className={cn("border-b border-border/50", isBest && "bg-up/5")}
+                    >
+                      <td className="py-2 pr-3 font-medium">
+                        {r.holding_period}
+                        {isBest && <span className="ml-1 text-up">★</span>}
+                      </td>
+                      <td className="py-2 pr-3 text-text-secondary">{r.fillable_n}</td>
+                      <td className="py-2 pr-3 text-text-secondary">
+                        {r.unfillable_count || "—"}
+                      </td>
+                      <td
+                        className={cn(
+                          "py-2 pr-3",
+                          r.win_rate == null
+                            ? "text-flat"
+                            : r.win_rate >= 0.5
+                              ? "text-up"
+                              : "text-down",
+                        )}
+                      >
+                        {r.win_rate == null ? "—" : formatRatio(r.win_rate)}
+                      </td>
+                      <td
+                        className={cn(
+                          "py-2 pr-3",
+                          r.avg_net_return == null
+                            ? "text-flat"
+                            : r.avg_net_return >= 0
+                              ? "text-up"
+                              : "text-down",
+                        )}
+                      >
+                        {r.avg_net_return == null ? "—" : formatPercent(r.avg_net_return)}
+                      </td>
+                      <td
+                        className={cn(
+                          "py-2 pr-3",
+                          r.avg_excess_return == null
+                            ? "text-flat"
+                            : r.avg_excess_return >= 0
+                              ? "text-up"
+                              : "text-down",
+                        )}
+                      >
+                        {r.avg_excess_return == null ? "—" : formatPercent(r.avg_excess_return)}
+                      </td>
+                      <td className="py-2 pr-3 text-down">
+                        {r.avg_max_drawdown == null ? "—" : formatPercent(r.avg_max_drawdown)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ── P3: AI 校准 ───────────────────────────────────────────── */
+
+function AggregateCard({
+  query,
+}: {
+  query: ReturnType<typeof useQuery<AggregateResult>>;
+}) {
+  const d = query.data;
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-2">
+        <Gauge className="h-4 w-4 text-text-secondary" />
+        <CardTitle>AI 校准</CardTitle>
+        <CardDescription>
+          按 置信度桶 / verdict / source 切片 · 回答"AI 自信时准不准"
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {query.isLoading ? (
+          <p className="py-6 text-center text-sm text-flat">回测中...</p>
+        ) : !d || d.fillable_count === 0 ? (
+          <p className="py-6 text-center text-sm text-flat">无信号</p>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-xs text-text-secondary">
+              共 {d.total_signals} 条信号 · 可成交 {d.fillable_count}
+              {d.unfillable_count > 0 && (
+                <span className="text-down">
+                  {" "}· 涨停不可成交 {d.unfillable_count}（已剔出胜率分母）
+                </span>
+              )}
+            </p>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <BucketTable
+                title="置信度桶"
+                buckets={d.by_confidence_bucket}
+                highlight
+              />
+              <BucketTable title="Verdict" buckets={d.by_verdict} />
+              <BucketTable title="来源" buckets={d.by_strategy} />
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function BucketTable({
+  title,
+  buckets,
+  highlight = false,
+}: {
+  title: string;
+  buckets: AggregateBucket[];
+  highlight?: boolean;
+}) {
+  return (
+    <div>
+      <p className="mb-1 text-xs font-medium text-text-secondary">{title}</p>
+      <table className="num w-full text-xs">
+        <thead>
+          <tr className="border-b border-border text-left text-text-secondary">
+            <th className="py-1.5 pr-2 font-normal">桶</th>
+            <th className="py-1.5 pr-2 font-normal">N</th>
+            <th className="py-1.5 pr-2 font-normal">胜率</th>
+            <th className="py-1.5 font-normal">净收益</th>
+          </tr>
+        </thead>
+        <tbody>
+          {buckets.map((b) => (
+            <tr key={b.key} className="border-b border-border/40">
+              <td className="py-1.5 pr-2">{b.key}</td>
+              <td className="py-1.5 pr-2 text-text-secondary">{b.n}</td>
+              <td
+                className={cn(
+                  "py-1.5 pr-2",
+                  b.win_rate == null
+                    ? "text-flat"
+                    : b.win_rate >= 0.5
+                      ? "text-up"
+                      : "text-down",
+                )}
+              >
+                {b.win_rate == null ? "—" : formatRatio(b.win_rate)}
+              </td>
+              <td
+                className={cn(
+                  "py-1.5",
+                  b.avg_net_return == null
+                    ? "text-flat"
+                    : b.avg_net_return >= 0
+                      ? "text-up"
+                      : "text-down",
+                )}
+              >
+                {b.avg_net_return == null ? "—" : formatPercent(b.avg_net_return)}
+              </td>
+            </tr>
+          ))}
+          {buckets.length === 0 && (
+            <tr>
+              <td colSpan={4} className="py-2 text-center text-flat">
+                —
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      {highlight && buckets.length >= 2 && (
+        <CalibInsight buckets={buckets} />
+      )}
+    </div>
+  );
+}
+
+function CalibInsight({ buckets }: { buckets: AggregateBucket[] }) {
+  // 比较 7-10 vs 1-3 的胜率，给一句话结论
+  const hi = buckets.find((b) => b.key === "7-10");
+  const lo = buckets.find((b) => b.key === "1-3");
+  if (!hi || !lo || hi.win_rate == null || lo.win_rate == null) return null;
+  const diff = hi.win_rate - lo.win_rate;
+  const good = diff > 0.05;
+  return (
+    <p
+      className={cn(
+        "mt-1.5 text-[11px]",
+        good ? "text-up" : diff < -0.05 ? "text-down" : "text-flat",
+      )}
+    >
+      {good
+        ? `✓ 高置信(7-10)胜率 ${formatRatio(hi.win_rate)} 显著高于低置信(1-3) ${formatRatio(lo.win_rate)}，AI 自评有区分度`
+        : diff < -0.05
+          ? `✗ 高置信胜率反而更低，AI 自评失真`
+          : `高/低置信胜率接近，AI 自评区分度有限`}
+    </p>
   );
 }
 
