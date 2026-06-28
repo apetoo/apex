@@ -83,9 +83,9 @@ frontend/src/
 │   ├── mutations.ts        # 6 react-query mutations (addCandidate/addPosition/replace/promote/close/archive)
 │   ├── market.ts watchlist.ts account.ts analyze.ts chat.ts screener.ts backtest.ts
 ├── components/
-│   ├── base/               # shadcn-style Card / Button / ChatPanel foundation
-│   └── a-share/            # A-share primitives: PriceTag / VerdictTag / PositionCard / CandidateCard / MarketIndexBar
-├── routes/                 # 5 pages: overview / watchlist / analyze / backtest / screener
+│   ├── base/               # shadcn-style Card / Button / ChatPanel / Markdown / Drawer foundation
+│   └── a-share/            # A-share primitives: PriceTag / VerdictTag / PositionCard / CandidateCard / MarketIndexBar / VerdictDetailCard
+├── routes/                 # 6 pages: overview / watchlist / analyze / journal / backtest / screener
 ├── hooks/                  # useSSE (hand-written, no MSW) + useChatContext (single-injection hash tracking)
 ├── lib/utils.ts            # cn / directionClass / formatPrice / formatDelta / formatPercent / formatRatio
 └── types/verdict.ts        # VERDICT_COLOR TS const
@@ -96,7 +96,8 @@ Vite proxy (`/api` → 127.0.0.1:8000) for dev. Production: `VITE_USE_MOCK=0 npm
 Routes:
 - `/` Overview — market index bar (ED13 single source) + positions + chat trigger
 - `/watchlist` — active / candidates / archived tabs with inline add form
-- `/analyze` — SSE trace stream + verdict card + journal history
+- `/analyze` — SSE trace stream + verdict card + per-stock journal history (概要)
+- `/journal` — cross-stock full history list + search + click-row → `<Drawer>` with `<VerdictDetailCard>` (完整结果)
 - `/backtest` — per-signal bar chart + stats table + realized closed trades
 - `/screener` — strategy weight sliders (localStorage) + report with regime/by_strategy/top_scored
 
@@ -120,3 +121,11 @@ SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `c
 **Closing a position triggers postmortem + recalibration.** `close_position` writes a closed record; the backend's `POST /api/watchlist/close` then runs `postmortem.run_and_patch` (AI diagnosis) and `calibration.compute()` when `postmortem=true` (default). `POST /api/postmortem/run` re-runs diagnosis on an existing closed record by `closed_at`.
 
 **Adding an AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The agent dispatches by name through `_dispatch_tool` which only looks at `TOOL_FUNCTIONS`.
+
+**SSE data contract (cross前后端).** `sse_starlette` 3.x 的 `EventSourceResponse` 对 `data` 直接 `str()` —— dict 会变 Python repr（单引号），前端 `JSON.parse` 必失败。所以 `backend/core/streaming.py` 的 `_sse()` helper 把 data 先 `json.dumps(ensure_ascii=False, default=str)` 成字符串再 yield；**新增 SSE 事件必须走 `_sse()`，不要直接 `yield {"event":..., "data": <dict>}`**。另一坑：sse_starlette 行尾是 `\r\n`（事件间 `\r\n\r\n`），而 dev mock 的 `sseEncode` 用 `\n` —— 前端 `useSSE.parseSSEChunk` 必须用 `split(/\r?\n\r?\n/)` 兼容两者，否则真后端事件全堆 buffer、mock 单测却全过（盲区）。
+
+**analyze verdict 字段形状（勿按 mock 写前端）.** 真后端 `analyze.run` 返回的 entry 是**嵌套**结构：`price_advice: {entry, stop_loss, target, position_size_pct}`、`evidence: string[]`、`analysis_text`（非 `note`）、`calibrated_confidence` / `calibration_explanation`、`analyzed_at`（非 `date`）。前端 mock（`api/analyze.ts`）用的是平铺 `entry_price`/`stop_loss`/`note` —— **写前端字段前以 `apex/analyze.py:run` 的返回 dict 为准，别照 mock 抄**。`tool_result` trace 事件同理带的是 `summary`(dict) + `raw`(原始 JSON str)，不是 `result`。共享渲染走 `components/a-share/VerdictDetailCard`，AI 叙述走 `components/base/Markdown`（AI 输出含 markdown，别用 `whitespace-pre-wrap` 纯文本）。
+
+**分时不是 AI 工具，且原始 bars 不落盘.** `get_intraday_snapshot` / `get_intraday_bars` 不在 `data.TOOL_FUNCTIONS` —— 别把它们注册成 AI 工具（启动时 `_format_intraday_block` 强制注入特征到 prompt，设计上不让 AI 决定调不调）。分时原始 1 分钟 bars 在 Python 压成特征后即弃，**不进 prompt、不写 trace.jsonl**；trace 里只有日线 raw（`get_daily_price` 是工具，落 `tool_result.raw`）。所以前端分时图只能实时调 `/api/market/intraday/{ts_code}/bars`，**无法从 trace 回放历史分时**。
+
+**web_search 有强制类别，别动 record_verdict 校验.** `MANDATORY_SEARCH_CATEGORIES = ["earnings","shareholders","regulatory","money_flow"]`（`data.py`）是 A 股判断地基，`record_verdict` 前强制校验 `searches_performed` 含全 4 类，缺则抛 `verdict_rejected` 逼 AI 补搜。这是有意覆盖设计，别为省调用次数放宽。
