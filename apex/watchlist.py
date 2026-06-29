@@ -37,6 +37,12 @@ def _save(data: dict) -> None:
 
 
 def is_triggered(entry: dict, current_price: float) -> bool:
+    # 带状触发优先：有 trigger_low/trigger_high 时，价格进入此带才触发（避免接飞刀/追高）。
+    low = entry.get("trigger_low")
+    high = entry.get("trigger_high")
+    if low is not None and high is not None:
+        return float(low) <= current_price <= float(high)
+    # 退回单向阈值（老候选 / 持仓层 trigger_price=None 不触发）
     direction = entry.get("trigger_direction", "below")
     trigger = entry.get("trigger_price")
     if trigger is None:
@@ -709,7 +715,9 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
                   expires_days: int = 7,
                   stop_advice: Optional[float] = None,
                   target_advice: Optional[float] = None,
-                  strategy: Optional[str] = None) -> None:
+                  strategy: Optional[str] = None,
+                  trigger_low: Optional[float] = None,
+                  trigger_high: Optional[float] = None) -> None:
     from datetime import timedelta
     data = _load()
     expires = (date.today() + timedelta(days=expires_days)).isoformat()
@@ -727,5 +735,10 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["target_advice"] = target_advice
     if strategy:
         entry["strategy"] = str(strategy)
+    # 买入区间（带状触发）：有则 is_triggered 走 low<=price<=high，无则退回单向阈值。
+    if trigger_low is not None:
+        entry["trigger_low"] = float(trigger_low)
+    if trigger_high is not None:
+        entry["trigger_high"] = float(trigger_high)
     data["candidates"].append(entry)
     _save(data)

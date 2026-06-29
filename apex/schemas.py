@@ -44,6 +44,8 @@ class FeaturesSchema(TypedDict, total=False):
 
 class PriceAdviceSchema(TypedDict, total=False):
     entry: Optional[float]
+    entry_low: Optional[float]
+    entry_high: Optional[float]
     stop_loss: Optional[float]
     target: Optional[float]
     position_size_pct: Optional[int]

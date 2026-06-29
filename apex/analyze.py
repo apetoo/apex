@@ -280,7 +280,10 @@ TOOLS = [
                 "必须引用工具返回的真实数字（如 close=12.34、RSI=67.2、减持公告日期），"
                 "不得写泛泛的定性描述。\n"
                 "**entry / stop_loss / target 为必填**：看多/偏多/观望偏多必须填具体价位，"
-                "非看多方向（中性及以下）统一填 0。"
+                "非看多方向（中性及以下）统一填 0。entry 同时给一个成交区间 entry_low/entry_high "
+                "（回踩入场：entry_low=区间下沿地板 / entry_high=entry 主锚点；突破入场：entry_low=entry 主锚点 / "
+                "entry_high=区间上沿天花板），价格进入此带才触发，避免接飞刀或追高。区间宽度参考 ATR(14)%，"
+                "通常 1-3%。非看多方向 entry_low/entry_high 留空不填。"
             ),
             "parameters": {
                 "type": "object",
@@ -294,7 +297,9 @@ TOOLS = [
                         "type": "integer",
                         "description": "置信度 1-10",
                     },
-                    "entry": {"type": "number", "description": "建议买入价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "entry": {"type": "number", "description": "建议买入价（主锚点）。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "entry_low": {"type": "number", "description": "买入区间下沿（地板价）。回踩入场=下方支撑，突破入场=entry 主锚点。看多类必填，非看多方向不填。"},
+                    "entry_high": {"type": "number", "description": "买入区间上沿（天花板）。回踩入场=entry 主锚点，突破入场=上方阻力。看多类必填，非看多方向不填。"},
                     "stop_loss": {"type": "number", "description": "止损价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
                     "target": {"type": "number", "description": "目标价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
                     "features": {
@@ -1421,6 +1426,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "calibration_explanation": cal_explanation,
         "price_advice": {
             "entry": verdict_data.get("entry"),
+            "entry_low": verdict_data.get("entry_low"),
+            "entry_high": verdict_data.get("entry_high"),
             "stop_loss": verdict_data.get("stop_loss"),
             "target": verdict_data.get("target"),
             "position_size_pct": verdict_data.get("position_size_pct"),

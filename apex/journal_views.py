@@ -69,11 +69,20 @@ def chat_summary(entry: dict, is_today: bool = False) -> str:
     pa = entry.get("price_advice") or {}
     if isinstance(pa, dict):
         entry_p = pa.get("entry")
+        entry_low = pa.get("entry_low")
+        entry_high = pa.get("entry_high")
         stop = pa.get("stop_loss")
         target = pa.get("target")
         if any(x is not None for x in (entry_p, stop, target)):
+            # 有区间就显示带，否则回退单值（老 entry 兼容）
+            if entry_low is not None and entry_high is not None:
+                entry_str = f"{entry_low}-{entry_high}"
+            elif entry_p is not None:
+                entry_str = str(entry_p)
+            else:
+                entry_str = "-"
             lines.append(
-                f"  建议入场 {entry_p if entry_p is not None else '-'} / "
+                f"  建议入场 {entry_str} / "
                 f"止损 {stop if stop is not None else '-'} / "
                 f"目标 {target if target is not None else '-'}"
             )

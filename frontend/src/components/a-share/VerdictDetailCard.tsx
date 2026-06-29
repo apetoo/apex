@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Sparkles, Target, ShieldAlert, Flag, ListChecks } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle, Markdown } from "@/components/base";
+import { Card, CardContent, CardHeader, CardTitle, Markdown, Button } from "@/components/base";
 import { VerdictTag } from "./VerdictTag";
+import { AddCandidateDialog } from "./AddCandidateDialog";
 import { cn, formatPrice } from "@/lib/utils";
 
 /**
@@ -20,6 +22,7 @@ export function fmtPrice(v: unknown): string {
 }
 
 export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown> }) {
+  const [addOpen, setAddOpen] = useState(false);
   const pa = (verdict.price_advice ?? {}) as Record<string, unknown>;
   const evidence = Array.isArray(verdict.evidence) ? (verdict.evidence as unknown[]) : [];
   const analysisText = typeof verdict.analysis_text === "string" ? verdict.analysis_text : "";
@@ -45,9 +48,18 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
         </div>
       </CardHeader>
       <CardContent className="space-y-4 pt-0">
-        {/* 价位建议 */}
+        {/* 价位建议: 入场有区间就显示带, 否则回退单值(老 entry 兼容) */}
         <div className="grid grid-cols-3 gap-3">
-          <PriceCell icon={Target} label="入场" value={fmtPrice(pa.entry)} tone="text-text-primary" />
+          <PriceCell
+            icon={Target}
+            label="入场"
+            value={
+              pa.entry_low != null && pa.entry_high != null
+                ? `${fmtPrice(pa.entry_low)}–${fmtPrice(pa.entry_high)}`
+                : fmtPrice(pa.entry)
+            }
+            tone="text-text-primary"
+          />
           <PriceCell icon={ShieldAlert} label="止损" value={fmtPrice(pa.stop_loss)} tone="text-down" />
           <PriceCell icon={Flag} label="目标" value={fmtPrice(pa.target)} tone="text-up" />
         </div>
@@ -84,6 +96,17 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
             校准: {calExplanation}
           </p>
         )}
+
+        {/* 加入候选: AI entry 价往往还没到, 挂候选等触发(见 trading flow) */}
+        {pa.entry != null && pa.entry !== "" && (
+          <div className="flex justify-end pt-1">
+            <Button variant="primary" size="sm" onClick={() => setAddOpen(true)}>
+              加入候选
+            </Button>
+          </div>
+        )}
+
+        <AddCandidateDialog open={addOpen} onClose={() => setAddOpen(false)} verdict={verdict} />
       </CardContent>
     </Card>
   );

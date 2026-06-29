@@ -50,6 +50,8 @@ export interface Candidate {
   note: string;
   stop_advice: number;
   target_advice: number;
+  trigger_low?: number | null;
+  trigger_high?: number | null;
 }
 
 export interface WatchlistData {
@@ -174,6 +176,8 @@ export interface AddCandidatePayload {
   target_advice?: number;
   note?: string;
   expires_days?: number;
+  trigger_low?: number;
+  trigger_high?: number;
 }
 
 export interface ClosePositionPayload {
@@ -223,6 +227,8 @@ export async function addCandidate(
       note: payload.note ?? `手动加候选 触发 ${payload.trigger_price}`,
       stop_advice: payload.stop_advice ?? 0,
       target_advice: payload.target_advice ?? 0,
+      ...(payload.trigger_low != null ? { trigger_low: payload.trigger_low } : {}),
+      ...(payload.trigger_high != null ? { trigger_high: payload.trigger_high } : {}),
     });
     return { message: "Candidate added (mock)", ts_code: payload.ts_code };
   }

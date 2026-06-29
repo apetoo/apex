@@ -16,6 +16,10 @@ import type { Candidate } from "@/api/watchlist";
 export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
   const { ts_code, name, trigger_price, trigger_direction, stop_advice, target_advice } =
     candidate;
+  const hasZone =
+    candidate.trigger_low != null && candidate.trigger_high != null;
+  const low = candidate.trigger_low ?? null;
+  const high = candidate.trigger_high ?? null;
 
   const prices = useQuery({
     queryKey: qk.prices([ts_code]),
@@ -26,19 +30,29 @@ export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
   const loading = prices.isLoading;
   const error = prices.isError;
 
-  const distance =
-    currentPrice != null ? currentPrice - trigger_price : null;
-  const distancePct =
-    currentPrice != null && trigger_price !== 0
-      ? (distance! / trigger_price) * 100
-      : null;
-
-  // 触发判断: below 触发 → 当前价 <= 触发价; above → 当前价 >= 触发价(严格规则, 穿越即触发)
+  // 带状触发: 价格进入 [low, high] 才触发; 无区间退回单向阈值(below<=price / above>=price)
   const isTriggered =
     currentPrice != null &&
-    (trigger_direction === "below"
-      ? currentPrice <= trigger_price
-      : currentPrice >= trigger_price);
+    (hasZone
+      ? currentPrice >= (low as number) && currentPrice <= (high as number)
+      : trigger_direction === "below"
+        ? currentPrice <= trigger_price
+        : currentPrice >= trigger_price);
+
+  // 距触发: 带状→到带边的最近距离; 单向→到 trigger_price 的距离
+  const anchor =
+    currentPrice != null
+      ? hasZone
+        ? trigger_direction === "below"
+          ? Math.max((low as number) - currentPrice, 0) // 等回踩到下沿
+          : Math.max(currentPrice - (high as number), 0) // 已突破上沿外, 否则 0(带内)
+          : currentPrice - trigger_price
+      : null;
+  const distance = anchor;
+  const distancePct =
+    currentPrice != null && trigger_price !== 0
+      ? ((distance ?? 0) / trigger_price) * 100
+      : null;
   const isNear =
     !isTriggered && distancePct != null && Math.abs(distancePct) < 2;
 
@@ -94,8 +108,11 @@ export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
       <div className="space-y-1 text-[11px] text-text-secondary">
         <div className="num flex items-center gap-0.5">
           <TrendingIcon className="h-3 w-3" />
-          触发 {formatPrice(trigger_price)}(
-          {trigger_direction === "below" ? "下方" : "上方"})
+          {hasZone
+            ? `触发带 ${formatPrice(low as number)}–${formatPrice(high as number)}`
+            : `触发 ${formatPrice(trigger_price)}(${
+                trigger_direction === "below" ? "下方" : "上方"
+              })`}
         </div>
         {(stop_advice > 0 || target_advice > 0) && (
           <div className="num flex items-center gap-3">

@@ -108,6 +108,8 @@ def add_candidate(req: AddCandidateRequest):
         stop_advice=req.stop_advice,
         target_advice=req.target_advice,
         strategy=req.strategy,
+        trigger_low=req.trigger_low,
+        trigger_high=req.trigger_high,
     )
     return {"message": "Candidate added", "ts_code": ts_code}
 

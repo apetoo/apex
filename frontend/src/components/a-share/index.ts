@@ -7,5 +7,6 @@ export { AnalyzeTraceStream } from "./AnalyzeTraceStream";
 export { TraceEventList } from "./TraceEventList";
 export type { TraceEvent, TraceEventListProps } from "./TraceEventList";
 export { VerdictDetailCard, fmtPrice } from "./VerdictDetailCard";
+export { AddCandidateDialog } from "./AddCandidateDialog";
 export { IntradayChart } from "./IntradayChart";
 export type { IntradayChartProps } from "./IntradayChart";
