@@ -55,13 +55,13 @@ export function formatDelta(delta: number | null | undefined): string {
 }
 
 /**
- * 成交额 千元 → 亿元(÷1e4)。
- * tushare index_daily 的 amount 单位是千元。
- * null/undefined/NaN → null(便于上层判空)。
+ * 成交额 千元 → 亿元(÷1e5)。
+ * tushare index_daily 的 amount 单位是千元, 新浪实时 amount 已在后端 ÷1000 对齐到千元。
+ * 1 亿 = 1e5 千元, 故 ÷1e5。null/undefined/NaN → null(便于上层判空)。
  */
 export function amountKToYi(amtK: number | null | undefined): number | null {
   if (amtK == null || Number.isNaN(amtK)) return null;
-  return amtK / 1e4;
+  return amtK / 1e5;
 }
 
 /**

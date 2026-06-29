@@ -55,6 +55,27 @@ export async function getDailyPrices(
   );
 }
 
+/**
+ * 昨收价(前一交易日收盘, 严格排除今天)。
+ * /prices/daily 在盘后 tushare 发了当日 daily 后会返回今日收盘, 不能当 prev 用。
+ * 「今日盈亏」的 prev 基准必须用本接口。盘中/盘后都正确。
+ */
+export async function getPrevClosePrices(
+  codes: string[],
+): Promise<Record<string, number | null>> {
+  if (codes.length === 0) return {};
+  if (USE_MOCK) {
+    const out: Record<string, number | null> = {};
+    codes.forEach((c) => {
+      out[c] = MOCK_DATA[c]?.prev ?? null;
+    });
+    return out;
+  }
+  return api.get<Record<string, number | null>>(
+    `/market/prices/prev-close?codes=${codes.join(",")}`,
+  );
+}
+
 /** 指数日线(ED13): 返回 { code, name, bars: [{ trade_date, close, vol, pct_chg, amount }] } */
 export interface IndexDailyBar {
   trade_date: string;
@@ -146,6 +167,32 @@ export async function getIndexDailyBatch(
   }
   return api.get<IndexDailyMap>(
     `/market/index-daily/batch?codes=${codes.join(",")}&days=${days}`,
+  );
+}
+
+/**
+ * 指数实时行情(新浪兜底): 当 EOD 日线还没发当日数据时(盘中 / 盘后到 EOD 发布前)
+ * 取当日点位 + 涨跌幅 + 成交额。amount 单位千元(后端已 ÷1000 对齐 tushare)。
+ * trade_date==今天 时前端覆盖 EOD 展示; 否则回退 EOD。
+ */
+export interface IndexRealtime {
+  code: string;
+  close: number;
+  prev_close: number;
+  pct_chg: number | null;
+  amount: number; // 千元
+  trade_date: string; // YYYYMMDD
+}
+export type IndexRealtimeMap = Record<string, IndexRealtime>;
+
+/** 批量指数实时(新浪): GET /api/market/index-realtime/batch?codes= */
+export async function getIndexRealtimeBatch(
+  codes: string[],
+): Promise<IndexRealtimeMap> {
+  if (codes.length === 0) return {};
+  if (USE_MOCK) return {}; // mock 走 EOD 即可
+  return api.get<IndexRealtimeMap>(
+    `/market/index-realtime/batch?codes=${codes.join(",")}`,
   );
 }
 

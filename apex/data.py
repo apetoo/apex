@@ -435,7 +435,12 @@ def get_realtime_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
 
 
 def get_latest_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
-    """Batch fetch latest close price for multiple stocks. Returns {ts_code: price}."""
+    """Batch fetch latest available daily close (含今天) for multiple stocks.
+
+    ⚠️ 这是「最新可用价」不是「昨收」: 盘后 tushare 发了当日个股 daily(约 15:30)
+    后, groupby.last() 取到今日收盘。需要前一交易日收盘(昨收)用 get_prev_close。
+    适合「最新价」语义(analyze 的 current_price 等); 当 prev 基准用会吞盈亏。
+    """
     result: dict[str, Optional[float]] = {c: None for c in ts_codes}
     try:
         pro = _tushare()
@@ -449,6 +454,42 @@ def get_latest_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
             for code in ts_codes:
                 if code in latest.index:
                     result[code] = float(latest.loc[code, "close"])
+    except Exception:
+        pass
+    return result
+
+
+def get_prev_close(ts_codes: list[str]) -> dict[str, Optional[float]]:
+    """批量取「昨收」价(前一交易日收盘), 返回 {ts_code: price}。
+
+    与 get_latest_price 的区别: 严格排除今天(trade_date < today)。
+    tushare 个股日线收盘后约 15:30 即发布当日数据, 此时 get_latest_price 的
+    groupby.last() 会取到今日收盘而非昨收, 导致 OverviewPage 的「今日盈亏」
+    cur==prev 恒为 0。本函数取今天之前最近一根日线收盘, 盘中(无今日 daily)
+    与盘后(有今日 daily)都正确返回昨收。
+
+    拉取窗口放宽到 10 个自然日, 覆盖节假日后的最近交易日。
+    """
+    result: dict[str, Optional[float]] = {c: None for c in ts_codes}
+    if not ts_codes:
+        return result
+    try:
+        pro = _tushare()
+        today = datetime.today().strftime("%Y%m%d")
+        start = (datetime.today() - timedelta(days=10)).strftime("%Y%m%d")
+        codes_str = ",".join(ts_codes)
+        df = pro.daily(ts_code=codes_str, start_date=start, end_date=today,
+                        fields="ts_code,trade_date,close")
+        if df is None or df.empty:
+            return result
+        # 排除今天, 取每只股票最近一根日线收盘
+        df = df[df["trade_date"].astype(str) < today]
+        if df.empty:
+            return result
+        latest = df.sort_values("trade_date").groupby("ts_code").last()
+        for code in ts_codes:
+            if code in latest.index:
+                result[code] = float(latest.loc[code, "close"])
     except Exception:
         pass
     return result
@@ -1086,6 +1127,82 @@ def get_index_daily_batch(codes: list[str], days: int = 2) -> str:
     result: dict[str, dict] = {}
     for c in codes:
         result[c] = {"code": c, "name": INDEX_NAMES.get(c, ""), "bars": bars_map.get(c, [])}
+    return json.dumps(result, ensure_ascii=False)
+
+
+def get_index_realtime_batch(codes: list[str]) -> str:
+    """批量取指数实时行情(新浪), 返回 JSON 字符串
+    { [code]: { code, close, prev_close, pct_chg, amount, trade_date } }。
+
+    用于市场温度卡在 tushare EOD 日线尚未发布当日数据时兜底:
+    盘中 + 盘后到 EOD 发布前(约 16:00-17:00)这段窗口, 显示当日指数点位
+    + 涨跌幅 + 成交额, 而不是前一交易日。
+
+    新浪指数字段: [2]=昨收 [3]=最新 [9]=成交额(元) [30]=日期(YYYY-MM-DD)。
+    amount 统一换算成千元(元 ÷1000), 与 tushare index_daily.amount 单位一致,
+    前端 amountKToYi(千元→亿) 统一处理。失败的 code 对应空 dict {}。
+    """
+    import re
+    result: dict[str, dict] = {c: {} for c in codes}
+    if not codes:
+        return json.dumps(result, ensure_ascii=False)
+    sina_codes = []
+    for c in codes:
+        symbol = c.split(".")[0]
+        if c.endswith(".SH"):
+            sina_codes.append(f"sh{symbol}")
+        elif c.endswith(".SZ"):
+            sina_codes.append(f"sz{symbol}")
+    if not sina_codes:
+        return json.dumps(result, ensure_ascii=False)
+    url = f"https://hq.sinajs.cn/list={','.join(sina_codes)}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": "Mozilla/5.0",
+        })
+        # 显式跳过系统代理(新浪在国内, 外代理会断连)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+    except Exception:
+        return json.dumps(result, ensure_ascii=False)
+
+    symbol_to_ts = {c.split(".")[0]: c for c in codes}
+    pattern = re.compile(r'var hq_str_(sh|sz)(\d{6})="([^"]*)";')
+    for line in raw.split("\n"):
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        symbol = m.group(2)
+        fields = m.group(3).split(",")
+        if len(fields) < 10:
+            continue
+        ts_code = symbol_to_ts.get(symbol)
+        if not ts_code:
+            continue
+        try:
+            prev_close = float(fields[2])
+            close = float(fields[3])
+            amount_yuan = float(fields[9])
+        except (ValueError, IndexError):
+            continue
+        if close <= 0:
+            continue
+        pct_chg = (
+            round((close - prev_close) / prev_close * 100, 4)
+            if prev_close > 0 else None
+        )
+        raw_date = fields[30] if len(fields) > 30 else ""
+        trade_date = raw_date.replace("-", "") if raw_date else ""
+        result[ts_code] = {
+            "code": ts_code,
+            "close": close,
+            "prev_close": prev_close,
+            "pct_chg": pct_chg,
+            "amount": amount_yuan / 1000.0,  # 元 → 千元, 对齐 tushare
+            "trade_date": trade_date,
+        }
     return json.dumps(result, ensure_ascii=False)
 
 

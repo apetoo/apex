@@ -41,8 +41,24 @@ def get_realtime_prices(codes: str = Query(...)):
 
 @router.get("/prices/daily")
 def get_daily_close_prices(codes: str = Query(...)):
-    """日线收盘价（tushare，盘中=昨收）。"""
+    """最新日线收盘价(tushare, 含今天)。
+
+    ⚠️ 不是「昨收」: 盘后 tushare 发了当日个股 daily(约 15:30)后, 本端点返回
+    今日收盘, 不能当 prev 基准用(否则今日盈亏 cur==prev 恒为 0)。需要昨收用
+    /prices/prev-close。本端点适合「最新可用价」语义(如 analyze 的 current_price)。
+    """
     return data.get_latest_price(_split_codes(codes))
+
+
+@router.get("/prices/prev-close")
+def get_prev_close_prices(codes: str = Query(...)):
+    """昨收价（前一交易日收盘, 严格排除今天）。
+
+    tushare 个股日线收盘后约 15:30 发布当日数据, /prices/daily 此时返回今日收盘
+    而非昨收。本端点取 trade_date < today 的最新收盘, 用于「今日盈亏」的 prev 基准,
+    盘中/盘后都正确。
+    """
+    return data.get_prev_close(_split_codes(codes))
 
 
 @router.get("/index-daily")
@@ -69,6 +85,20 @@ def get_index_daily_batch(
     """
     code_list = [c.strip() for c in codes.split(",") if c.strip()]
     return parse_json(data.get_index_daily_batch(code_list, days=days))
+
+
+@router.get("/index-realtime/batch")
+def get_index_realtime_batch(
+    codes: str = Query(..., description="逗号分隔指数代码"),
+):
+    """批量指数实时行情(新浪): 盘中/盘后兜底, 用于市场温度卡在 tushare EOD
+    当日数据发布前显示当日点位 + 涨跌幅 + 成交额。
+
+    返回 { [code]: { code, close, prev_close, pct_chg, amount(千元), trade_date } }。
+    失败 code 对应空 dict。前端据 trade_date==今天决定是否覆盖 EOD 展示。
+    """
+    code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    return parse_json(data.get_index_realtime_batch(code_list))
 
 
 # ── 分时 ──────────────────────────────────────────────────────────────────────

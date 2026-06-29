@@ -14,9 +14,11 @@ export const qk = {
   // 带参数的细粒度 key
   prices: (codes: string[]) => ["market", "prices", codes] as const,
   dailyPrices: (codes: string[]) => ["market", "prices-daily", codes] as const,
+  prevClose: (codes: string[]) => ["market", "prices-prev-close", codes] as const,
   stockDaily: (tsCode: string) => ["market", "stock", tsCode, "daily"] as const,
   intraday: (tsCode: string) => ["market", "intraday", tsCode] as const,
   indexDailyBatch: (codes: string[]) => ["market", "index-daily", codes] as const,
+  indexRealtimeBatch: (codes: string[]) => ["market", "index-realtime", codes] as const,
   journal: (tsCode: string) => ["journal", tsCode] as const,
   journalLatest: (tsCode: string) => ["journal", tsCode, "latest"] as const,
   journalAll: ["journal", "all"] as const,

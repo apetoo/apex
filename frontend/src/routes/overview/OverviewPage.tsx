@@ -9,7 +9,7 @@ import {
   Button,
 } from "@/components/base";
 import { MarketIndexBar } from "@/components/a-share";
-import { getPrices, getDailyPrices } from "@/api/market";
+import { getPrices, getPrevClosePrices } from "@/api/market";
 import { getWatchlist } from "@/api/watchlist";
 import { getAccount } from "@/api/account";
 import { qk } from "@/api/query-keys";
@@ -46,9 +46,11 @@ export function OverviewPage() {
     enabled: codes.length > 0,
   });
 
+  // 昨收: 用 prev-close(排除今天), 不能用 /prices/daily —— 盘后 tushare 发了当日
+  // 个股 daily 后, daily 会返回今日收盘, 导致今日盈亏 cur==prev 恒为 0。
   const daily = useQuery({
-    queryKey: qk.dailyPrices(codes),
-    queryFn: () => getDailyPrices(codes),
+    queryKey: qk.prevClose(codes),
+    queryFn: () => getPrevClosePrices(codes),
     enabled: codes.length > 0,
   });
 

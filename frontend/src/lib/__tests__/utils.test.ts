@@ -102,12 +102,12 @@ describe("cn(className 合并, tailwind-merge 去重)", () => {
   });
 });
 
-describe("amountKToYi(千元 → 亿元, ÷1e4)", () => {
-  it("6.5e7 千元 → 6500 亿", () => {
-    expect(amountKToYi(6.5e7)).toBe(6500);
+describe("amountKToYi(千元 → 亿元, ÷1e5)", () => {
+  it("6.5e7 千元 → 650 亿", () => {
+    expect(amountKToYi(6.5e7)).toBe(650);
   });
-  it("1e4 千元 → 1 亿", () => {
-    expect(amountKToYi(1e4)).toBe(1);
+  it("1e5 千元 → 1 亿", () => {
+    expect(amountKToYi(1e5)).toBe(1);
   });
   it("0 → 0", () => {
     expect(amountKToYi(0)).toBe(0);
