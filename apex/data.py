@@ -95,7 +95,141 @@ def get_daily_price(ts_code: str, start_date: str = None, end_date: str = None,
     return result.to_json(orient="records", force_ascii=False)
 
 
-def compute_candlestick_features(bars: list[dict]) -> dict:
+# ── 资金流 / 全市场日线 / 交易日历 ───────────────────────────────────────────
+# moneyflow 不含收盘价/涨跌幅/流通市值，需配合 pro.daily / pro.daily_basic 使用。
+# 所有金额字段在出口处统一转成「元」（tushare 原始口径为万元）。
+
+_MF_AMOUNT_COLS = [
+    "buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
+    "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount",
+    "net_mf_amount",
+]
+
+
+def get_moneyflow(trade_date: str) -> str:
+    """全市场个股资金流（大/中/小/超大单净额），返回 JSON 字符串。
+
+    主源 tushare moneyflow，akshare 兜底。**所有 *_amount 字段已 *1e4 转成元**
+    （tushare 原始为万元口径，不转会令按元写的阈值失效）。
+    不注册为 AI 工具——粗筛信号，非 AI 复核工具。
+    """
+    trade_date = (trade_date or "").replace("-", "")
+    df = _moneyflow_tushare(trade_date)
+    if df is None or df.empty:
+        df = _moneyflow_akshare(trade_date)
+        source = "akshare"
+    else:
+        source = "tushare"
+    if df is None or df.empty:
+        return json.dumps([], ensure_ascii=False)
+
+    for col in _MF_AMOUNT_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0) * 1e4
+    df["source"] = source
+    return df.to_json(orient="records", force_ascii=False)
+
+
+def _moneyflow_tushare(trade_date: str) -> Optional[pd.DataFrame]:
+    try:
+        df = _tushare().moneyflow(trade_date=trade_date)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    df["trade_date"] = df["trade_date"].astype(str)
+    return df
+
+
+def _moneyflow_akshare(trade_date: str) -> Optional[pd.DataFrame]:
+    """akshare 东财全市场资金流兜底。主力口径与 tushare 不同（仅"主力"合计）。"""
+    import akshare as ak
+    try:
+        df = ak.stock_individual_fund_flow_rank(indicator="今日")
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    rename = {
+        "代码": "ts_code", "名称": "name",
+        "今日主力净流入-净额": "net_mf_amount",
+        "今日超大单净流入-净额": "net_elg_amount",
+        "今日大单净流入-净额": "net_lg_amount",
+        "今日中单净流入-净额": "net_md_amount",
+        "今日小单净流入-净额": "net_sm_amount",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    if "ts_code" not in df.columns:
+        return None
+    df["ts_code"] = df["ts_code"].astype(str).map(normalize_ts_code)
+    df["trade_date"] = trade_date
+    keep = ["ts_code", "name", "trade_date", "net_mf_amount",
+            "net_elg_amount", "net_lg_amount", "net_md_amount", "net_sm_amount"]
+    return df[[c for c in keep if c in df.columns]]
+
+
+def get_market_daily(trade_date: str) -> str:
+    """全市场日线（含 pct_chg/close/pre_close/vol），返回 JSON 字符串。
+
+    moneyflow 不含收盘价与涨跌幅，靠此补。全市场一次返回。
+    """
+    trade_date = (trade_date or "").replace("-", "")
+    try:
+        df = _tushare().daily(trade_date=trade_date)
+    except Exception:
+        return json.dumps([], ensure_ascii=False)
+    if df is None or df.empty:
+        return json.dumps([], ensure_ascii=False)
+    df["trade_date"] = df["trade_date"].astype(str)
+    return df.to_json(orient="records", force_ascii=False)
+
+
+def get_market_daily_basic(trade_date: str) -> str:
+    """全市场每日指标（含 circ_mv 流通市值 / turnover_rate / volume_ratio 量比）。
+
+    circ_mv 为万元口径，出口处 *1e4 转成元。volume_ratio 即量比——moneyflow
+    策略可直接用此字段，无需接入 technical 共享缓存。
+    """
+    trade_date = (trade_date or "").replace("-", "")
+    try:
+        df = _tushare().daily_basic(trade_date=trade_date)
+    except Exception:
+        return json.dumps([], ensure_ascii=False)
+    if df is None or df.empty:
+        return json.dumps([], ensure_ascii=False)
+    df["trade_date"] = df["trade_date"].astype(str)
+    if "circ_mv" in df.columns:
+        df["circ_mv"] = pd.to_numeric(df["circ_mv"], errors="coerce").fillna(0) * 1e4
+    return df.to_json(orient="records", force_ascii=False)
+
+
+def last_n_trade_dates(trade_date: str, n: int = 5) -> list[str]:
+    """截至 trade_date 的过去 n 个交易日（含当日，若为交易日）。
+
+    用 tushare trade_cal 拿真实日历（含节假日），避免纯周末跳过漏掉节假日。
+    失败时退回纯周末跳过的近似。
+    """
+    trade_date = (trade_date or "").replace("-", "")
+    try:
+        end = trade_date
+        start = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=n * 3 + 10)).strftime("%Y%m%d")
+        cal = _tushare().trade_cal(exchange="SSE", start_date=start, end_date=end, is_open="1")
+        # trade_cal 默认按 cal_date 降序返回，需显式升序后再取末尾 n 个
+        dates = sorted(cal["cal_date"].astype(str).tolist())
+        if len(dates) >= n:
+            return dates[-n:]
+        return dates  # 不足 n 个就全返
+    except Exception:
+        d = datetime.strptime(trade_date, "%Y%m%d")
+        out = []
+        while len(out) < n and d.year > 2000:
+            if d.weekday() < 5:
+                out.append(d.strftime("%Y%m%d"))
+            d -= timedelta(days=1)
+        return list(reversed(out))
+
+
+
     """从最近 N 根 K 线计算蜡烛图形态特征。
 
     返回 dict，包含：

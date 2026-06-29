@@ -6,7 +6,7 @@ BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}
 
 REQUIRED_FEATURE_KEYS = ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"]
 
-SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept", "limit_up_history"]
+SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept", "limit_up_history", "moneyflow"]
 
 EXIT_REASON_ENUM = ["stop_hit", "target_hit", "manual", "expired", "other"]
 

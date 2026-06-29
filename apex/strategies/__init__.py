@@ -27,6 +27,7 @@ from apex.strategies import (
     pullback_to_ma,
     bullish_alignment,
     volume_breakout,
+    stealth_accumulation,
 )
 
 STRATEGIES = {
@@ -38,5 +39,6 @@ STRATEGIES = {
         pullback_to_ma,
         bullish_alignment,
         volume_breakout,
+        stealth_accumulation,
     ]
 }

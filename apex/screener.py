@@ -228,6 +228,13 @@ def _format_signals_for_prompt(c: dict) -> str:
             sp = raw.get("stock_pct", 0)
             all_c = (raw.get("all_concepts") or [])[:3]
             lines.append(f"  - 概念龙头：{cn} 涨 {cp}% ｜ 个股 {sp}% ｜ 命中题材 {','.join(all_c)}")
+        elif st == "moneyflow":
+            consec = raw.get("consec_days", 0)
+            inflow = (raw.get("cum_net_inflow", 0) or 0) / 1e8
+            cp = raw.get("cum_pct", 0)
+            mp = raw.get("max_daily_pct", 0)
+            vr = raw.get("vol_ratio", 0) or 0
+            lines.append(f"  - 主力偷买：连续 {consec} 日净流入累计 {inflow:.2f}亿 ｜ 期间涨 {cp}% ｜ 单日最高 {mp}% ｜ 量比 {vr:.2f}")
     return "\n".join(lines)
 
 

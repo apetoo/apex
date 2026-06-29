@@ -174,9 +174,9 @@ def _build_prompt(regime: Optional[dict], counts: dict[str, int]) -> str:
 
 # 决策原则
 1. **regime 影响策略偏好**（先验，无数据时主要靠这个）：
-   - `risk_on` → 偏好 `first_board_leader` / `leader_with_volume`（情绪驱动型）
+   - `risk_on` → 偏好 `first_board_leader` / `leader_with_volume`（情绪驱动型）；压低 `stealth_accumulation`（连板淹没信号 + 出货前对倒风险）
    - `risk_off` → 偏好 `institutional_flow`（防御型，机构持仓周期长）
-   - `neutral` → 偏好 `industry_rotation`（板块效应）
+   - `neutral` → 偏好 `industry_rotation`（板块效应）与 `stealth_accumulation`（震荡市资金偷买最有效，提前埋伏 swing）
 2. **历史胜率优先级**：
    - 优先看"当前 regime 下"的桶（如果 n ≥ 5）
    - n < 5 时退回看全样本

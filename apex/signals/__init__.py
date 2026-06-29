@@ -6,6 +6,7 @@ from apex.signals import (
     northbound,
     concept,
     limit_up_history,
+    moneyflow,
 )
 
 FETCHERS = {
@@ -15,4 +16,5 @@ FETCHERS = {
     "northbound": northbound.fetch,
     "concept": concept.fetch,
     "limit_up_history": limit_up_history.fetch,
+    "moneyflow": moneyflow.fetch,
 }
