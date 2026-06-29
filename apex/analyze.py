@@ -936,6 +936,43 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
                 parts.append(f"量比 {v:.2f}({vol_label})")
             lines.append(f"- {' / '.join(parts)}")
 
+    # 大盘当日分时（沪深300 压缩特征）—— 日线只有收盘涨跌，这里补上盘中形态/分段/拐点/量价
+    idx_intra = ctx.get("index_intraday")
+    if idx_intra and idx_intra.get("last_price"):
+        intra_label = "盘中实时" if idx_intra.get("is_intraday") else "当日"
+        lines.append(f"\n### 大盘当日分时（沪深300 {intra_label}，截至 {idx_intra.get('as_of_time', '?')}）")
+        iparts = [f"现价 {idx_intra['last_price']}"]
+        if idx_intra.get("prev_close") is not None:
+            iparts.append(f"昨收 {idx_intra['prev_close']}")
+        if idx_intra.get("day_chg_pct") is not None:
+            iparts.append(f"日内 {idx_intra['day_chg_pct']:+.2f}%")
+        if idx_intra.get("open") is not None:
+            iparts.append(f"开盘 {idx_intra['open']}")
+        if idx_intra.get("high") is not None and idx_intra.get("low") is not None:
+            iparts.append(f"高/低 {idx_intra['high']}/{idx_intra['low']}")
+        if idx_intra.get("amplitude_pct") is not None:
+            iparts.append(f"振幅 {idx_intra['amplitude_pct']:.2f}%")
+        lines.append(f"- {' / '.join(iparts)}")
+        if idx_intra.get("shape"):
+            lines.append(f"- 形态 {idx_intra['shape']}")
+        segs = idx_intra.get("session_segments")
+        if segs:
+            seg_parts = []
+            for s in segs:
+                if s.get("chg_pct") is None:
+                    continue
+                vol_pct = s.get("vol_pct")
+                vol_str = f"量占{vol_pct:.0f}%" if vol_pct is not None else ""
+                seg_parts.append(f"{s['name']}{s['chg_pct']:+.2f}%{vol_str}")
+            if seg_parts:
+                lines.append(f"- 分段：{' / '.join(seg_parts)}")
+        sw = idx_intra.get("swing")
+        if sw and sw.get("verdict"):
+            lines.append(f"- 拐点：{sw['verdict']}")
+        vp = idx_intra.get("vol_price_match")
+        if vp and vp.get("verdict"):
+            lines.append(f"- 量价：{vp['verdict']}")
+
     # 板块
     sector = ctx.get("sector")
     if sector:

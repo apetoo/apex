@@ -1202,12 +1202,13 @@ def get_market_context(ts_code: str) -> str:
     result: dict = {
         "as_of": datetime.today().strftime("%Y-%m-%d"),
         "indices": [],
+        "index_intraday": None,  # 大盘当日分时走势（HS300 压缩特征，补日线只有收盘涨跌的缺口）
         "sector": None,
         "north_money": None,
         "stock_relative": None,
     }
 
-    # 1. 大盘指数
+    # 1. 大盘指数（日级聚合）
     try:
         codes = _select_indices(ts_code)
         bars_map = _fetch_index_bars(codes, days=30)
@@ -1217,6 +1218,16 @@ def get_market_context(ts_code: str) -> str:
                 result["indices"].append(s)
         if result["indices"]:
             result["as_of"] = result["indices"][0]["trade_date"] or result["as_of"]
+    except Exception:
+        pass
+
+    # 1b. 大盘当日分时走势（沪深300）—— 复用个股分时压缩链（akshare stock_zh_a_minute
+    #     对指数符号同样可用），把 1 分钟 bars 压成分段/拐点/量价特征注入，原始 bars 不落盘。
+    #     非交易时段/失败 fail-soft 返 None，analyze 侧跳过该段。
+    try:
+        snap = json.loads(get_intraday_snapshot("000300.SH"))
+        if snap and snap.get("last_price"):
+            result["index_intraday"] = snap
     except Exception:
         pass
 
