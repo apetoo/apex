@@ -73,6 +73,41 @@ def _is_bullish(verdict: str) -> bool:
     return has_bull and not has_bear
 
 
+def _dedupe_signals(entries: list) -> list:
+    """同股同日多次分析只留最新一条（策略 A：最新判断胜出）。
+
+    回测按"天"对齐（date 字段只到天），同一只股票同一天的多条判决用的是同一段行情、
+    同一个次日开盘价，逐条独立模拟等于把同一笔交易算 N 次 → 虚增样本量、扭曲校准。
+    留 analyzed_at 最新的一条（综合信息最多的最终判断），其余丢弃。
+
+    journal 是 append-only 真相层，不去动它；这里只是回测消费时的采样策略。
+    date 缺失的条目无法判定是否重复，原样保留。
+    """
+    if not entries:
+        return entries
+    latest: dict = {}  # (ts_code, date) -> entry
+    no_date: list = []
+    for e in entries:
+        d = e.get("date", "")
+        code = e.get("ts_code", "")
+        if not d:
+            no_date.append(e)
+            continue
+        key = (code, d)
+        prev = latest.get(key)
+        if prev is None:
+            latest[key] = e
+        else:
+            # analyzed_at 大的胜出；缺失 analyzed_at 视为最早
+            if (e.get("analyzed_at", "") or "") > (prev.get("analyzed_at", "") or ""):
+                latest[key] = e
+    deduped = list(latest.values()) + no_date
+    dropped = len(entries) - len(deduped)
+    if dropped > 0:
+        print(f"  · 同股同日去重: {len(entries)} → {len(deduped)} 条（丢弃 {dropped} 条冗余判决）")
+    return deduped
+
+
 def _add_days(date_str: str, n: int) -> str:
     d = datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=n)
     return d.strftime("%Y-%m-%d")
@@ -463,6 +498,7 @@ def run_sweep(ts_code: Optional[str] = None,
 
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+    long_entries = _dedupe_signals(long_entries)
 
     codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
     _prefetch_signals(codes, long_entries, max_hp)
@@ -602,6 +638,7 @@ def aggregate(ts_code: Optional[str] = None,
 
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+    long_entries = _dedupe_signals(long_entries)
 
     codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
     _prefetch_signals(codes, long_entries, lookforward_days)
@@ -735,6 +772,7 @@ def run_portfolio(ts_code: Optional[str] = None,
 
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+    long_entries = _dedupe_signals(long_entries)
     if not long_entries:
         return {"equity_curve": [], "stats": {}, "trades": []}
 

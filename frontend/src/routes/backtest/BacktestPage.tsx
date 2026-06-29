@@ -58,10 +58,14 @@ export function BacktestPage() {
   const [tsCode, setTsCode] = useState("");
   const [committedCode, setCommittedCode] = useState<string | null>(null);
   const [lookforwardDays, setLookforwardDays] = useState(10);
+  // 门控: 进页面不自动跑回测(原来 committedCode 初始 null 触发全量回测),
+  // 点「跑回测」才置 true, 4 个回测 query 的 enabled 都依赖它。
+  const [hasRun, setHasRun] = useState(false);
 
   const signals = useQuery({
     queryKey: ["backtest", "signals", committedCode, lookforwardDays],
     queryFn: () => getBacktestSignals(committedCode, lookforwardDays),
+    enabled: hasRun,
   });
   const realized = useQuery({
     queryKey: ["backtest", "realized"],
@@ -70,18 +74,26 @@ export function BacktestPage() {
   const sweep = useQuery({
     queryKey: ["backtest", "sweep", committedCode],
     queryFn: () => getBacktestSweep(committedCode),
+    enabled: hasRun,
   });
   const aggregate = useQuery({
     queryKey: ["backtest", "aggregate", committedCode, lookforwardDays],
     queryFn: () => getBacktestAggregate(committedCode, lookforwardDays),
+    enabled: hasRun,
   });
   const portfolio = useQuery({
     queryKey: ["backtest", "portfolio", committedCode, lookforwardDays],
     queryFn: () => getBacktestPortfolio(committedCode, lookforwardDays),
+    enabled: hasRun,
   });
 
   const data = signals.data ?? [];
   const stats = computeStats(data);
+
+  const triggerRun = () => {
+    setCommittedCode(tsCode.trim() || null);
+    setHasRun(true);
+  };
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 px-6 py-8">
@@ -124,15 +136,24 @@ export function BacktestPage() {
               className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
             />
           </div>
-          <Button
-            variant="primary"
-            onClick={() => setCommittedCode(tsCode.trim() || null)}
-          >
+          <Button variant="primary" onClick={triggerRun}>
             跑回测
           </Button>
         </CardContent>
       </Card>
 
+      {/* 未运行占位: 进页面不自动回测, 提示点按钮 */}
+      {!hasRun && (
+        <Card>
+          <CardContent className="py-10 text-center text-sm text-flat">
+            选好标的与前瞻天数, 点上方「跑回测」开始
+          </CardContent>
+        </Card>
+      )}
+
+      {/* 回测结果区: 未运行时不渲染, 避免空态误导 */}
+      {hasRun && (
+        <>
       {/* 统计卡 */}
       {data.length > 0 && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
@@ -258,6 +279,8 @@ export function BacktestPage() {
           )}
         </CardContent>
       </Card>
+        </>
+      )}
 
       {/* 实盘平仓 */}
       <Card>

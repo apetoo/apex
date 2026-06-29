@@ -13,6 +13,13 @@ def _journal_dir() -> Path:
     return Path(config.get()["paths"]["journal_dir"])
 
 
+# 白名单: 只认 NNNNNN.SS.jsonl 形式的个股分析文件（如 603019.SH.jsonl）。
+# 同目录下的 trades.jsonl / triggers.jsonl / *.trace.jsonl 等非分析文件会被
+# glob("*.jsonl") 误读成判决, 污染 load_entries → 回测/calibration/health 全局统计。
+# 用白名单而非黑名单(trades/triggers), 一劳永逸挡住未来新增的任何非分析 jsonl。
+_ENTRY_NAME = re.compile(r"^\d{6}\.(SH|SZ|BJ)\.jsonl$")
+
+
 def _entry_path(ts_code: str) -> Path:
     return _journal_dir() / f"{ts_code}.jsonl"
 
@@ -47,12 +54,12 @@ def load_entries(ts_code: Optional[str] = None) -> list[dict]:
     if ts_code:
         paths = [_entry_path(ts_code)]
     else:
-        # 排除 *.trace.jsonl —— 它是 trace.write_trace 写的完整事件流，
-        # 形如 {ts_code, analyzed_at, events}，没有 verdict/features/evidence，
-        # 混进来会污染 list_all_journal / health.check_journal / evidence_attribution。
+        # 白名单: 只读 NNNNNN.SS.jsonl 个股分析文件。同目录的 trades.jsonl /
+        # triggers.jsonl / *.trace.jsonl 等非分析文件不读, 否则会被当成判决污染
+        # list_all_journal / health.check_journal / evidence_attribution / 回测。
         paths = sorted(
             p for p in journal_dir.glob("*.jsonl")
-            if not p.name.endswith(".trace.jsonl")
+            if _ENTRY_NAME.match(p.name)
         )
 
     for path in paths:
