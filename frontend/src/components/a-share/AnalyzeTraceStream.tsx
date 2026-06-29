@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Wrench, MessageSquare, FileText, CheckCircle2, Loader2, AlertCircle, RefreshCw, Square, ChevronRight } from "lucide-react";
-import { Card, CardContent, CardHeader, Button, Markdown } from "@/components/base";
+import { Loader2, AlertCircle, RefreshCw, Square, ChevronRight } from "lucide-react";
+import { Card, CardContent, CardHeader, Button } from "@/components/base";
 import { useSSE } from "@/hooks/useSSE";
 import { analyzeFetchFn, analyzeRunPath } from "@/api/analyze";
 import { cn } from "@/lib/utils";
+import { TraceEventList, type TraceEvent } from "./TraceEventList";
 
 /**
  * <AnalyzeTraceStream> — analyze SSE 流式 trace 渲染
@@ -24,28 +25,6 @@ import { cn } from "@/lib/utils";
  *   - **过程默认折叠**: 过程是给「想看细节」的人, 默认收起; 头部显示步数 + 状态。
  *   - ED1 重连策略: 都关自动重连; status=disconnected 头部显示「重试」。
  */
-
-type TraceEvent = {
-  type?: string;
-  name?: string;
-  iteration?: number;
-  args?: Record<string, unknown>;
-  content?: string;
-  result?: unknown;
-  verdict?: string;
-  confidence?: number;
-  error?: string;
-  // 终态 verdict 字段
-  [key: string]: unknown;
-};
-
-const EVENT_META: Record<string, { icon: typeof Wrench; label: string; tone: string }> = {
-  context: { icon: FileText, label: "上下文", tone: "text-flat" },
-  tool_call: { icon: Wrench, label: "调工具", tone: "text-flat" },
-  tool_result: { icon: FileText, label: "工具结果", tone: "text-flat" },
-  assistant_text: { icon: MessageSquare, label: "AI", tone: "text-text-primary" },
-  verdict: { icon: CheckCircle2, label: "结论", tone: "text-text-primary" },
-};
 
 export interface AnalyzeTraceStreamProps {
   tsCode: string;
@@ -175,63 +154,12 @@ export function AnalyzeTraceStream({ tsCode, onVerdict, className }: AnalyzeTrac
             <p className="py-6 text-center text-sm text-flat">尚未收到事件…</p>
           )}
 
-          {/* 事件流(rAF 节流, 一次性渲染) */}
-          <div className="space-y-1.5 font-mono text-xs" data-flush={flushVersion}>
-            {events.map((e, i) => {
-              const data = e.data as TraceEvent;
-              const meta = EVENT_META[data.type ?? ""] ?? EVENT_META.context;
-              const Icon = meta.icon;
-              const isVerdict = data.type === "verdict";
-              return (
-                <div
-                  key={i}
-                  className={cn(
-                    "flex items-start gap-2 rounded px-2 py-1.5",
-                    isVerdict ? "bg-up/5 border border-up/20" : "hover:bg-bg-base",
-                  )}
-                >
-                  <Icon className={cn("mt-0.5 h-3.5 w-3.5 flex-shrink-0", meta.tone)} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
-                      <span className={cn("text-[10px] font-medium uppercase", meta.tone)}>
-                        {meta.label}
-                      </span>
-                      {data.iteration !== undefined && (
-                        <span className="text-[10px] text-flat">iter {data.iteration}</span>
-                      )}
-                      {isVerdict && data.verdict && (
-                        <span className="num text-sm font-semibold text-up">
-                          {String(data.verdict)} · 置信度 {String(data.confidence)}
-                        </span>
-                      )}
-                    </div>
-                    {data.type === "assistant_text" && data.content && (
-                      <div className="mt-1 font-sans">
-                        <Markdown compact>{String(data.content)}</Markdown>
-                      </div>
-                    )}
-                    {data.type === "tool_call" && data.name && (
-                      <p className="mt-0.5 text-text-secondary">
-                        {String(data.name)}({JSON.stringify(data.args ?? {})})
-                      </p>
-                    )}
-                    {data.type === "tool_result" && data.name && (
-                      <p className="mt-0.5 line-clamp-2 text-flat">
-                        {JSON.stringify(data.result ?? {}).slice(0, 200)}
-                      </p>
-                    )}
-                    {data.type === "context" && data.name && (
-                      <p className="mt-0.5 line-clamp-1 text-flat">
-                        {String(data.name)}: {String(data.content ?? "").slice(0, 100)}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+          {/* 事件流(rAF 节流, 一次性渲染) —— 剥离 SSE event 外壳, 复用 TraceEventList */}
+          <div data-flush={flushVersion}>
+            <TraceEventList events={events.map((e) => e.data as TraceEvent)} />
 
             {running && (
-              <div className="flex items-center gap-2 px-2 py-1.5 text-flat">
+              <div className="mt-1.5 flex items-center gap-2 px-2 py-1.5 text-flat">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 <span className="text-[10px]">thinking...</span>
               </div>

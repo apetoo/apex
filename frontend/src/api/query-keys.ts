@@ -20,4 +20,5 @@ export const qk = {
   journal: (tsCode: string) => ["journal", tsCode] as const,
   journalLatest: (tsCode: string) => ["journal", tsCode, "latest"] as const,
   journalAll: ["journal", "all"] as const,
+  trace: (tsCode: string, analyzedAt: string) => ["trace", tsCode, analyzedAt] as const,
 } as const;

@@ -219,3 +219,29 @@ export async function getJournal(tsCode: string): Promise<unknown[]> {
   }
   return api.get<unknown[]>(`/journal/${encodeURIComponent(tsCode)}`);
 }
+
+/**
+ * GET /api/trace/{ts_code}/{analyzed_at} — 某次分析的完整事件流(trace.jsonl)。
+ *
+ * 回放历史分析过程用。无记录返回 null(早期分析未落 trace / save=False)。
+ * events 形状见 <TraceEventList> 注释(对齐真后端 apex/analyze.py:_emit)。
+ * 这里用 unknown[] 而非 TraceEvent[] —— 避免 api 层反向依赖 components 层,
+ * 组件层自行断言。
+ */
+export interface TraceRecord {
+  ts_code: string;
+  analyzed_at: string;
+  events: Record<string, unknown>[];
+}
+
+export async function getTrace(
+  tsCode: string,
+  analyzedAt: string,
+): Promise<TraceRecord | null> {
+  if (USE_MOCK) {
+    return null; // mock 无 trace 落盘, 回放区降级「无过程记录」
+  }
+  return api.get<TraceRecord | null>(
+    `/trace/${encodeURIComponent(tsCode)}/${encodeURIComponent(analyzedAt)}`,
+  );
+}

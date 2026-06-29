@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { History, Search } from "lucide-react";
+import { History, Search, ChevronRight, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/base";
-import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PriceTag } from "@/components/a-share";
-import { getJournal } from "@/api/analyze";
+import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PriceTag, TraceEventList } from "@/components/a-share";
+import { getJournal, getTrace } from "@/api/analyze";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { qk } from "@/api/query-keys";
 import { useChatContext } from "@/hooks/useChatContext";
+import { cn } from "@/lib/utils";
 
 /**
  * /analyze 个股分析页
@@ -39,6 +40,8 @@ export function AnalyzePage() {
   const [tsCode, setTsCode] = useState("");
   const [committedCode, setCommittedCode] = useState<string | null>(null);
   const [latestVerdict, setLatestVerdict] = useState<Record<string, unknown> | null>(null);
+  // 历史 journal 行展开回放：存当前展开的 analyzed_at（null=全收起）
+  const [expandedAt, setExpandedAt] = useState<string | null>(null);
 
   const { setContext } = useChatContext();
 
@@ -180,27 +183,44 @@ export function AnalyzePage() {
                 {journal.data.map((entry: unknown, i: number) => {
                   const e = entry as Record<string, unknown>;
                   const pa = (e.price_advice ?? {}) as Record<string, unknown>;
+                  const at = String(e.analyzed_at ?? "");
+                  const isOpen = expandedAt === at;
                   return (
-                    <div key={i} className="flex items-center justify-between py-3">
-                      <div className="min-w-0">
-                        <p className="num text-xs text-text-secondary">
-                          {String(e.analyzed_at ?? "")}
-                        </p>
-                        <p className="mt-0.5 truncate text-sm">
-                          {String(e.note ?? e.analysis_text ?? "")}
-                        </p>
-                      </div>
-                      <div className="ml-3 flex-shrink-0 text-right">
-                        <VerdictTag verdict={String(e.verdict ?? "")} />
-                        <p className="num mt-0.5 text-xs text-text-secondary">
-                          置信度 {String(e.confidence ?? "—")}
-                        </p>
-                        {pa.entry !== undefined && (
-                          <p className="num text-[11px] text-flat">
-                            入 {String(pa.entry)} · 止 {String(pa.stop_loss)} · 目 {String(pa.target)}
+                    <div key={i}>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedAt(isOpen ? null : at)}
+                        className="flex w-full items-center justify-between py-3 text-left hover:bg-bg-base"
+                      >
+                        <div className="min-w-0 flex items-center gap-1.5">
+                          <ChevronRight
+                            className={cn(
+                              "h-3.5 w-3.5 flex-shrink-0 text-flat transition-transform",
+                              isOpen && "rotate-90",
+                            )}
+                          />
+                          <div className="min-w-0">
+                            <p className="num text-xs text-text-secondary">{at}</p>
+                            <p className="mt-0.5 truncate text-sm">
+                              {String(e.note ?? e.analysis_text ?? "")}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="ml-3 flex-shrink-0 text-right">
+                          <VerdictTag verdict={String(e.verdict ?? "")} />
+                          <p className="num mt-0.5 text-xs text-text-secondary">
+                            置信度 {String(e.confidence ?? "—")}
                           </p>
-                        )}
-                      </div>
+                          {pa.entry !== undefined && (
+                            <p className="num text-[11px] text-flat">
+                              入 {String(pa.entry)} · 止 {String(pa.stop_loss)} · 目 {String(pa.target)}
+                            </p>
+                          )}
+                        </div>
+                      </button>
+                      {isOpen && (
+                        <HistoryTraceReplay tsCode={committedCode!} analyzedAt={at} />
+                      )}
                     </div>
                   );
                 })}
@@ -212,5 +232,33 @@ export function AnalyzePage() {
         </Card>
       )}
     </div>
+  );
+}
+
+/** 历史行展开的 trace 回放块：按 (ts_code, analyzed_at) 拉 trace.jsonl。null 降级。 */
+function HistoryTraceReplay({ tsCode, analyzedAt }: { tsCode: string; analyzedAt: string }) {
+  const trace = useQuery({
+    queryKey: qk.trace(tsCode, analyzedAt),
+    queryFn: () => getTrace(tsCode, analyzedAt),
+    enabled: !!tsCode && !!analyzedAt,
+  });
+
+  if (trace.isLoading) {
+    return (
+      <p className="py-3 text-center text-xs text-flat">
+        <Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" />
+        加载过程…
+      </p>
+    );
+  }
+  if (trace.data?.events?.length) {
+    return (
+      <div className="pb-3 pl-5">
+        <TraceEventList events={trace.data.events} />
+      </div>
+    );
+  }
+  return (
+    <p className="py-3 pl-5 text-xs text-flat">无过程记录（早期分析未落 trace）</p>
   );
 }

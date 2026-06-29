@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { History, Search, AlertCircle, Loader2 } from "lucide-react";
+import { History, Search, AlertCircle, Loader2, ChevronRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, Drawer } from "@/components/base";
-import { VerdictTag, VerdictDetailCard } from "@/components/a-share";
-import { getAllJournal } from "@/api/analyze";
+import { VerdictTag, VerdictDetailCard, TraceEventList } from "@/components/a-share";
+import { getAllJournal, getTrace } from "@/api/analyze";
 import { qk } from "@/api/query-keys";
+import { cn } from "@/lib/utils";
 
 /**
  * /journal 全部历史分析
@@ -148,9 +149,63 @@ export function JournalPage() {
         }
         widthClass="max-w-lg"
       >
-        {selected && <VerdictDetailCard verdict={selected} />}
+        {selected && (
+          <>
+            <VerdictDetailCard verdict={selected} />
+            <TraceReplay
+              tsCode={String(selected.ts_code ?? "")}
+              analyzedAt={String(selected.analyzed_at ?? selected.date ?? "")}
+            />
+          </>
+        )}
       </Drawer>
     </div>
+  );
+}
+
+/** Drawer 内的 trace 回放区：折叠展开，按 (ts_code, analyzed_at) 拉一次 trace.jsonl。null 降级。 */
+function TraceReplay({ tsCode, analyzedAt }: { tsCode: string; analyzedAt: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const trace = useQuery({
+    queryKey: qk.trace(tsCode, analyzedAt),
+    queryFn: () => getTrace(tsCode, analyzedAt),
+    enabled: !!expanded && !!tsCode && !!analyzedAt,
+  });
+
+  return (
+    <Card className="mt-4">
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="flex items-center gap-1.5 text-sm font-normal text-text-secondary hover:text-text-primary"
+        >
+          <ChevronRight
+            className={cn("h-3.5 w-3.5 transition-transform", expanded && "rotate-90")}
+          />
+          <span>分析过程回放</span>
+          {expanded && trace.data?.events?.length ? (
+            <span className="num text-xs text-flat">{trace.data.events.length} 步</span>
+          ) : null}
+        </button>
+      </CardHeader>
+      {expanded && (
+        <CardContent className="pt-0">
+          {trace.isLoading ? (
+            <p className="py-4 text-center text-sm text-flat">
+              <Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" />
+              加载过程…
+            </p>
+          ) : trace.data?.events?.length ? (
+            <TraceEventList events={trace.data.events} />
+          ) : (
+            <p className="py-4 text-center text-sm text-flat">
+              无过程记录（早期分析未落 trace）
+            </p>
+          )}
+        </CardContent>
+      )}
+    </Card>
   );
 }
 
