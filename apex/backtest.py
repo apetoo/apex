@@ -13,7 +13,6 @@ T+1 真实入场建模:
   信号日为 bar[0]，bar[1] **开盘价**入场（涨停封板/一字板 → unfillable，剔除出胜率分母并单列计数）。
   基准对比窗口用实际 fill_date（非信号日），消除固定方向偏置。
 """
-import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -21,7 +20,7 @@ import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
-from apex import config, data, journal
+from apex import config, data, journal, market_cache
 from apex.schemas import BULLISH_VERDICTS
 
 _BENCHMARK_CODE = "000300.SH"
@@ -117,35 +116,33 @@ def _benchmark_return(entry_date: str, exit_date: str) -> Optional[float]:
 
 
 def _fetch_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """直接拉日线（tushare 主, akshare 兜底），不算 MA、不截断 tail(60)。
+    """拉单票日线（market_cache parquet 缓存为主, akshare 兜底），不算 MA、不截断 tail(60)。
 
-    供 run_portfolio 跨长历史用；run() 仍用 data.get_daily_price（带 MA，窗口≤60 安全）。
+    供 run_portfolio 兜底（主路径走 _build_ohlc_panels 的批量拉取）。
     返回 DataFrame, index=trade_date(datetime), cols: open/high/low/close/vol。失败返回空。
     """
     s = start_date.replace("-", "")
     e = end_date.replace("-", "")
     try:
-        _tushare()  # 确保 token 已 set
-        import tushare as ts_module
-        df = ts_module.pro_bar(ts_code=code, adj="qfq", freq="D",
-                               start_date=s, end_date=e)
-        if df is None or df.empty:
-            raise ValueError("empty")
-        df = df.sort_values("trade_date").reset_index(drop=True)
+        df = market_cache.load_daily_full(code, start_date=s, end_date=e, adj="qfq")
+        if df is not None and not df.empty:
+            return df
     except Exception:
-        try:
-            import akshare as ak
-            symbol = code.split(".")[0]
-            df = ak.stock_zh_a_hist(symbol=symbol, start_date=s, end_date=e,
-                                     adjust="qfq")
-            df = df.rename(columns={"日期": "trade_date", "开盘": "open",
-                                    "收盘": "close", "最高": "high",
-                                    "最低": "low", "成交量": "vol"})
-            df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "")
-        except Exception:
-            return pd.DataFrame()
-    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
-    return df.set_index("trade_date").sort_index()
+        pass
+    # 兜底：akshare（market_cache 对停牌/无数据返空时）
+    try:
+        import akshare as ak
+        symbol = code.split(".")[0]
+        df = ak.stock_zh_a_hist(symbol=symbol, start_date=s, end_date=e,
+                                 adjust="qfq")
+        df = df.rename(columns={"日期": "trade_date", "开盘": "open",
+                                "收盘": "close", "最高": "high",
+                                "最低": "low", "成交量": "vol"})
+        df["trade_date"] = pd.to_datetime(df["trade_date"].astype(str)
+                                          .str.replace("-", ""), format="%Y%m%d")
+        return df.set_index("trade_date").sort_index()
+    except Exception:
+        return pd.DataFrame()
 
 
 def _tushare():
@@ -326,30 +323,43 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
 
 
 def _load_bars(code: str, entry_date: str, holding_period: int) -> pd.DataFrame:
-    """拉一条信号所需的日线窗口（用 get_daily_price，带 MA、窗口短安全）。
+    """拉一条信号所需的日线窗口（走 market_cache parquet 缓存, qfq 复权）。
 
-    返回 DataFrame, index=trade_date, 含 open/high/low/close。失败/形状错返回空。
+    返回 DataFrame, index=trade_date(datetime 升序), 含 open/high/low/close。失败/形状错返回空。
+    语义与旧 get_daily_price 一致：从 entry_date 起升序，_simulate_one 取 iloc[:hp+2]。
     """
     end_date = _add_days(entry_date, holding_period + 20)
     try:
-        raw = data.get_daily_price(code,
-                                   start_date=entry_date.replace("-", ""),
-                                   end_date=end_date.replace("-", ""))
+        df = market_cache.load_daily_full(
+            code,
+            start_date=entry_date.replace("-", ""),
+            end_date=end_date.replace("-", ""),
+            adj="qfq",
+        )
     except Exception as exc:
         print(f"  ⚠ {code} {entry_date} 拉行情失败: {type(exc).__name__}: {exc}")
         return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df
+
+
+def _prefetch_signals(codes, entries, holding_period: int) -> None:
+    """批量预热所有信号的日线 parquet（按交易日横截面，调用数与 code 数解耦）。
+
+    一次 load_raw_daily_batch 覆盖所有 code 的全局窗口（调用数 = 交易日×2，远低于 per-code
+    的 N×2），预热后 _load_bars→load_daily_full 命中 parquet、0 网络。失败静默（_load_bars
+    各自兜底）。
+    """
+    dates = [e.get("date", "") for e in entries if e.get("date")]
+    if not dates or not codes:
+        return
+    start = min(dates).replace("-", "")
+    end = _add_days(max(dates), holding_period + 20).replace("-", "")
     try:
-        records = json.loads(raw)
-    except Exception:
-        return pd.DataFrame()
-    # 防御: get_daily_price 出错可能返回 dict 而非 list
-    if not isinstance(records, list) or not records:
-        return pd.DataFrame()
-    if "trade_date" not in records[0]:
-        return pd.DataFrame()
-    df = pd.DataFrame(records)
-    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
-    return df.set_index("trade_date").sort_index()
+        market_cache.load_raw_daily_batch(list(codes), start, end)
+    except Exception as e:
+        print(f"⚠ 回测预热批量拉取失败: {type(e).__name__}: {e}")
 
 
 def _run_entries(long_entries: list, holding_period: int,
@@ -400,6 +410,9 @@ def run(ts_code: Optional[str] = None,
     if len(long_entries) < min_entries:
         print(f"⚠ 多头信号只有 {len(long_entries)} 条，少于最小要求 {min_entries}，仍继续但结果仅供参考。")
 
+    codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
+    _prefetch_signals(codes, long_entries, lookforward_days)
+
     all_rows, _ = _run_entries(long_entries, lookforward_days, include_benchmark)
     fillable = [r for r in all_rows if not r.get("unfillable")]
     return pd.DataFrame(fillable)
@@ -424,6 +437,9 @@ def run_sweep(ts_code: Optional[str] = None,
 
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+
+    codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
+    _prefetch_signals(codes, long_entries, max_hp)
 
     per_signal = []
     # by_period 聚合
@@ -541,6 +557,9 @@ def aggregate(ts_code: Optional[str] = None,
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
 
+    codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
+    _prefetch_signals(codes, long_entries, lookforward_days)
+
     all_rows, unfillable_count = _run_entries(long_entries, lookforward_days, include_benchmark)
     fillable = [r for r in all_rows if not r.get("unfillable")]
 
@@ -563,7 +582,8 @@ def aggregate(ts_code: Optional[str] = None,
 def _build_ohlc_panels(codes: list, entries: list, holding_period: int) -> dict:
     """拉所有 code 的日线，拼成 wide OHLC 面板（index=交易日并集, cols=code）。
 
-    跨长历史用 _fetch_daily（绕开 get_daily_price 的 tail(60)）。停牌缺口 ffill。
+    走 market_cache 批量拉取（按交易日横截面，调用数=交易日×2，与 code 数解耦），
+    parquet 缓存 + 限频重试。批量缺的 code 用 _fetch_daily 单票 akshare 兜底。停牌缺口 ffill。
     返回 {"open":df,"high":df,"low":df,"close":df}；任一为空 → 全部空 DataFrame。
     """
     empty = {k: pd.DataFrame() for k in ("open", "high", "low", "close")}
@@ -575,11 +595,25 @@ def _build_ohlc_panels(codes: list, entries: list, holding_period: int) -> dict:
     start = min(dates)
     end = _add_days(max(dates), holding_period + 10)
 
+    # 批量按交易日横截面拉取（一次覆盖所有 code，调用数与 code 数解耦）
+    try:
+        batch = market_cache.load_raw_daily_batch(
+            list(codes), start.replace("-", ""), end.replace("-", ""),
+        )
+    except Exception as e:
+        print(f"⚠ portfolio 批量拉取失败: {type(e).__name__}: {e}")
+        batch = {}
+
     cols = {k: {} for k in ("open", "high", "low", "close")}
     for code in codes:
-        df = _fetch_daily(code, start, end)
-        if df.empty:
+        df = batch.get(code)
+        if df is None or df.empty:
+            # 兜底：单票（market_cache 对停牌/无数据返空时走 akshare）
+            df = _fetch_daily(code, start, end)
+        if df is None or df.empty:
             continue
+        if "adj_factor" in df.columns:
+            df = market_cache._apply_adj(df, "qfq")
         for k in cols:
             cols[k][code] = df[k].astype(float)
     if not cols["close"]:
