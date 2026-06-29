@@ -140,11 +140,25 @@ def _review_path() -> Path:
     return cache_dir / "backtest_review.json"
 
 
+def _review_cfg() -> dict:
+    """读 backtest 复盘相关阈值。缺失回退默认。"""
+    cfg = config.get()
+    bt = cfg.get("backtest") or {}
+    return {
+        "min_review_samples": int(bt.get("min_review_samples", 8)),
+        "max_inject_age_days": int(bt.get("max_inject_age_days", 30)),
+    }
+
+
 def load_prompt_injection() -> Optional[str]:
     """供 analyze 读取最近一次回测复盘的 prompt_injection。无/空返回 None。
 
     这是回测复盘→下次分析闭环的最后一环：AI 在回测里发现的失败模式，
-    在下次分析同一只票时作为提醒注入 user prompt。
+    在下次分析时作为提醒注入 user prompt。
+
+    质量保护（避免旧/小样本结论误导新分析）：
+    - 样本不足（fillable_count < min_review_samples）→ 不注入
+    - 过期（generated_at 超过 max_inject_age_days 天）→ 不注入
     """
     p = _review_path()
     if not p.exists():
@@ -153,8 +167,36 @@ def load_prompt_injection() -> Optional[str]:
         d = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+    rc = _review_cfg()
+    # 样本量门槛
+    agg = d.get("aggregate") or {}
+    fillable = agg.get("fillable_count")
+    if fillable is not None and fillable < rc["min_review_samples"]:
+        return None
+    # 时效门槛
+    gen = d.get("generated_at")
+    if gen:
+        try:
+            gen_dt = datetime.fromisoformat(gen)
+            age_days = (datetime.now(_TZ_CN) - gen_dt).days
+            if age_days > rc["max_inject_age_days"]:
+                return None
+        except Exception:
+            pass
     txt = (d.get("prompt_injection") or "").strip()
     return txt or None
+
+
+def _sanitize_weight_hint(agg: dict, raw_hint: dict) -> dict:
+    """强制样本门槛：n < 3 的策略 weight_hint 一律 'hold'，不采信 AI 对小样本的判断。
+
+    prompt 已要求 AI 自律，但代码兜底——AI 仍可能对 n=1 的策略给 increase/decrease。
+    """
+    n_by_strategy = {b["key"]: b.get("n", 0) for b in agg.get("by_strategy", [])}
+    out = {}
+    for k, v in (raw_hint or {}).items():
+        out[k] = v if n_by_strategy.get(k, 0) >= 3 else "hold"
+    return out
 
 
 def _persist_strategy_stats(agg: dict, weight_hint: dict) -> dict:
@@ -205,8 +247,15 @@ def review(ts_code: Optional[str] = None,
         raise BacktestReviewError("deepseek.api_key 未配置")
 
     agg = backtest.aggregate(ts_code=ts_code, lookforward_days=lookforward_days)
+    rc = _review_cfg()
     if agg["fillable_count"] == 0:
         raise BacktestReviewError("无可成交信号，无法复盘")
+    # #2 样本量门槛：小样本复盘无统计意义，结论会误导反哺
+    if agg["fillable_count"] < rc["min_review_samples"]:
+        raise BacktestReviewError(
+            f"可成交信号仅 {agg['fillable_count']} 笔，少于最小要求 "
+            f"{rc['min_review_samples']}，复盘无统计意义"
+        )
 
     user_block = _format_stats(agg)
     client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
@@ -256,8 +305,13 @@ def review(ts_code: Optional[str] = None,
     if ai_part is None:
         raise last_err or BacktestReviewError("AI 复盘失败")
 
-    weight_hint = ai_part.get("strategy_weight_hint") or {}
-    persisted = _persist_strategy_stats(agg, weight_hint)
+    # #4a 强制样本门槛：n<3 的策略 weight_hint 一律 hold（代码兜底，不靠 AI 自律）
+    weight_hint = _sanitize_weight_hint(agg, ai_part.get("strategy_weight_hint") or {})
+
+    # 仅全局复盘（ts_code=None）落盘反哺：个股复盘(ts_code=X)只返回前端展示，
+    # 不覆盖全局注入文件 / 策略统计（否则个股结论会污染全局反哺 —— 见 #3）。
+    is_global = ts_code is None
+    persisted = _persist_strategy_stats(agg, weight_hint) if is_global else None
 
     result = {
         "summary": ai_part.get("summary", ""),
@@ -270,10 +324,11 @@ def review(ts_code: Optional[str] = None,
         "generated_at": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
     }
 
-    # 落盘整份复盘，供 analyze 下次注入 prompt_injection（闭环最后一环）
-    try:
-        _review_path().write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"⚠ backtest_review 落盘失败: {e}")
+    if is_global:
+        # 落盘整份复盘，供 analyze 下次注入 prompt_injection（闭环最后一环）
+        try:
+            _review_path().write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"⚠ backtest_review 落盘失败: {e}")
 
     return result

@@ -258,6 +258,9 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
             "hit": None,
             "beat_benchmark": None,
             "unfillable": True,
+            "exit_reason": "unfillable",
+            "mae": None,
+            "mfe": None,
         })
         return base
 
@@ -307,6 +310,26 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     if total_return is None:
         return None
 
+    # 退出归因 + 偏移(MAE/MFE)：首根触及 SL/TP 的 bar，否则持有到末根(time_stop)。
+    # 用价格动作判定，与 vbt 实际退出在罕见同根/gap 情况下可能微偏，但诊断语义（"止损被触过"）更准。
+    stop_price = fill_price * (1 - sl_frac) if not np.isnan(sl_frac) else None
+    target_price = fill_price * (1 + tp_frac) if not np.isnan(tp_frac) else None
+    exit_pos = len(window) - 1
+    exit_reason = "time_stop"
+    for i in range(1, len(window)):
+        lo = float(low_.iloc[i])
+        hi = float(high_.iloc[i])
+        if stop_price is not None and lo <= stop_price:
+            exit_reason = "stop_hit"; exit_pos = i; break
+        if target_price is not None and hi >= target_price:
+            exit_reason = "target_hit"; exit_pos = i; break
+    hold = window.iloc[1:exit_pos + 1]
+    if fill_price > 0 and len(hold) > 0:
+        mae = float(((hold["low"].astype(float) / fill_price) - 1).min())
+        mfe = float(((hold["high"].astype(float) / fill_price) - 1).max())
+    else:
+        mae = mfe = None
+
     bench = _benchmark_return(fill_date, exit_date) if include_benchmark else None
     excess = round(total_return - bench, 4) if bench is not None else None
 
@@ -318,6 +341,9 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
         "sharpe": round(sharpe, 2) if sharpe is not None else None,
         "hit": total_return > 0,
         "beat_benchmark": (excess or 0) > 0 if bench is not None else None,
+        "exit_reason": exit_reason,
+        "mae": round(mae, 4) if mae is not None else None,
+        "mfe": round(mfe, 4) if mfe is not None else None,
     })
     return base
 
@@ -512,6 +538,26 @@ def _conf_bucket(conf) -> Optional[str]:
     return "7-10"
 
 
+def _excursion(rows: list) -> dict:
+    """聚合 MAE/MFE + 拿不住率。rows=fillable 行（含 mae/mfe/net_return）。
+
+    avg_mae=平均最大浮亏(负数)、avg_mfe=平均最大浮盈(正数)。
+    left_money_rate=MFE>0 却最终亏损(net_return<0)的占比 —— 高=拿不住/止损太紧。
+    无样本返回全 None。
+    """
+    have = [r for r in rows if r.get("mae") is not None and r.get("mfe") is not None]
+    if not have:
+        return {"avg_mae": None, "avg_mfe": None, "left_money_rate": None}
+    maes = [r["mae"] for r in have]
+    mfes = [r["mfe"] for r in have]
+    left = sum(1 for r in have if (r.get("mfe") or 0) > 0 and (r.get("net_return") or 0) < 0)
+    return {
+        "avg_mae": round(sum(maes) / len(maes), 4),
+        "avg_mfe": round(sum(mfes) / len(mfes), 4),
+        "left_money_rate": round(left / len(have), 4),
+    }
+
+
 def _slice_bucket(rows: list, key_fn) -> list:
     """对 fillable 行按 key_fn 分桶聚合。返回 [{key, n, win_rate, avg_net_return, avg_excess_return}]。"""
     groups: dict = {}
@@ -574,6 +620,8 @@ def aggregate(ts_code: Optional[str] = None,
         "by_confidence_bucket": _slice_bucket(fillable, _conf_key),
         "by_verdict": _slice_bucket(fillable, lambda r: r.get("verdict")),
         "by_strategy": _slice_bucket(fillable, lambda r: r.get("strategy") or "unknown"),
+        "by_exit_reason": _slice_bucket(fillable, lambda r: r.get("exit_reason")),
+        "excursion": _excursion(fillable),
     }
 
 

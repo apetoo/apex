@@ -357,7 +357,18 @@ def _load_system_prompt() -> str:
             "你是一位资深A股投资顾问。对给定股票做技术面+基本面综合分析，"
             "给出明确的判断方向和具体价位建议。分析完成后必须调用 record_verdict 工具记录结论。"
         )
-    return evidence_attribution.inject_into(calibration.inject_into(base))
+    base = evidence_attribution.inject_into(calibration.inject_into(base))
+    # 回测复盘→分析闭环：注入最近一次全局复盘的 prompt_injection。
+    # 时效(max_inject_age_days) + 样本量(min_review_samples) 门槛已由 load 端把关，
+    # 不满足则返回 None 不注入，避免旧/小样本结论误导本次分析。
+    try:
+        from apex import backtest_review
+        inj = backtest_review.load_prompt_injection()
+        if inj:
+            base += "\n\n## 回测复盘提醒（基于历史模拟回测派生，注意样本局限，非定论）\n" + inj
+    except Exception:
+        pass
+    return base
 
 
 def _dispatch_tool(name: str, tool_input: dict) -> str:

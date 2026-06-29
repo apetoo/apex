@@ -129,6 +129,23 @@ def _format_history_block(regime_label: Optional[str] = None) -> str:
         else:
             parts.append("（暂无 strategy×regime 数据，回退看全样本）")
 
+    # 回测复盘的 per-strategy 权重建议（backtest_review 闭环另一侧）。
+    # 仅展示样本≥3 的非 hold 建议，供 AI 决策参考；不强制覆盖 AI 权重。
+    try:
+        from apex import backtest_review
+        stats = backtest_review.load_strategy_stats() or {}
+        by_strat = stats.get("by_strategy") or {}
+        hints = [(name, b.get("weight_hint"), b.get("n"), b.get("win_rate"))
+                 for name, b in by_strat.items()
+                 if b.get("weight_hint") in ("increase", "decrease") and (b.get("n") or 0) >= 3]
+        if hints:
+            parts.append("\n**回测复盘权重建议**（模拟回测派生，n≥3 才显示）")
+            for name, hint, n, wr in hints:
+                wr_str = f"{wr * 100:.0f}%" if wr is not None else "—"
+                parts.append(f"- {name}: {hint}（n={n}, 模拟胜率 {wr_str}）")
+    except Exception:
+        pass
+
     return "\n".join(parts)
 
 
