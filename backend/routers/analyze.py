@@ -42,8 +42,17 @@ def list_all_journal():
 
     复用 ``journal.load_entries()``(无 ts_code 即读 journal_dir 下所有 *.jsonl)。
     量级 ~数百条, 直接全量返回(前端本地搜索)。
+
+    老条目缺 ``name``(中文名), 这里用全量 name map 兜底回填, 供列表展示。
     """
     entries = journal.load_entries()
+    name_map = data_mod.get_name_map()
+    if name_map:
+        for e in entries:
+            if not e.get("name"):
+                n = name_map.get(e.get("ts_code", ""))
+                if n:
+                    e["name"] = n
     entries.sort(
         key=lambda e: e.get("analyzed_at") or e.get("date", ""),
         reverse=True,

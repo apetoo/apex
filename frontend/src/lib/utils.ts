@@ -22,7 +22,9 @@ export function directionClass(delta: number | null | undefined): string {
  * 格式化价格: 保留 2 位小数, 等宽
  */
 export function formatPrice(price: number | null | undefined): string {
-  if (price == null || Number.isNaN(price)) return "—";
+  // 0 视为无值: 后端看多类价位被拒后理论上不会再漏 0 进来,
+  // 但历史 journal + 非看多方向占位仍可能拿到 0, A 股没有 0 元的票
+  if (price == null || price === 0 || Number.isNaN(price)) return "—";
   return price.toFixed(2);
 }
 

@@ -10,7 +10,7 @@ import {
 } from "@/components/base";
 import { MarketIndexBar } from "@/components/a-share";
 import { getPrices, getPrevClosePrices } from "@/api/market";
-import { getWatchlist } from "@/api/watchlist";
+import { getWatchlist, getClosedPositions } from "@/api/watchlist";
 import { getAccount } from "@/api/account";
 import { qk } from "@/api/query-keys";
 import { cn, formatPercent } from "@/lib/utils";
@@ -54,17 +54,50 @@ export function OverviewPage() {
     enabled: codes.length > 0,
   });
 
+  /* ── 当日平仓：今日盈亏要计入「今日那段」(exit_price - 昨收) × 股数 ─────── */
+  // 平仓后仓位从 active_positions 移除, 否则今日盈亏会漏掉这笔今天的涨跌。
+  // CN 时区今日字符串, 与后端 close.exit_date (date.today().isoformat()) 对齐。
+  const todayStr = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date()).replace(/\//g, "-");
+
+  const closedRecent = useQuery({
+    queryKey: qk.closedRecent,
+    queryFn: () => getClosedPositions({ since_days: 3 }),
+  });
+
+  const closedToday = (closedRecent.data ?? []).filter(
+    (c) => c.close?.exit_date === todayStr,
+  );
+  const closedCodes = closedToday.map((c) => c.ts_code);
+
+  const closedPrevClose = useQuery({
+    queryKey: qk.prevClose(closedCodes),
+    queryFn: () => getPrevClosePrices(closedCodes),
+    enabled: closedCodes.length > 0,
+  });
+
   /* ── 今日盈亏汇总 ──────────────────────────────────── */
 
   const todayPnlTotal: number | null = (() => {
     let sum = 0;
+    // 在仓: (现价 - 昨收) × 股数
     for (const pos of positions) {
       const cur = prices.data?.[pos.ts_code] ?? null;
       const prev = daily.data?.[pos.ts_code] ?? null;
       if (cur == null || prev == null || pos.position_size_shares == null) return null;
       sum += (cur - prev) * pos.position_size_shares;
     }
-    return positions.length > 0 ? sum : null;
+    // 当日平仓: (exit_price - 昨收) × 股数（best-effort, 取不到昨收则跳过这条, 不拖垮整指标）
+    for (const c of closedToday) {
+      const exitPrice = c.close?.actual_exit_price;
+      const prev = closedPrevClose.data?.[c.ts_code] ?? null;
+      const shares = c.open?.position_size_shares ?? null;
+      if (exitPrice == null || prev == null || shares == null) continue;
+      sum += (exitPrice - prev) * shares;
+    }
+    return positions.length > 0 || closedToday.length > 0 ? sum : null;
   })();
 
   const acc = account.data;

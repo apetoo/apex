@@ -116,6 +116,36 @@ export interface SellResponseClosed {
 
 export type SellResponse = SellResponsePartial | SellResponseClosed;
 
+/**
+ * 已平仓记录（GET /api/watchlist/closed）。
+ * 形状对齐 apex/watchlist.py:close_position 写入的 closed record：
+ *   open.{entry_date, actual_fill_price, position_size_shares}
+ *   close.{exit_date, actual_exit_price, realized_pnl_amount, closed_at}
+ * 其余字段宽松保留（diagnosis / open / close 里的扩展键）。
+ */
+export interface ClosedPosition {
+  ts_code: string;
+  name: string;
+  open: {
+    entry_date: string;
+    entry_price: number | null;
+    actual_fill_price: number | null;
+    position_size_shares: number | null;
+    [k: string]: unknown;
+  };
+  close: {
+    exit_date: string;
+    actual_exit_price: number;
+    exit_reason: string;
+    realized_pnl_amount: number | null;
+    realized_pnl_pct: number | null;
+    closed_at: string;
+    [k: string]: unknown;
+  };
+  diagnosis: unknown;
+  [k: string]: unknown;
+}
+
 const MOCK_DATA: WatchlistData = {
   active_positions: [
     {
@@ -184,13 +214,17 @@ export interface ClosePositionPayload {
   ts_code: string;
   exit_price: number;
   exit_date: string; // YYYY-MM-DD
-  shares?: number;
-  notes?: string;
+  exit_reason?: string;
+  user_notes?: string;
+  actual_fill_price?: number;
+  postmortem?: boolean;
 }
 
 export interface ArchivePayload {
   ts_code: string;
   reason: "manual" | "expired" | "dedup";
+  /** 缺省时后端自动探测(候选优先)。显式传更明确。 */
+  section?: "active_positions" | "candidates";
 }
 
 export interface PromotePayload {
@@ -400,6 +434,24 @@ export async function sell(payload: SellPayload): Promise<SellResponse> {
   return api.post("/watchlist/sell", payload);
 }
 
+/** POST /api/watchlist/positions/{ts_code}/advice — 更新止损/目标(覆盖) */
+export interface UpdateAdvicePayload {
+  ts_code: string;
+  stop_loss?: number;
+  target?: number;
+  calibrated_confidence?: number;
+}
+
+export async function updateAdvice(
+  ts_code: string,
+  payload: Omit<UpdateAdvicePayload, "ts_code">,
+): Promise<{ message: string; position: ActivePosition }> {
+  return api.post(
+    `/watchlist/positions/${encodeURIComponent(ts_code)}/advice`,
+    { ts_code, ...payload },
+  );
+}
+
 /** GET /api/watchlist/trades — 交易流水(倒序) */
 export async function getTrades(params?: {
   ts_code?: string;
@@ -412,6 +464,19 @@ export async function getTrades(params?: {
   if (params?.since_days) qs.set("since_days", String(params.since_days));
   const q = qs.toString();
   return api.get<Trade[]>(`/watchlist/trades${q ? `?${q}` : ""}`);
+}
+
+/** GET /api/watchlist/closed — 已平仓记录（按 closed_at 倒序）。 */
+export async function getClosedPositions(params?: {
+  limit?: number;
+  since_days?: number;
+}): Promise<ClosedPosition[]> {
+  if (USE_MOCK) return [];
+  const qs = new URLSearchParams();
+  if (params?.limit) qs.set("limit", String(params.limit));
+  if (params?.since_days) qs.set("since_days", String(params.since_days));
+  const q = qs.toString();
+  return api.get<ClosedPosition[]>(`/watchlist/closed${q ? `?${q}` : ""}`);
 }
 
 // Re-export ApiError for callers

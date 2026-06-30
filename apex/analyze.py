@@ -1277,19 +1277,40 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             })
 
             if name == "record_verdict":
+                # 校验 1: 强制博查类别必须全部调用过
                 missing = [
                     c for c in data.MANDATORY_SEARCH_CATEGORIES
                     if c not in searches_performed
                 ]
-                if missing:
-                    # 拒绝记录结论，强制 AI 先把强制类别补齐
+                # 校验 2: 看多类(看多/偏多/观望偏多)必须填具体价位,
+                # entry/stop_loss/target 任一 ≤ 0 视为漏填(0 是非看多方向的占位)
+                bad_prices = []
+                if not missing and tool_input.get("verdict") in BULLISH_VERDICTS:
+                    bad_prices = [
+                        f for f in ("entry", "stop_loss", "target")
+                        if not (
+                            isinstance(tool_input.get(f), (int, float))
+                            and tool_input.get(f) > 0
+                        )
+                    ]
+
+                if missing or bad_prices:
+                    # 拒绝记录结论, 把错误喂回 AI 逼其修正后重调 record_verdict
+                    reasons = []
+                    if missing:
+                        reasons.append(
+                            f"强制博查类别未全部调用, 缺: {missing}。"
+                            f"请先调用 web_search(category=<上述类别>) 补齐"
+                        )
+                    if bad_prices:
+                        reasons.append(
+                            f"方向为「{tool_input.get('verdict')}」属看多类, "
+                            f"价位 {bad_prices} 必须填大于 0 的具体数字, 不能填 0"
+                        )
                     result = json.dumps({
-                        "error": (
-                            f"强制博查类别未全部调用，缺：{missing}。"
-                            f"请先调用 web_search(category=<上述类别>) 把每个缺失项查一遍，"
-                            f"再调用 record_verdict。"
-                        ),
+                        "error": "；".join(reasons) + "。请修正后重新调用 record_verdict。",
                         "missing_categories": missing,
+                        "bad_prices": bad_prices,
                         "performed": searches_performed,
                     }, ensure_ascii=False)
                     _emit({
@@ -1297,6 +1318,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         "iteration": iteration,
                         "tool_call_id": tool_call.id,
                         "missing": missing,
+                        "bad_prices": bad_prices,
                         "performed": list(searches_performed),
                     })
                 else:
@@ -1416,8 +1438,11 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             cal_explanation = f"校准失败: {e}"
 
     now_cn = datetime.now(_TZ_CN)
+    # 中文名: 优先 name map(一次拉全量), 兜底 None。写入 journal 供历史列表直接展示。
+    stock_name = data.get_name_map().get(ts_code)
     entry = {
         "ts_code": ts_code,
+        "name": stock_name,
         "date": now_cn.date().isoformat(),
         "analyzed_at": now_cn.isoformat(timespec="seconds"),
         "verdict": raw_verdict,

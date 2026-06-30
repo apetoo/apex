@@ -88,7 +88,17 @@ class SellRequest(BaseModel):
 
 
 class ArchiveRequest(BaseModel):
-    """归档（软删除）。section: active_positions | candidates。"""
+    """归档（软删除）。section 缺省时后端自动探测(候选优先, 再 active_positions)。"""
     ts_code: str
-    section: str = Field(..., pattern="^(active_positions|candidates)$")
+    section: Optional[str] = Field(
+        None, pattern="^(active_positions|candidates)$",
+    )
     reason: str = "manual"
+
+
+class UpdateAdviceRequest(BaseModel):
+    """更新持仓止损/目标(覆盖写)。用于手动持仓同步最近 AI 分析。"""
+    ts_code: str
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    calibrated_confidence: Optional[float] = None

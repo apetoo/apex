@@ -117,18 +117,22 @@ def migrate_and_backfill() -> dict:
                 item["ts_code"] = new
                 stats["normalized"] += 1
                 changed = True
-            if section in ("active_positions", "candidates") and not item.get("name") and item.get("ts_code"):
-                try:
-                    info_raw = _data.get_stock_info(ts_code=item["ts_code"])
-                    info_list = json.loads(info_raw)
-                    if isinstance(info_list, list) and info_list:
-                        nm = info_list[0].get("name", "")
-                        if nm:
-                            item["name"] = nm
-                            stats["named"] += 1
-                            changed = True
-                except Exception:
-                    pass
+            if section in ("active_positions", "candidates") and item.get("ts_code"):
+                # name 缺失, 或被误存成 ts_code/裸代码(AddCandidateDialog 历史bug) → 重查
+                nm = item.get("name", "")
+                bare = item["ts_code"].split(".")[0]
+                if not nm or nm == item["ts_code"] or nm == bare:
+                    try:
+                        info_raw = _data.get_stock_info(ts_code=item["ts_code"])
+                        info_list = json.loads(info_raw)
+                        if isinstance(info_list, list) and info_list:
+                            real = info_list[0].get("name", "")
+                            if real and real != nm:
+                                item["name"] = real
+                                stats["named"] += 1
+                                changed = True
+                    except Exception:
+                        pass
             if section == "active_positions" and not item.get("avg_cost"):
                 ep = item.get("entry_price")
                 if ep is not None:
@@ -211,6 +215,32 @@ def add_position(ts_code: str, name: str, entry_price: float,
         record["regime_at_open"] = str(regime_at_open)
     data["active_positions"].append(record)
     _save(data)
+
+
+def update_advice(ts_code: str,
+                  stop_loss: Optional[float] = None,
+                  target: Optional[float] = None,
+                  calibrated_confidence: Optional[float] = None) -> dict:
+    """更新已存在持仓的止损/目标/校准确信度(覆盖写)。
+
+    用于手动持仓从最近一次 AI 分析同步 advice。总是覆盖传入的字段;
+    传 None 的字段保持原值不动。
+
+    Raises:
+      PositionNotFoundError: ts_code 不在 active_positions。
+    """
+    data = _load()
+    for pos in data["active_positions"]:
+        if pos.get("ts_code") == ts_code:
+            if stop_loss is not None:
+                pos["stop_loss"] = float(stop_loss)
+            if target is not None:
+                pos["target"] = float(target)
+            if calibrated_confidence is not None:
+                pos["calibrated_confidence"] = float(calibrated_confidence)
+            _save(data)
+            return pos
+    raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
 
 
 def replace_position(ts_code: str, name: str, entry_price: float,
@@ -437,6 +467,7 @@ def sell(ts_code: str, fill_price: float, shares: int,
         closed_record = close_position(
             ts_code=ts_code, exit_price=fill_price, exit_reason=exit_reason,
             actual_fill_price=avg_cost_before,
+            record_trade=False,  # 上面已 append_trade, 避免双写
         )
         diagnosis = None
         if postmortem:
@@ -504,11 +535,19 @@ def dedup_active_positions() -> int:
     return archived_count
 
 
-def archive_entry(ts_code: str, section: str, reason: str = "manual") -> bool:
-    """Move an entry from active_positions or candidates into archived. Returns True if moved."""
+def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "manual") -> bool:
+    """Move an entry from active_positions or candidates into archived. Returns True if moved.
+
+    section 缺省时自动探测: 候选优先, 再 active_positions。便于前端只传 ts_code+reason。
+    """
+    wl = _load()
+    if section is None:
+        for s in ("candidates", "active_positions"):
+            if any(item.get("ts_code") == ts_code for item in wl.get(s, [])):
+                section = s
+                break
     if section not in ("active_positions", "candidates"):
         return False
-    wl = _load()
     today = date.today().isoformat()
     for i, item in enumerate(wl[section]):
         if item.get("ts_code") == ts_code:
@@ -572,12 +611,15 @@ def close_position(ts_code: str,
                    exit_reason: str = "manual",
                    exit_date: Optional[str] = None,
                    user_notes: str = "",
-                   actual_fill_price: Optional[float] = None) -> dict:
+                   actual_fill_price: Optional[float] = None,
+                   record_trade: bool = True) -> dict:
     """平仓一笔持仓 → 写一条完整记录到 closed_positions.jsonl，并从 active_positions 移除。
 
     返回写入的 closed record（不含 diagnosis 段，那是 1.4 post-mortem 的活）。
 
     actual_fill_price: 开仓时的实际成交价（A股可能与 entry_price 略有滑点）；缺省回落到 entry_price。
+    record_trade: 是否追加一条 sell trade 到 trades.jsonl。直接走 /close 的平仓默认 True；
+                  sell() 卖光分支已自行留痕, 会传 False 避免双写。
 
     Raises:
       PositionNotFoundError: ts_code 不在 active_positions 中
@@ -675,6 +717,20 @@ def close_position(ts_code: str,
     pos_breadcrumb["closed_record_ref"] = record["close"]["closed_at"]
     wl["archived"].append(pos_breadcrumb)
     _save(wl)
+
+    # 平仓即卖光: 追加一条 sell trade 留痕(realized_pnl 与 closed record 同口径, 基准=fill_price)。
+    # sell() 卖光分支已自行 append_trade, 走 record_trade=False 避免双写。
+    if record_trade:
+        from apex import trades as _trades
+        _trades.append_trade(
+            ts_code=ts_code, name=pos.get("name", ""), side="sell",
+            fill_price=float(exit_price), shares=shares,
+            avg_cost_after=None, shares_after=0,
+            strategy=pos.get("strategy"), regime=_today_regime(),
+            journal_ref=_journal_ref_for(ts_code),
+            realized_pnl=realized_pnl_amount, realized_pnl_pct=realized_pnl_pct,
+            note=user_notes or exit_reason,
+        )
 
     return record
 

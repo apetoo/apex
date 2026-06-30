@@ -9,6 +9,8 @@ export const qk = {
   account: ["account"] as const,
   triggers: ["triggers"] as const,
   closed: ["closed"] as const,
+  // 近 N 日已平仓（概览今日盈亏用）；close/sell mutation 失效 ["closed"] 前缀即覆盖。
+  closedRecent: ["closed", "recent"] as const,
   trades: ["trades"] as const,
   calibration: ["calibration"] as const,
   // 带参数的细粒度 key

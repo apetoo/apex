@@ -64,7 +64,9 @@ export function AddCandidateDialog({
     addMut.mutate(
       {
         ts_code: tsCode,
-        name: tsCode,
+        // verdict 不带 name, 传空让后端 _resolve_name 查 tushare 补真名;
+        // 别传 ts_code 否则后端当已有名直接 return, 持仓只剩代码
+        name: "",
         trigger_price: tp,
         trigger_direction: direction,
         stop_advice: stopAdvice ? Number(stopAdvice) : undefined,

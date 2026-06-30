@@ -9,11 +9,27 @@ import {
   CardTitle,
   CardDescription,
   Button,
+  Dialog,
 } from "@/components/base";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 import { CompactCandidateCard } from "@/components/a-share/CompactCandidateCard";
-import { getWatchlist, getTrades, type ActivePosition } from "@/api/watchlist";
-import { useAddCandidate, useBuy, useSell } from "@/api/mutations";
+import { getPrices, getDailyPrices } from "@/api/market";
+import { getLatestJournal } from "@/api/analyze";
+import {
+  getWatchlist,
+  getTrades,
+  type ActivePosition,
+  type Candidate,
+} from "@/api/watchlist";
+import {
+  useAddCandidate,
+  useBuy,
+  useSell,
+  useClosePosition,
+  useArchiveEntry,
+  usePromoteCandidate,
+  useUpdateAdvice,
+} from "@/api/mutations";
 import { qk } from "@/api/query-keys";
 import { formatPrice } from "@/lib/utils";
 
@@ -42,6 +58,12 @@ export function WatchlistPage() {
   const addCandidateMut = useAddCandidate();
   const buyMut = useBuy();
   const sellMut = useSell();
+  const closeMut = useClosePosition();
+  const archiveMut = useArchiveEntry();
+  const promoteMut = usePromoteCandidate();
+  const adviceMut = useUpdateAdvice();
+  // 正在同步 AI advice 的 ts_code(单只反馈, 避免全局 spinner)
+  const [syncingCode, setSyncingCode] = useState<string | null>(null);
 
   const { data: tradesData } = useQuery({
     queryKey: qk.trades,
@@ -69,6 +91,20 @@ export function WatchlistPage() {
   const [addPrice, setAddPrice] = useState("");
   const [showAdd, setShowAdd] = useState(false);
 
+  // 平仓弹窗
+  const [closeTarget, setCloseTarget] = useState<ActivePosition | null>(null);
+  const [closePrice, setClosePrice] = useState("");
+  const [closeDate, setCloseDate] = useState("");
+  const [closeNote, setCloseNote] = useState("");
+  const [closeDiag, setCloseDiag] = useState<string | null>(null);
+
+  // promote(候选→持仓)弹窗
+  const [promoteTarget, setPromoteTarget] = useState<Candidate | null>(null);
+  const [promotePrice, setPromotePrice] = useState("");
+  const [promoteShares, setPromoteShares] = useState("");
+  const [promoteStop, setPromoteStop] = useState("");
+  const [promoteTargetPrice, setPromoteTargetPrice] = useState("");
+
   const submitAdd = (e?: React.FormEvent) => {
     e?.preventDefault();
     const tsCode = addCode.trim().toUpperCase();
@@ -77,7 +113,8 @@ export function WatchlistPage() {
     addCandidateMut.mutate(
       {
         ts_code: tsCode,
-        name: tsCode,
+        // 传空让后端 _resolve_name 查 tushare 补真名
+        name: "",
         trigger_price: price,
         note: `手动加候选 触发 ${price}`,
       },
@@ -140,6 +177,114 @@ export function WatchlistPage() {
     mut.mutate(payload, {
       onSuccess: () => setTradeTarget(null),
     });
+  };
+
+  // —— 平仓 —— 打开弹窗时预填当前价 + 今天日期
+  const openCloseForm = async (p: ActivePosition) => {
+    setCloseTarget(p);
+    setClosePrice("");
+    setCloseNote("");
+    setCloseDiag(null);
+    setCloseDate(new Date().toISOString().slice(0, 10));
+    // 预填当前价: 实时价优先, 回退日收盘
+    try {
+      const [rt, daily] = await Promise.all([
+        getPrices([p.ts_code]),
+        getDailyPrices([p.ts_code]),
+      ]);
+      const cur = rt?.[p.ts_code] ?? daily?.[p.ts_code] ?? null;
+      if (cur != null) setClosePrice(String(cur));
+    } catch {
+      /* 拿不到就让用户手填 */
+    }
+  };
+
+  const submitClose = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!closeTarget) return;
+    const price = Number(closePrice);
+    if (!price || !closeDate) return;
+    closeMut.mutate(
+      {
+        ts_code: closeTarget.ts_code,
+        exit_price: price,
+        exit_date: closeDate,
+        user_notes: closeNote || undefined,
+        // postmortem 后端默认 true, 跑 AI 复盘 + 校准
+      },
+      {
+        onSuccess: (resp) => {
+          setCloseDiag(resp.diagnosis ?? null);
+          // 保留弹窗展示 diagnosis, 但清掉 target 防止重复提交;
+          // 用户看完 diagnosis 点关闭清场
+          setCloseTarget(null);
+        },
+      },
+    );
+  };
+
+  // —— 候选归档 —— 直接调, 软删除(reason=manual)
+  const handleArchive = (c: Candidate) => {
+    if (!window.confirm(`归档候选 ${c.name || c.ts_code}? (软删除, 可在归档区找回)`))
+      return;
+    archiveMut.mutate({ ts_code: c.ts_code, reason: "manual", section: "candidates" });
+  };
+
+  // —— promote 候选→持仓 —— 打开弹窗预填候选 trigger_price / stop_advice / target_advice
+  const openPromoteForm = (c: Candidate) => {
+    setPromoteTarget(c);
+    setPromotePrice(c.trigger_price ? String(c.trigger_price) : "");
+    setPromoteShares("100");
+    setPromoteStop(c.stop_advice ? String(c.stop_advice) : "");
+    setPromoteTargetPrice(c.target_advice ? String(c.target_advice) : "");
+  };
+
+  const submitPromote = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!promoteTarget) return;
+    const entry = Number(promotePrice);
+    const shares = Number(promoteShares);
+    const stop = Number(promoteStop);
+    const target = Number(promoteTargetPrice);
+    if (!entry || !shares || !stop || !target) return;
+    promoteMut.mutate(
+      { ts_code: promoteTarget.ts_code, entry_price: entry, shares, stop_loss: stop, target },
+      { onSuccess: () => setPromoteTarget(null) },
+    );
+  };
+
+  // —— 同步 AI advice —— 拉最近一次 AI 分析, 用其 price_advice 覆盖持仓 stop_loss/target
+  const handleSyncAi = async (p: ActivePosition) => {
+    setSyncingCode(p.ts_code);
+    try {
+      const latest = await getLatestJournal(p.ts_code);
+      if (!latest || !latest.price_advice) {
+        window.alert(`${p.name || p.ts_code} 暂无 AI 分析记录, 无法同步`);
+        return;
+      }
+      const pa = latest.price_advice;
+      const stop = pa.stop_loss ?? null;
+      const target = pa.target ?? null;
+      if (stop == null && target == null) {
+        window.alert(`${p.name || p.ts_code} 最近 AI 分析未给出止损/目标`);
+        return;
+      }
+      adviceMut.mutate(
+        {
+          ts_code: p.ts_code,
+          stop_loss: stop ?? undefined,
+          target: target ?? undefined,
+          calibrated_confidence: latest.calibrated_confidence,
+        },
+        {
+          onError: (e) => window.alert(`同步失败 · ${String(e)}`),
+        },
+      );
+    } catch (e) {
+      window.alert(`拉取 AI 分析失败 · ${String(e)}`);
+    } finally {
+      setSyncingCode(null);
+    }
   };
 
   return (
@@ -373,6 +518,9 @@ export function WatchlistPage() {
                         position={p}
                         onAdd={(pos) => openTradeForm(pos, "buy")}
                         onReduce={(pos) => openTradeForm(pos, "sell")}
+                        onClose={openCloseForm}
+                        onSyncAi={handleSyncAi}
+                        syncing={syncingCode === p.ts_code}
                       />
                     ))}
                   </div>
@@ -400,7 +548,12 @@ export function WatchlistPage() {
                 <CardContent className="pt-0">
                   <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
                     {data.candidates.map((c) => (
-                      <CompactCandidateCard key={c.ts_code} candidate={c} />
+                      <CompactCandidateCard
+                        key={c.ts_code}
+                        candidate={c}
+                        onArchive={handleArchive}
+                        onPromote={openPromoteForm}
+                      />
                     ))}
                   </div>
                 </CardContent>
@@ -472,6 +625,176 @@ export function WatchlistPage() {
           </p>
         </CardContent>
       </Card>
+
+      {/* 平仓弹窗: 输成交价/日期/备注, 提交后展示 AI 复盘 diagnosis */}
+      <Dialog
+        open={closeTarget !== null || closeDiag !== null}
+        onClose={() => {
+          setCloseTarget(null);
+          setCloseDiag(null);
+        }}
+        busy={closeMut.isPending}
+        title={
+          <span>
+            平仓 <span className="num text-text-secondary">{closeTarget?.ts_code}</span>
+          </span>
+        }
+      >
+        {closeDiag !== null ? (
+          // 提交成功 → 展示 AI 复盘, 关闭清场
+          <div className="space-y-3">
+            <p className="text-sm text-up">✓ 已平仓, AI 复盘如下:</p>
+            <p className="whitespace-pre-wrap text-sm text-text-primary">{closeDiag}</p>
+            <div className="flex justify-end">
+              <Button variant="primary" size="sm" onClick={() => setCloseDiag(null)}>
+                知道了
+              </Button>
+            </div>
+          </div>
+        ) : closeTarget ? (
+          <form onSubmit={submitClose} className="space-y-3">
+            <p className="text-xs text-flat">
+              {closeTarget.name} · 当前持仓 {closeTarget.position_size_shares ?? "—"} 股
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">成交价 *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={closePrice}
+                  onChange={(e) => setClosePrice(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  autoFocus
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">成交日期 *</label>
+                <input
+                  type="date"
+                  value={closeDate}
+                  onChange={(e) => setCloseDate(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  required
+                />
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-text-secondary">备注</label>
+              <input
+                type="text"
+                value={closeNote}
+                onChange={(e) => setCloseNote(e.target.value)}
+                placeholder="可选"
+                className="w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+              />
+            </div>
+            {closeMut.isError && (
+              <p className="text-xs text-down">失败 · {String(closeMut.error)}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setCloseTarget(null)}
+                disabled={closeMut.isPending}
+              >
+                取消
+              </Button>
+              <Button type="submit" variant="primary" size="sm" disabled={closeMut.isPending}>
+                {closeMut.isPending ? "平仓中..." : "确认平仓"}
+              </Button>
+            </div>
+          </form>
+        ) : null}
+      </Dialog>
+
+      {/* promote 弹窗: 候选→持仓, 预填候选 trigger_price/stop_advice/target_advice */}
+      <Dialog
+        open={promoteTarget !== null}
+        onClose={() => setPromoteTarget(null)}
+        busy={promoteMut.isPending}
+        title={
+          <span>
+            候选转持仓 <span className="num text-text-secondary">{promoteTarget?.ts_code}</span>
+          </span>
+        }
+      >
+        {promoteTarget && (
+          <form onSubmit={submitPromote} className="space-y-3">
+            <p className="text-xs text-flat">
+              {promoteTarget.name} · 候选已成交, 用实际成交价转持仓。候选会被归档为
+              archived_promoted。
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">成交价 *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={promotePrice}
+                  onChange={(e) => setPromotePrice(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  autoFocus
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">股数 *</label>
+                <input
+                  type="number"
+                  step="100"
+                  value={promoteShares}
+                  onChange={(e) => setPromoteShares(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">止损 *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={promoteStop}
+                  onChange={(e) => setPromoteStop(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  required
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-text-secondary">目标 *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={promoteTargetPrice}
+                  onChange={(e) => setPromoteTargetPrice(e.target.value)}
+                  className="num w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  required
+                />
+              </div>
+            </div>
+            {promoteMut.isError && (
+              <p className="text-xs text-down">失败 · {String(promoteMut.error)}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setPromoteTarget(null)}
+                disabled={promoteMut.isPending}
+              >
+                取消
+              </Button>
+              <Button type="submit" variant="primary" size="sm" disabled={promoteMut.isPending}>
+                {promoteMut.isPending ? "转入中..." : "确认转持仓"}
+              </Button>
+            </div>
+          </form>
+        )}
+      </Dialog>
     </div>
   );
 }

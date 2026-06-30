@@ -33,6 +33,7 @@ export function JournalPage() {
     return entries.filter((e) => {
       const hay = [
         String(e.ts_code ?? ""),
+        String(e.name ?? ""),
         String(e.verdict ?? ""),
         String(e.analysis_text ?? ""),
       ].join(" ").toUpperCase();
@@ -58,7 +59,7 @@ export function JournalPage() {
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="按 ts_code / verdict / 分析内容过滤"
+              placeholder="按代码 / 名称 / verdict / 分析内容过滤"
               className="flex-1 bg-transparent text-sm focus:outline-none"
             />
             <span className="num text-xs text-flat">{filtered.length} 条</span>
@@ -98,6 +99,11 @@ export function JournalPage() {
                 const pa = (e.price_advice ?? {}) as Record<string, unknown>;
                 const at = String(e.analyzed_at ?? e.date ?? "");
                 const text = String(e.analysis_text ?? "");
+                const name = String(e.name ?? "");
+                const hasPrice =
+                  fmtOrDash(pa.entry) !== "—" ||
+                  fmtOrDash(pa.stop_loss) !== "—" ||
+                  fmtOrDash(pa.target) !== "—";
                 return (
                   <button
                     key={`${e.ts_code}-${at}-${i}`}
@@ -106,17 +112,31 @@ export function JournalPage() {
                     className="flex w-full items-start justify-between gap-3 py-3 text-left hover:bg-bg-base"
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
+                      {/* 代码 + 中文名 + 时间 */}
+                      <div className="flex items-baseline gap-2">
                         <span className="num text-sm font-medium text-text-primary">
                           {String(e.ts_code ?? "")}
                         </span>
-                        <span className="num text-[11px] text-flat">{at}</span>
+                        {name && (
+                          <span className="truncate text-sm text-text-primary">
+                            {name}
+                          </span>
+                        )}
+                        <span className="num ml-auto shrink-0 text-[11px] text-flat">
+                          {at}
+                        </span>
                       </div>
-                      <p className="mt-0.5 line-clamp-1 text-xs text-text-secondary">
+                      {/* 价格信息(重点): 入场 / 止损 / 目标 */}
+                      {hasPrice && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                          <PriceChip label="入场" value={pa.entry} tone="neutral" />
+                          <PriceChip label="止损" value={pa.stop_loss} tone="down" />
+                          <PriceChip label="目标" value={pa.target} tone="up" />
+                        </div>
+                      )}
+                      {/* AI 分析结论 */}
+                      <p className="mt-1 line-clamp-2 text-xs text-text-secondary">
                         {text || "—"}
-                      </p>
-                      <p className="num mt-0.5 text-[11px] text-flat">
-                        入场 {fmtOrDash(pa.entry)} · 止损 {fmtOrDash(pa.stop_loss)} · 目标 {fmtOrDash(pa.target)}
                       </p>
                     </div>
                     <div className="flex flex-col items-end gap-0.5">
@@ -141,6 +161,9 @@ export function JournalPage() {
           selected ? (
             <span className="flex items-center gap-2">
               <span className="num">{String(selected.ts_code ?? "")}</span>
+              {String(selected.name ?? "") && (
+                <span className="text-sm">{String(selected.name ?? "")}</span>
+              )}
               <span className="num text-xs text-flat">
                 {String(selected.analyzed_at ?? selected.date ?? "")}
               </span>
@@ -213,4 +236,35 @@ function fmtOrDash(v: unknown): string {
   if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);
   return Number.isFinite(n) ? String(n) : String(v);
+}
+
+/** 价格小徽章: 入场/止损/目标。A 股惯例 红涨绿跌。— 表示该价位缺失(非看多方向占位)。 */
+function PriceChip({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: unknown;
+  tone: "neutral" | "up" | "down";
+}) {
+  const s = fmtOrDash(value);
+  const isDash = s === "—";
+  const toneCls =
+    tone === "up"
+      ? "text-up"
+      : tone === "down"
+        ? "text-down"
+        : "text-text-secondary";
+  return (
+    <span
+      className={cn(
+        "num inline-flex items-center gap-0.5 rounded bg-bg-base px-1.5 py-0.5 text-[11px]",
+        isDash ? "text-flat" : toneCls,
+      )}
+    >
+      <span className="text-flat">{label}</span>
+      <span>{s}</span>
+    </span>
+  );
 }

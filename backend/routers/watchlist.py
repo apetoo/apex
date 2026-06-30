@@ -25,6 +25,7 @@ from backend.schemas.watchlist import (
     PromoteCandidateRequest,
     ReplacePositionRequest,
     SellRequest,
+    UpdateAdviceRequest,
 )
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
@@ -92,6 +93,21 @@ def replace_position(req: ReplacePositionRequest):
         strategy=req.strategy,
     )
     return {"message": "Position replaced", "ts_code": ts_code}
+
+
+@router.post("/positions/{ts_code}/advice")
+def update_advice(ts_code: str, req: UpdateAdviceRequest):
+    """更新持仓止损/目标(覆盖写)。用于手动持仓同步最近一次 AI 分析的 advice。
+
+    路径 ts_code 与 body ts_code 应一致; 以路径为准(已 normalize)。"""
+    code = data_mod.normalize_ts_code(ts_code)
+    pos = wl.update_advice(
+        ts_code=code,
+        stop_loss=req.stop_loss,
+        target=req.target,
+        calibrated_confidence=req.calibrated_confidence,
+    )
+    return {"message": "Advice updated", "position": pos}
 
 
 @router.post("/candidates")

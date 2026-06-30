@@ -516,6 +516,32 @@ def get_stock_info(ts_code: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+# 进程级全量 ts_code→name 缓存。一次 stock_basic 调用拿全 A 股(~5k 行),
+# 供 /journal 列表给历史分析条目补中文名用。失败返回 {} 走兜底。
+_NAME_MAP_CACHE: Optional[dict] = None
+
+
+def get_name_map() -> dict:
+    """全量 ts_code→中文名 映射(进程级缓存, 一次 tushare 调用)。失败返回 {}。"""
+    global _NAME_MAP_CACHE
+    if _NAME_MAP_CACHE is not None:
+        return _NAME_MAP_CACHE
+    try:
+        pro = _tushare()
+        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
+        if df is None or df.empty:
+            _NAME_MAP_CACHE = {}
+        else:
+            _NAME_MAP_CACHE = {
+                str(r["ts_code"]): str(r["name"])
+                for _, r in df.iterrows()
+                if r.get("ts_code") and r.get("name")
+            }
+    except Exception:
+        _NAME_MAP_CACHE = {}
+    return _NAME_MAP_CACHE
+
+
 def get_realtime_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
     """Batch fetch intraday real-time price from Sina Finance (one HTTP call, bypasses proxy)."""
     import re

@@ -8,6 +8,7 @@ import {
   archiveEntry,
   buy,
   sell,
+  updateAdvice,
   type AddCandidatePayload,
   type AddPositionPayload,
   type PromotePayload,
@@ -17,6 +18,7 @@ import {
   type SellPayload,
   type BuyResponse,
   type SellResponse,
+  type UpdateAdvicePayload,
 } from "./watchlist";
 import { qk } from "./query-keys";
 
@@ -45,9 +47,10 @@ const INVALIDATE: Record<string, string[][]> = {
     [...qk.triggers],
     [...qk.closed],
   ],
-  // 平仓 → 影响最大(触发 postmortem + calibration)
+  // 平仓 → 影响最大(触发 postmortem + calibration); close_position 现在也写 sell trade, 故失效 trades
   closePosition: [
     [...qk.watchlist],
+    [...qk.trades],
     [...qk.account],
     [...qk.closed],
     [...qk.calibration],
@@ -66,6 +69,8 @@ const INVALIDATE: Record<string, string[][]> = {
   ],
   // 归档 → watchlist + triggers
   archiveEntry: [[...qk.watchlist], [...qk.triggers]],
+  // 更新止损/目标(advice) → 只影响 watchlist(持仓卡显示)
+  updateAdvice: [[...qk.watchlist]],
 };
 
 function invalidateAll(
@@ -169,5 +174,21 @@ export function useArchiveEntry(): UseMutationResult<
   return useMutation({
     mutationFn: archiveEntry,
     onSuccess: () => invalidateAll(qc, "archiveEntry"),
+  });
+}
+
+/**
+ * 同步 AI advice 到持仓: 调用方先 getLatestJournal 拿到 stop_loss/target,
+ * 再用本 mutation 覆盖写入。变量是 { ts_code, ...payload }, 包一层适配 react-query 单参 mutationFn。
+ */
+export function useUpdateAdvice(): UseMutationResult<
+  { message: string; position: unknown },
+  Error,
+  UpdateAdvicePayload
+> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars) => updateAdvice(vars.ts_code, vars),
+    onSuccess: () => invalidateAll(qc, "updateAdvice"),
   });
 }

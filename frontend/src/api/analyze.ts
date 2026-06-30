@@ -221,6 +221,41 @@ export async function getJournal(tsCode: string): Promise<unknown[]> {
 }
 
 /**
+ * GET /api/journal/{ts_code}/latest — 最近一条 AI 分析记录。无记录返回 null。
+ *
+ * 返回 verdict entry(形状见 apex/analyze.py:run),其中 price_advice 含
+ * entry/stop_loss/target。用于手动持仓同步 AI advice。
+ */
+export interface LatestJournal {
+  ts_code: string;
+  analyzed_at?: string;
+  verdict?: string;
+  calibrated_confidence?: number;
+  price_advice?: {
+    entry?: number | null;
+    stop_loss?: number | null;
+    target?: number | null;
+  };
+}
+
+export async function getLatestJournal(
+  tsCode: string,
+): Promise<LatestJournal | null> {
+  if (USE_MOCK) {
+    return {
+      ts_code: tsCode,
+      analyzed_at: "2026-06-24T10:30:00",
+      verdict: "偏多",
+      calibrated_confidence: 3.5,
+      price_advice: { entry: 66.04, stop_loss: 60.71, target: 72.0 },
+    };
+  }
+  return api.get<LatestJournal | null>(
+    `/journal/${encodeURIComponent(tsCode)}/latest`,
+  );
+}
+
+/**
  * GET /api/trace/{ts_code}/{analyzed_at} — 某次分析的完整事件流(trace.jsonl)。
  *
  * 回放历史分析过程用。无记录返回 null(早期分析未落 trace / save=False)。

@@ -1,4 +1,4 @@
-import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert, X, Sparkles } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { PriceTag } from "@/components/a-share";
 import { getPrices, getDailyPrices } from "@/api/market";
@@ -20,10 +20,17 @@ export function CompactPositionCard({
   position,
   onAdd,
   onReduce,
+  onClose,
+  onSyncAi,
+  syncing,
 }: {
   position: ActivePosition;
   onAdd?: (p: ActivePosition) => void;
   onReduce?: (p: ActivePosition) => void;
+  onClose?: (p: ActivePosition) => void;
+  /** 同步最近 AI 分析的止损/目标(覆盖)。通常手动持仓缺 advice 时显示。 */
+  onSyncAi?: (p: ActivePosition) => void;
+  syncing?: boolean;
 }) {
   const { ts_code, name, entry_price, avg_cost, stop_loss, target, position_size_shares, strategy } =
     position;
@@ -125,7 +132,7 @@ export function CompactPositionCard({
       </div>
 
       {/* 操作按钮(可选) */}
-      {(onAdd || onReduce) && (
+      {(onAdd || onReduce || onClose || onSyncAi) && (
         <div className="mt-2 flex items-center gap-1.5">
           {onAdd && (
             <button
@@ -143,6 +150,28 @@ export function CompactPositionCard({
               className="rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base"
             >
               减仓
+            </button>
+          )}
+          {onSyncAi && (
+            <button
+              type="button"
+              onClick={() => onSyncAi(position)}
+              disabled={syncing}
+              className="inline-flex items-center gap-0.5 rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base disabled:opacity-50"
+              title="用最近一次 AI 分析的止损/目标覆盖当前值"
+            >
+              <Sparkles className="h-3 w-3" />
+              {syncing ? "同步中..." : "同步AI"}
+            </button>
+          )}
+          {onClose && (
+            <button
+              type="button"
+              onClick={() => onClose(position)}
+              className="ml-auto inline-flex items-center gap-0.5 rounded border border-down/30 px-2 py-0.5 text-[11px] text-down hover:bg-down/5"
+            >
+              <X className="h-3 w-3" />
+              平仓
             </button>
           )}
         </div>

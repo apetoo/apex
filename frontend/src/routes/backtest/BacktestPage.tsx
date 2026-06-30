@@ -35,7 +35,6 @@ import {
   type AggregateBucket,
   type AggregateResult,
   type PortfolioResult,
-  type BacktestReviewResult,
   type ReviewSeverity,
   type WeightHint,
 } from "@/api/backtest";

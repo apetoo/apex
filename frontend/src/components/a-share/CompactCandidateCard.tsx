@@ -1,4 +1,4 @@
-import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert } from "lucide-react";
+import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { PriceTag } from "@/components/a-share";
 import { getPrices } from "@/api/market";
@@ -13,7 +13,15 @@ import type { Candidate } from "@/api/watchlist";
  * 距触发距离配色: 未触发灰 / 接近触发(|pct|<2)黄 / 已触发红字+浅红底。
  * 红涨绿跌铁律: 触发=利好 → 用 up(红) 表达已触发。
  */
-export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
+export function CompactCandidateCard({
+  candidate,
+  onArchive,
+  onPromote,
+}: {
+  candidate: Candidate;
+  onArchive?: (c: Candidate) => void;
+  onPromote?: (c: Candidate) => void;
+}) {
   const { ts_code, name, trigger_price, trigger_direction, stop_advice, target_advice } =
     candidate;
   const hasZone =
@@ -131,6 +139,32 @@ export function CompactCandidateCard({ candidate }: { candidate: Candidate }) {
           </div>
         )}
       </div>
+
+      {/* 操作按钮(可选): 转持仓 / 归档 */}
+      {(onPromote || onArchive) && (
+        <div className="mt-2 flex items-center gap-1.5">
+          {onPromote && (
+            <button
+              type="button"
+              onClick={() => onPromote(candidate)}
+              className="inline-flex items-center gap-0.5 rounded border border-up/30 px-2 py-0.5 text-[11px] text-up hover:bg-up/5"
+            >
+              <ArrowUpCircle className="h-3 w-3" />
+              转持仓
+            </button>
+          )}
+          {onArchive && (
+            <button
+              type="button"
+              onClick={() => onArchive(candidate)}
+              className="ml-auto inline-flex items-center gap-0.5 rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base"
+            >
+              <Archive className="h-3 w-3" />
+              归档
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
