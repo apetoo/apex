@@ -8,10 +8,15 @@ Backtest module — 四种视图:
 5. run_portfolio():   组合级净值 — 全部信号喂进单个 vectorbt Portfolio（共享资金池），产出净值曲线。
 
 A股成本模型（可配, config.backtest.costs）:
-  佣金 万2.5（双向）+ 印花税 千1（卖出） → 来回约 0.15%。
+  佣金 万2.5（双向）+ 印花税 千1（卖出）+ 滑点 10bp（双边） → 来回约 0.35%。
+  小盘股流动性差，滑点不可略（否则系统性高估收益）。
 T+1 真实入场建模:
   信号日为 bar[0]，bar[1] **开盘价**入场（涨停封板/一字板 → unfillable，剔除出胜率分母并单列计数）。
+  跌停封板卖不出：SL 触发当天若一字跌停，实盘卖不掉 → 顺延到下一非封板 bar 收盘退出，标 stop_hit_limit_locked（涨停封板你能卖，买盘充裕，故只修跌停方向）。
   基准对比窗口用实际 fill_date（非信号日），消除固定方向偏置。
+生存者偏差兜底:
+  信号日 + T+1 两根 bar 即模拟（不再 <3 静默丢弃）；持仓窗口被截断（退市/长期停牌）按最后一根收盘退出，标 data_truncated，
+  收益自然反映亏损；连 T+1 都没有才计 no_fill_bar（报告但不丢）。
 """
 from datetime import datetime, timedelta
 from typing import Optional
@@ -25,7 +30,11 @@ from apex.schemas import BULLISH_VERDICTS
 
 _BENCHMARK_CODE = "000300.SH"
 
-_BULLISH_KEYWORDS = ["看多", "偏多", "多", "反弹", "建仓", "加仓"]
+# 看多关键词兜底（仅在 verdict 非 BULLISH_VERDICTS 枚举时触发，处理旧数据/异常 verdict）。
+# 不含单字"多"——会误伤"多空交织""多方减弱"等中性/偏空表述。
+# 用明确动作词，并配合 _BEAR_KEYWORDS 排除。
+_BULLISH_KEYWORDS = ["看多", "偏多", "反弹", "建仓", "加仓"]
+_BEAR_KEYWORDS = ["偏空", "看空", "空", "减弱", "观望", "震荡"]
 
 # sharpe 需要足够样本才有统计意义；短窗口(<20 bar)直接返回 None，避免误导
 _SHARPE_MIN_BARS = 20
@@ -33,22 +42,35 @@ _SHARPE_MIN_BARS = 20
 
 # ── 配置 & 成本 ───────────────────────────────────────────────────────────────
 
-def _costs() -> tuple[float, float, float]:
-    """从 config 读成本率；缺失时回退默认（万2.5双向佣金 + 千1印花税）。"""
+def _costs() -> tuple[float, float, float, float]:
+    """从 config 读成本率；缺失时回退默认（万2.5双向佣金 + 千1印花税 + 10bp 单边滑点）。
+
+    返回 (commission_rate, stamp_duty_rate, round_trip_cost, slippage)。
+    round_trip_cost = 佣金来回 + 印花税卖出（不含滑点，滑点由 vbt slippage 参数 / _apply_costs 单独处理）。
+    """
     cfg = config.get()
     c = (cfg.get("backtest") or {}).get("costs") or {}
     commission = float(c.get("commission_rate", 0.00025))
     stamp = float(c.get("stamp_duty_rate", 0.001))
-    return commission, stamp, commission * 2 + stamp
+    slippage = float(c.get("slippage", 0.001))
+    return commission, stamp, commission * 2 + stamp, slippage
 
 
 def _round_trip_cost() -> float:
     return _costs()[2]
 
 
+def _slippage() -> float:
+    return _costs()[3]
+
+
 def _apply_costs(gross_return: float) -> float:
-    """Deduct A-share round-trip costs: commission both ways + stamp duty on sell."""
-    return gross_return - _round_trip_cost()
+    """Deduct A-share round-trip costs: commission both ways + stamp duty on sell + slippage both ways.
+
+    滑点双边（买入踩高 + 卖出踩低），小盘股流动性差时这是真实成本——略去会系统性高估收益。
+    """
+    _commission, _stamp, rtc, slip = _costs()
+    return gross_return - rtc - 2 * slip
 
 
 def _limit_pct(ts_code: str) -> float:
@@ -69,7 +91,7 @@ def _is_bullish(verdict: str) -> bool:
     if verdict in BULLISH_VERDICTS:
         return True
     has_bull = any(kw in verdict for kw in _BULLISH_KEYWORDS)
-    has_bear = any(kw in verdict for kw in ["偏空", "看空"])
+    has_bear = any(kw in verdict for kw in _BEAR_KEYWORDS)
     return has_bull and not has_bear
 
 
@@ -236,19 +258,35 @@ def run_realized(closed: Optional[list] = None) -> pd.DataFrame:
 
 # ── 信号模拟回测：内核 ────────────────────────────────────────────────────────
 
+def _limit_down_locked(prev_close: float, low: float, high: float, close: float,
+                       limit: float) -> bool:
+    """该 bar 是否一字跌停封板（low==high==close 且 ≈ 前收*(1-limit)）。
+
+    跌停封板时卖盘堆积、买盘稀少，实盘**卖不掉**——SL 触发当天若遇此情形，
+    回测不能按 stop_price 成交（否则单边乐观，只剔"买不进的赢"不剔"卖不出的亏"）。
+    涨停封板相反（买盘堆积），你能卖，故只判跌停方向。
+    """
+    limit_down_price = prev_close * (1 - limit)
+    return (low == high == close) and (close <= limit_down_price + 1e-4)
+
+
 def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                   include_benchmark: bool) -> Optional[dict]:
     """单条信号 × 单持有期 → 一行结果。
 
     bars: DataFrame, index=trade_date(datetime, 升序), 需含 open/high/low/close。
-          取 [:holding_period+1] 作为窗口（信号日 + T+1 入场 + 出场）。
-    返回结果 dict；数据不足(<3 bar)返回 None。
+          取 [:holding_period+2] 作为窗口（信号日 + T+1 入场 + 出场）。
+    返回结果 dict；连 T+1 fill bar 都没有（<2 bar）返回 None。
     unfillable（涨停买不进）返回带 unfillable=True 的行，net_return=None。
+
+    生存者偏差兜底：只要有信号日 + T+1 两根 bar 就模拟。持仓窗口被截断
+    （退市/长期停牌导致 bars 不足 hp+2）→ 按最后一根收盘退出，标 data_truncated，
+    收益自然反映亏损，不再静默丢弃最亏的案例。
     """
     code = entry["ts_code"]
     # 窗口 = 信号日(bar0) + T+1 入场(bar1) + 持有 N 天 → 出场(bar N+1)，共 N+2 根。
     window = bars.iloc[:holding_period + 2]
-    if len(window) < 3:  # 至少 信号日 + 入场 + 出场
+    if len(window) < 2:  # 连 T+1 fill bar 都没有 → 无法成交（停牌/缺数据），交由上层计 no_fill_bar
         return None
 
     prev_close = float(window["close"].iloc[0])
@@ -265,6 +303,8 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
 
     fill_price = t1_open
     fill_date = window.index[1].strftime("%Y-%m-%d")
+    # 窗口截断（退市/停牌）→ 退出日是最后一根可得 bar，而非完整持有期
+    truncated = len(window) < holding_period + 2
     exit_date = window.index[-1].strftime("%Y-%m-%d")
 
     base = {
@@ -281,6 +321,7 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
         "holding_period": holding_period,
         "has_features": bool(entry.get("features")),
         "unfillable": False,
+        "truncated": truncated,
     }
 
     if unfillable:
@@ -331,33 +372,60 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
             init_cash=10000,
             sl_stop=sl_frac if not np.isnan(sl_frac) else None,
             tp_stop=tp_frac if not np.isnan(tp_frac) else None,
+            # 滑点不喂 vbt：统一由 _apply_costs 扣（双边），避免 vbt 内部扣一次 + _apply_costs 再扣一次的双扣。
+            # vbt total_return() 因此是毛收益（无费用），_apply_costs 一次性加 佣金来回+印花税+滑点双边。
             freq="D",
         )
-        total_return = _apply_costs(float(pf.total_return()))
+        total_return = float(pf.total_return())
         max_dd = float(pf.max_drawdown())
         if len(close) > _SHARPE_MIN_BARS:
             sharpe = float(pf.sharpe_ratio())
     except Exception:
         if fill_price > 0:
             gross = (float(close.iloc[-1]) - fill_price) / fill_price
-            total_return = _apply_costs(gross)
+            total_return = gross
 
     if total_return is None:
         return None
 
-    # 退出归因 + 偏移(MAE/MFE)：首根触及 SL/TP 的 bar，否则持有到末根(time_stop)。
-    # 用价格动作判定，与 vbt 实际退出在罕见同根/gap 情况下可能微偏，但诊断语义（"止损被触过"）更准。
+    # ── 退出归因 + 跌停封板顺延 + 偏移(MAE/MFE) ──
+    # 首根触及 SL/TP 的 bar，否则持有到末根。截断窗口 → data_truncated。
+    # 跌停封板顺延：SL 触发的 bar 若一字跌停（卖不出），不顺应该 bar 成交，
+    # 继续往后找第一个非封板 bar 的收盘退出；找不到则按末根收盘。重算该笔收益
+    # 覆盖 vbt 的 stop_price 成交价（vbt 不建模跌停锁单）。语义：止损被触过但卖不掉。
     stop_price = fill_price * (1 - sl_frac) if not np.isnan(sl_frac) else None
     target_price = fill_price * (1 + tp_frac) if not np.isnan(tp_frac) else None
     exit_pos = len(window) - 1
-    exit_reason = "time_stop"
+    exit_reason = "data_truncated" if truncated else "time_stop"
     for i in range(1, len(window)):
         lo = float(low_.iloc[i])
         hi = float(high_.iloc[i])
+        cl = float(close.iloc[i])
         if stop_price is not None and lo <= stop_price:
-            exit_reason = "stop_hit"; exit_pos = i; break
+            bar_prev_close = float(close.iloc[i - 1])  # i>=1 恒成立
+            if _limit_down_locked(bar_prev_close, lo, hi, cl, limit):
+                # 顺延：找 i 之后第一个非一字跌停的 bar 收盘退出
+                deferred = None
+                for j in range(i + 1, len(window)):
+                    j_prev = float(close.iloc[j - 1])
+                    if not _limit_down_locked(j_prev, float(low_.iloc[j]),
+                                              float(high_.iloc[j]),
+                                              float(close.iloc[j]), limit):
+                        deferred = j
+                        break
+                exit_pos = deferred if deferred is not None else len(window) - 1
+                exit_reason = "stop_hit_limit_locked"
+                defer_close = float(close.iloc[exit_pos])
+                total_return = (defer_close - fill_price) / fill_price  # 毛收益，下方统一 _apply_costs
+            else:
+                exit_reason = "stop_hit"; exit_pos = i
+            break
         if target_price is not None and hi >= target_price:
             exit_reason = "target_hit"; exit_pos = i; break
+
+    # 统一扣成本（佣金来回 + 印花税 + 滑点双边）；vbt 路径与跌停顺延路径口径一致
+    total_return = _apply_costs(total_return)
+
     hold = window.iloc[1:exit_pos + 1]
     if fill_price > 0 and len(hold) > 0:
         mae = float(((hold["low"].astype(float) / fill_price) - 1).min())
@@ -424,31 +492,52 @@ def _prefetch_signals(codes, entries, holding_period: int) -> None:
 
 
 def _run_entries(long_entries: list, holding_period: int,
-                 include_benchmark: bool) -> tuple[list, int]:
-    """对一批多头信号逐条模拟，返回 (所有行含 unfillable, unfillable_count)。
+                 include_benchmark: bool) -> tuple[list, dict]:
+    """对一批多头信号逐条模拟，返回 (所有行含 unfillable/truncated, counts)。
 
-    既有 fillable 也有 unfillable 行（unfillable 行 net_return=None）。
-    run() 只取 fillable；aggregate/sweep 各取所需。
+    counts: {unfillable, truncated, no_fill_bar}
+      - unfillable: 涨停封板买不进（net_return=None）
+      - truncated:  窗口被截断（退市/停牌）但仍按最后收盘退出（net_return 有值，标 data_truncated）
+      - no_fill_bar: 连 T+1 fill bar 都没有（停牌/缺数据），无法成交，不进样本但计数（生存者偏差透明化）
+
+    run() 只取 fillable；aggregate/sweep 各取所需。失败案例不再静默丢弃。
     """
     rows = []
-    unfillable_count = 0
+    counts = {"unfillable": 0, "truncated": 0, "no_fill_bar": 0}
     for entry in long_entries:
         entry_date = entry.get("date", "")
         if not entry_date:
             continue
         bars = _load_bars(entry["ts_code"], entry_date, holding_period)
-        if bars.empty or len(bars) < 3:
+        if bars.empty or len(bars) < 2:
+            # 连 T+1 fill bar 都没有：无法成交（停牌/退市当日即终/缺数据）。
+            # 不静默丢弃——计入 no_fill_bar，让 aggregate 透明披露多少信号因数据缺失无法回测。
+            counts["no_fill_bar"] += 1
             continue
         row = _simulate_one(entry, bars, holding_period, include_benchmark)
         if row is None:
+            counts["no_fill_bar"] += 1
             continue
         if row.get("unfillable"):
-            unfillable_count += 1
+            counts["unfillable"] += 1
+        if row.get("truncated"):
+            counts["truncated"] += 1
         rows.append(row)
-    return rows, unfillable_count
+    return rows, counts
 
 
 # ── 信号模拟回测：逐笔（保持旧契约） ──────────────────────────────────────────
+
+def load_long_entries(ts_code: Optional[str] = None) -> list:
+    """加载多头信号（journal → 筛 bullish → 同股同日去重）。
+
+    供 backtest_review 做 OOS 切分：先拿全部多头信号，按日期切 train/test，
+    再各自喂 aggregate(entries=...)。避免 review 重复实现 load/filter/dedupe。
+    """
+    entries = journal.load_entries(ts_code=ts_code)
+    long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+    return _dedupe_signals(long_entries)
+
 
 def run(ts_code: Optional[str] = None,
         lookforward_days: Optional[int] = None,
@@ -474,7 +563,7 @@ def run(ts_code: Optional[str] = None,
     codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
     _prefetch_signals(codes, long_entries, lookforward_days)
 
-    all_rows, _ = _run_entries(long_entries, lookforward_days, include_benchmark)
+    all_rows, _counts = _run_entries(long_entries, lookforward_days, include_benchmark)
     fillable = [r for r in all_rows if not r.get("unfillable")]
     return pd.DataFrame(fillable)
 
@@ -506,6 +595,7 @@ def run_sweep(ts_code: Optional[str] = None,
     per_signal = []
     # by_period 聚合
     agg: dict = {hp: {"n": 0, "fillable_n": 0, "unfillable_count": 0,
+                      "truncated_count": 0, "no_fill_bar": 0,
                       "wins": 0, "net_sum": 0.0, "dd_sum": 0.0, "dd_n": 0,
                       "excess_sum": 0.0, "excess_n": 0}
                  for hp in holding_periods}
@@ -516,11 +606,15 @@ def run_sweep(ts_code: Optional[str] = None,
         if not entry_date:
             continue
         bars = _load_bars(entry["ts_code"], entry_date, max_hp)
-        if bars.empty or len(bars) < 3:
+        if bars.empty or len(bars) < 2:
+            # 连 T+1 fill bar 都没有：所有 hp 都计 no_fill_bar（生存者偏差透明化）
+            for hp in holding_periods:
+                agg[hp]["no_fill_bar"] += 1
             continue
         for hp in holding_periods:
             row = _simulate_one(entry, bars, hp, include_benchmark)
             if row is None:
+                agg[hp]["no_fill_bar"] += 1
                 continue
             per_signal.append(row)
             a = agg[hp]
@@ -528,6 +622,8 @@ def run_sweep(ts_code: Optional[str] = None,
             if row.get("unfillable"):
                 a["unfillable_count"] += 1
                 continue
+            if row.get("truncated"):
+                a["truncated_count"] += 1
             a["fillable_n"] += 1
             if row.get("hit"):
                 a["wins"] += 1
@@ -548,6 +644,8 @@ def run_sweep(ts_code: Optional[str] = None,
             "n": a["n"],
             "fillable_n": fn,
             "unfillable_count": a["unfillable_count"],
+            "truncated_count": a["truncated_count"],
+            "no_fill_bar_count": a["no_fill_bar"],
             "win_rate": round(a["wins"] / fn, 4) if fn else None,
             "avg_net_return": round(a["net_sum"] / fn, 4) if fn else None,
             "avg_max_drawdown": round(a["dd_sum"] / a["dd_n"], 4) if a["dd_n"] else None,
@@ -625,25 +723,33 @@ def _slice_bucket(rows: list, key_fn) -> list:
 
 def aggregate(ts_code: Optional[str] = None,
               lookforward_days: Optional[int] = None,
-              include_benchmark: bool = True) -> dict:
+              include_benchmark: bool = True,
+              entries: Optional[list] = None) -> dict:
     """对 run() 的逐笔回测做切片聚合，回答"AI 自信时准不准"。
 
     优先用 calibrated_confidence 分桶（系统真正想验证的校准后置信度），回退 confidence。
-    输出: by_confidence_bucket / by_verdict / by_strategy(source) + unfillable 统计。
+    输出: by_confidence_bucket / by_verdict / by_strategy(source) + unfillable/truncated/no_fill_bar 统计。
     互补于 calibration.compute()（后者聚合真实平仓，本函数聚合模拟回测，样本量大）。
+
+    entries: 可选，外部传入已筛好的多头信号列表（跳过 journal.load_entries）。
+    供 backtest_review 的 OOS 切分：train/test 各自调 aggregate(entries=...)。
     """
     cfg = config.get()
     if lookforward_days is None:
         lookforward_days = cfg["backtest"]["lookforward_days"]
 
-    entries = journal.load_entries(ts_code=ts_code)
-    long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
-    long_entries = _dedupe_signals(long_entries)
+    if entries is None:
+        entries = journal.load_entries(ts_code=ts_code)
+        long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+        long_entries = _dedupe_signals(long_entries)
+    else:
+        # 外部传入（如 OOS 切分）— 已是多头信号；dedupe 幂等可重复跑
+        long_entries = _dedupe_signals(list(entries))
 
     codes = sorted({e["ts_code"] for e in long_entries if e.get("ts_code")})
     _prefetch_signals(codes, long_entries, lookforward_days)
 
-    all_rows, unfillable_count = _run_entries(long_entries, lookforward_days, include_benchmark)
+    all_rows, counts = _run_entries(long_entries, lookforward_days, include_benchmark)
     fillable = [r for r in all_rows if not r.get("unfillable")]
 
     def _conf_key(r):
@@ -653,7 +759,9 @@ def aggregate(ts_code: Optional[str] = None,
         "lookforward_days": lookforward_days,
         "total_signals": len(all_rows),
         "fillable_count": len(fillable),
-        "unfillable_count": unfillable_count,
+        "unfillable_count": counts["unfillable"],
+        "truncated_count": counts["truncated"],
+        "no_fill_bar_count": counts["no_fill_bar"],
         "by_confidence_bucket": _slice_bucket(fillable, _conf_key),
         "by_verdict": _slice_bucket(fillable, lambda r: r.get("verdict")),
         "by_strategy": _slice_bucket(fillable, lambda r: r.get("strategy") or "unknown"),
@@ -761,14 +869,14 @@ def run_portfolio(ts_code: Optional[str] = None,
                   lookforward_days: Optional[int] = None) -> dict:
     """全部多头信号喂进单个 vectorbt Portfolio（共享资金池）→ 单条净值曲线。
 
-    现金共享 + 按信号顺序仅空仓入场 + 固定持有期出场 + 佣金（印花税暂略，见注释）。
+    现金共享 + 按信号顺序仅空仓入场 + 固定持有期出场 + 佣金 + 印花税（round-trip）+ 滑点。
     这正是前端 ED11 注释里"想要但客户端累乘做不对"的组合级净值——并发持仓的资金占用/
     复利必须服务端用 vectorbt 算，不能客户端 ∏(1+r)。
     """
     cfg = config.get()
     if lookforward_days is None:
         lookforward_days = cfg["backtest"]["lookforward_days"]
-    commission, _stamp, _rtc = _costs()
+    commission, stamp, _rtc, slip = _costs()
 
     entries = journal.load_entries(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
@@ -800,8 +908,11 @@ def run_portfolio(ts_code: Optional[str] = None,
             cash_sharing=True,
             group_by=True,
             freq="D",
-            fees=commission,          # 双边佣金；印花税(卖出)暂略(vbt 无单边费率), 略低估成本
-            slippage=0.0,
+            # #2 成本补全：vbt 的 fees 每边各扣一次，印花税是单边（卖出）。
+            # 设 fees = commission + stamp/2 → 来回 = 2*commission + stamp，round-trip 正确
+            # （单边略偏：买入多扣 stamp/2，但组合回测只关心 round-trip 净值，可接受）。
+            fees=commission + stamp / 2,
+            slippage=slip,            # 单边滑点，vbt 买卖各扣一次（双边 2*slip）
         )
     except Exception as exc:
         print(f"⚠ run_portfolio vectorbt 失败: {type(exc).__name__}: {exc}")

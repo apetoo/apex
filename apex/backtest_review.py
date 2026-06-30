@@ -76,7 +76,8 @@ _TOOL = {
 
 _SYSTEM_PROMPT = """你是这个 A 股交易系统的回测复盘官。
 
-你将看到一批 AI 看多信号的模拟回测聚合统计（T+1 开盘入场、含佣金印花税、SL/TP intrabar 触发）。
+你将看到一批 AI 看多信号的模拟回测聚合统计（T+1 开盘入场、含佣金印花税滑点、SL/TP intrabar 触发、跌停封板顺延）。
+统计来自 TRAIN 期；最近一段 OOS 期由系统独立验证你的 weight_hint，样本内看着好但 OOS 亏的策略会被降级 hold。
 你的任务：从统计里诊断系统性问题，给出可执行改进，并产出一段将注入下次 analyze 的提醒。
 
 诊断维度（按数据说话，避免结果论）：
@@ -147,7 +148,85 @@ def _review_cfg() -> dict:
     return {
         "min_review_samples": int(bt.get("min_review_samples", 8)),
         "max_inject_age_days": int(bt.get("max_inject_age_days", 30)),
+        "oos_test_days": int(bt.get("oos_test_days", 30)),
     }
+
+
+def _oos_split(entries: list, oos_test_days: int) -> tuple[list, list, Optional[str]]:
+    """按日期切 train/test：最近 oos_test_days 天信号作 test，更早的作 train。
+
+    返回 (train, test, cutoff_date)。用 cutoff = max_date - oos_test_days；
+    信号 date 字符串字典序即日期序。test 为空（数据跨度太短）→ train=全部, test=[]。
+    """
+    dated = [e for e in entries if e.get("date")]
+    if not dated:
+        return list(entries), [], None
+    dates = sorted(e["date"] for e in dated)
+    max_date = dates[-1]
+    # 字符串日期减天数：转 datetime 算
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff_dt = _dt.strptime(max_date, "%Y-%m-%d") - _td(days=oos_test_days)
+        cutoff = cutoff_dt.strftime("%Y-%m-%d")
+    except Exception:
+        return list(entries), [], None
+    train = [e for e in entries if (e.get("date") or "") < cutoff]
+    test = [e for e in entries if (e.get("date") or "") >= cutoff]
+    # 防极端：train 空（几乎全在 test 窗）→ 退化为全量 train, 不做 OOS
+    if not train:
+        return list(entries), [], None
+    return train, test, cutoff
+
+
+def _gate_hints_with_oos(weight_hint: dict, agg_test: Optional[dict],
+                         min_samples: int) -> tuple[dict, list]:
+    """OOS 门控：用 test 集否决被样本内噪声误导的 weight_hint。
+
+    - hint=increase 但 test 该策略 avg_net_return<0 → 降级 hold（样本内看着好，样本外亏）
+    - hint=decrease 但 test avg_net_return>0 → 降级 hold（样本内看着差，样本外反而赚）
+    - test 缺该策略 / test 样本不足 → 不门控（保留 hint，标注 oos_insufficient）
+
+    返回 (gated_hint, per_strategy 验证明细)。
+    """
+    per_strategy: list = []
+    if not agg_test:
+        return dict(weight_hint), per_strategy
+
+    test_fillable = agg_test.get("fillable_count", 0)
+    test_by_strat = {b["key"]: b for b in agg_test.get("by_strategy", [])}
+    oos_insufficient = test_fillable < min_samples
+
+    gated = {}
+    for strat, hint in (weight_hint or {}).items():
+        tb = test_by_strat.get(strat)
+        test_net = tb.get("avg_net_return") if tb else None
+        survived = True
+        reason = "ok"
+        if not oos_insufficient and test_net is not None and hint in ("increase", "decrease"):
+            if hint == "increase" and test_net < 0:
+                gated[strat] = "hold"
+                survived = False
+                reason = "oos_negative_contradicts_increase"
+            elif hint == "decrease" and test_net > 0:
+                gated[strat] = "hold"
+                survived = False
+                reason = "oos_positive_contradicts_decrease"
+            else:
+                gated[strat] = hint
+        else:
+            gated[strat] = hint
+            reason = "oos_insufficient" if oos_insufficient else "no_test_data"
+        per_strategy.append({
+            "strategy": strat,
+            "hint_train": hint,
+            "hint_gated": gated[strat],
+            "test_n": tb.get("n") if tb else 0,
+            "test_win_rate": tb.get("win_rate") if tb else None,
+            "test_avg_net_return": test_net,
+            "survived_oos": survived,
+            "reason": reason,
+        })
+    return gated, per_strategy
 
 
 def load_prompt_injection() -> Optional[str]:
@@ -245,19 +324,34 @@ def review(ts_code: Optional[str] = None,
     api_key = cfg["deepseek"]["api_key"]
     if not api_key:
         raise BacktestReviewError("deepseek.api_key 未配置")
-
-    agg = backtest.aggregate(ts_code=ts_code, lookforward_days=lookforward_days)
     rc = _review_cfg()
+
+    # #7 OOS 反过拟合：按日期切 train/test。AI 只看 train 派生 weight_hint/prompt_injection，
+    # 代码用 test 做门控——train 里看着好但 test 里亏的策略，weight_hint 降级 hold，不反哺。
+    long_entries = backtest.load_long_entries(ts_code=ts_code)
+    train_entries, test_entries, cutoff = _oos_split(long_entries, rc["oos_test_days"])
+
+    agg = backtest.aggregate(lookforward_days=lookforward_days, entries=train_entries)
     if agg["fillable_count"] == 0:
         raise BacktestReviewError("无可成交信号，无法复盘")
     # #2 样本量门槛：小样本复盘无统计意义，结论会误导反哺
     if agg["fillable_count"] < rc["min_review_samples"]:
         raise BacktestReviewError(
-            f"可成交信号仅 {agg['fillable_count']} 笔，少于最小要求 "
+            f"train 可成交信号仅 {agg['fillable_count']} 笔，少于最小要求 "
             f"{rc['min_review_samples']}，复盘无统计意义"
         )
 
+    # test 集独立算（用于 OOS 门控）；test 为空 → oos_insufficient，不门控但标注
+    agg_test = None
+    if test_entries:
+        agg_test = backtest.aggregate(lookforward_days=lookforward_days, entries=test_entries)
+
     user_block = _format_stats(agg)
+    if cutoff:
+        user_block += (
+            f"\n\n（以上为 TRAIN 期统计，cutoff={cutoff}；最近 {rc['oos_test_days']} 天作 OOS 验证集，"
+            f"系统会用 OOS 集门控你的 weight_hint——样本内看着好但 OOS 亏的策略会被降级 hold。）"
+        )
     client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
     use_model = (
         model
@@ -306,7 +400,21 @@ def review(ts_code: Optional[str] = None,
         raise last_err or BacktestReviewError("AI 复盘失败")
 
     # #4a 强制样本门槛：n<3 的策略 weight_hint 一律 hold（代码兜底，不靠 AI 自律）
-    weight_hint = _sanitize_weight_hint(agg, ai_part.get("strategy_weight_hint") or {})
+    hint_after_n_gate = _sanitize_weight_hint(agg, ai_part.get("strategy_weight_hint") or {})
+    # #7 OOS 门控：用 test 集否决被样本内噪声误导的 hint
+    weight_hint, oos_per_strategy = _gate_hints_with_oos(
+        hint_after_n_gate, agg_test, rc["min_review_samples"])
+    n_downgraded = sum(1 for p in oos_per_strategy if not p["survived_oos"])
+
+    oos_validation = {
+        "oos_test_days": rc["oos_test_days"],
+        "cutoff": cutoff,
+        "train_fillable": agg["fillable_count"],
+        "test_fillable": agg_test["fillable_count"] if agg_test else 0,
+        "oos_insufficient": (not agg_test) or agg_test["fillable_count"] < rc["min_review_samples"],
+        "n_hints_downgraded": n_downgraded,
+        "per_strategy": oos_per_strategy,
+    }
 
     # 仅全局复盘（ts_code=None）落盘反哺：个股复盘(ts_code=X)只返回前端展示，
     # 不覆盖全局注入文件 / 策略统计（否则个股结论会污染全局反哺 —— 见 #3）。
@@ -320,6 +428,7 @@ def review(ts_code: Optional[str] = None,
         "strategy_weight_hint": weight_hint,
         "strategy_stats": persisted,
         "aggregate": agg,
+        "oos_validation": oos_validation,
         "model": use_model,
         "generated_at": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
     }
