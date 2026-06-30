@@ -18,6 +18,7 @@ export const qk = {
   dailyPrices: (codes: string[]) => ["market", "prices-daily", codes] as const,
   prevClose: (codes: string[]) => ["market", "prices-prev-close", codes] as const,
   stockDaily: (tsCode: string) => ["market", "stock", tsCode, "daily"] as const,
+  stockInfo: (tsCode: string) => ["market", "stock", tsCode, "info"] as const,
   intraday: (tsCode: string) => ["market", "intraday", tsCode] as const,
   indexDailyBatch: (codes: string[]) => ["market", "index-daily", codes] as const,
   indexRealtimeBatch: (codes: string[]) => ["market", "index-realtime", codes] as const,

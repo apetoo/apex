@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { History, Search, ChevronRight, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/base";
 import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PriceTag, TraceEventList } from "@/components/a-share";
 import { getJournal, getTrace } from "@/api/analyze";
-import { getPrices, getDailyPrices } from "@/api/market";
+import { getPrices, getDailyPrices, getStockInfo } from "@/api/market";
 import { qk } from "@/api/query-keys";
 import { useChatContext } from "@/hooks/useChatContext";
 import { cn } from "@/lib/utils";
@@ -22,7 +22,31 @@ import { cn } from "@/lib/utils";
  *
  * ED1: useSSE hook, 都关自动重连, 断流手动重试
  * ED2: setContext(verdict 摘要) → chat 呼出时自动注入
+ *
+ * 持久化: tsCode/committedCode/latestVerdict 存 sessionStorage, 切走再回不丢「已分析的结果」。
+ *   - 仅恢复本会话展示过的 verdict, 不主动从 journal 拉历史(避免首次进入就显示旧 verdict)。
+ *   - SSE 随路由 unmount 被 useSSE abort, 中途切走的不完整分析不恢复(只恢复已 done 的 verdict)。
  */
+
+const ANALYZE_STATE_KEY = "apex.analyze.state";
+
+interface PersistedAnalyzeState {
+  tsCode: string;
+  committedCode: string | null;
+  latestVerdict: Record<string, unknown> | null;
+}
+
+function loadPersistedState(): PersistedAnalyzeState | null {
+  try {
+    const raw = sessionStorage.getItem(ANALYZE_STATE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedAnalyzeState;
+    if (typeof parsed.tsCode !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
 
 /** 前端 ts_code 归一化(镜像后端 data.normalize_ts_code: 6→SH, 0/3→SZ, 4/8→BJ)。非法返回 null。 */
 function normalizeTsCode(raw: string): string | null {
@@ -37,13 +61,25 @@ function normalizeTsCode(raw: string): string | null {
 }
 
 export function AnalyzePage() {
-  const [tsCode, setTsCode] = useState("");
-  const [committedCode, setCommittedCode] = useState<string | null>(null);
-  const [latestVerdict, setLatestVerdict] = useState<Record<string, unknown> | null>(null);
+  // 仅 mount 时读一次 sessionStorage(切回页面时拿最新持久化值)。
+  const persisted = useMemo(() => loadPersistedState(), []);
+  const [tsCode, setTsCode] = useState(persisted?.tsCode ?? "");
+  const [committedCode, setCommittedCode] = useState<string | null>(persisted?.committedCode ?? null);
+  const [latestVerdict, setLatestVerdict] = useState<Record<string, unknown> | null>(persisted?.latestVerdict ?? null);
   // 历史 journal 行展开回放：存当前展开的 analyzed_at（null=全收起）
   const [expandedAt, setExpandedAt] = useState<string | null>(null);
 
   const { setContext } = useChatContext();
+
+  // 持久化: 三者任一变化即写 sessionStorage, 切走再回可恢复。
+  useEffect(() => {
+    const state: PersistedAnalyzeState = { tsCode, committedCode, latestVerdict };
+    try {
+      sessionStorage.setItem(ANALYZE_STATE_KEY, JSON.stringify(state));
+    } catch {
+      // quota / 隐私模式 —— 忽略, 持久化是 best-effort
+    }
+  }, [tsCode, committedCode, latestVerdict]);
 
   // 防抖自动 commit: 输入停顿 500ms 且归一化结果变化才 commit(避免补后缀时抖动)。
   // commit 只决定「下方内容」(行情/历史/分析区占位)是否展示, 不触发 AI 分析 ——
@@ -69,6 +105,14 @@ export function AnalyzePage() {
     queryFn: () => getDailyPrices([committedCode!]),
     enabled: !!committedCode,
   });
+  // 股票名称(展示用, 失败/mock 未命中降级只显示代码)
+  const stockInfo = useQuery({
+    queryKey: qk.stockInfo(committedCode ?? ""),
+    queryFn: () => getStockInfo(committedCode!),
+    enabled: !!committedCode,
+    staleTime: Infinity, // 名称不变, 永不重拉
+  });
+  const stockName = stockInfo.data?.name;
 
   // 历史 journal
   const journal = useQuery({
@@ -125,8 +169,13 @@ export function AnalyzePage() {
           {/* 左: 行情速览 */}
           <Card className="lg:col-span-1">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-normal text-text-secondary">
-                {committedCode}
+              <CardTitle className="flex items-baseline gap-2 text-sm font-normal text-text-secondary">
+                <span className="num">{committedCode}</span>
+                {stockName ? (
+                  <span className="text-text-primary">{stockName}</span>
+                ) : stockInfo.isLoading ? (
+                  <span className="text-flat">…</span>
+                ) : null}
               </CardTitle>
             </CardHeader>
             <CardContent>

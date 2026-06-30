@@ -215,6 +215,38 @@ export interface IntradayBars {
   bars: IntradayBar[];
 }
 
+/** 股票基本信息(名称/行业/上市日)。失败/mock 未命中返回 null, 调用方降级只显示代码。 */
+export interface StockInfo {
+  name?: string;
+  industry?: string;
+  list_date?: string;
+  market?: string;
+}
+
+const MOCK_STOCK_NAMES: Record<string, string> = {
+  "000001.SZ": "平安银行",
+  "002466.SZ": "天齐锂业",
+  "002415.SZ": "海康威视",
+  "002475.SZ": "立讯精密",
+  "603650.SH": "彤程新材",
+};
+
+export async function getStockInfo(tsCode: string): Promise<StockInfo | null> {
+  if (USE_MOCK) {
+    const name = MOCK_STOCK_NAMES[tsCode];
+    return name ? { name } : null;
+  }
+  try {
+    const res = await api.get<StockInfo | { error: string }>(
+      `/market/stocks/${encodeURIComponent(tsCode)}/info`,
+    );
+    if (!res || "error" in res) return null;
+    return res;
+  } catch {
+    return null;
+  }
+}
+
 /** GET /api/market/intraday/{ts_code}/bars — 当日分时 */
 export async function getIntradayBars(tsCode: string): Promise<IntradayBars> {
   if (USE_MOCK) {
