@@ -189,3 +189,142 @@ def evidence_digest(ea: Optional[dict]) -> str:
     if not table:
         return header + "\n\n样本不足（每 pattern 需 ≥3 次引用），暂无可用归因表。"
     return header + "\n\n" + table
+
+
+# ── chat 扩展工具的 digest（逐笔流水 / 账户风控 / 仓位计算 / 平仓诊断）─────────────
+
+
+def trade_history_digest(trades: list[dict]) -> str:
+    """逐笔买卖流水摘要。
+
+    与 ``closed_trades_digest`` 互补：后者看闭环交易（判决→盈亏→退出原因），
+    这里看 ``trades.jsonl`` 的原始 buy/sell 流水（加仓/减仓/部分平仓/单笔节奏）。
+    每条一行：``时间 | 标的 | 方向 | 成交价 | 股数 | 金额 | 持仓变化 | 策略 | 备注``。
+    末尾汇总 buy/sell 笔数。
+    """
+    if not trades:
+        return "无交易流水记录。"
+
+    buys = sum(1 for t in trades if t.get("side") == "buy")
+    sells = sum(1 for t in trades if t.get("side") == "sell")
+    lines = [f"## 最近 {len(trades)} 笔交易流水（买入 {buys} / 卖出 {sells}）"]
+    lines.append("时间 | 标的 | 方向 | 成交价 | 股数 | 金额 | 持仓变化 | 策略 | 备注")
+    lines.append("---|---|---|---|---|---|---|---|---")
+
+    for t in trades:
+        ts = (t.get("traded_at") or "?")[:16].replace("T", " ")
+        code = t.get("ts_code", "?")
+        name = _short(t.get("name"))
+        side = "买" if t.get("side") == "buy" else "卖"
+        price = t.get("fill_price", "?")
+        shares = t.get("shares", "?")
+        amount = t.get("amount")
+        amt_str = f"{amount:,.0f}" if isinstance(amount, (int, float)) else "?"
+        after = t.get("shares_after")
+        after_str = f"{after}" if after is not None else "?"
+        strat = t.get("strategy") or "-"
+        note = t.get("note") or ""
+        lines.append(
+            f"{ts} | {code} {name} | {side} | {price} | {shares} | {amt_str} | "
+            f"持{after_str} | {strat} | {note}"
+        )
+
+    return "\n".join(lines)
+
+
+def account_risk_digest(risk: dict, account: dict) -> str:
+    """账户风控摘要：总资金 / 单笔风险 / 总风险上限 + 当前持仓风险敞口是否超限。
+
+    ``risk`` 来自 ``account.current_total_risk(active_positions)``，``account`` 来自
+    ``account.load()``。用户问『仓位重不重/总风险多少/超限没』时调。
+    """
+    capital = account.get("total_capital", 0)
+    rpt = account.get("risk_per_trade_pct", 0)
+    max_pct = account.get("max_total_risk_pct", 0)
+    total_risk = risk.get("total_risk_amount", 0)
+    risk_pct = risk.get("total_risk_pct")
+    over = risk.get("over_limit")
+    pos_n = risk.get("position_count", 0)
+    missing = risk.get("missing_size_count", 0)
+
+    pct_str = f"{risk_pct:.2f}%" if isinstance(risk_pct, (int, float)) else "?"
+    status = "⚠️ 超出上限" if over else "未超限"
+    missing_str = f"（另有 {missing} 条缺 size 数据未计入）" if missing else ""
+
+    lines = [
+        "## 账户风控",
+        f"总资金: ¥{capital:,.0f} | 单笔风险: {rpt}% | 总风险上限: {max_pct}%",
+        f"当前持仓风险敞口: ¥{total_risk:,.0f} ({pct_str}) — {status}",
+        f"计入持仓: {pos_n} 条{missing_str}",
+    ]
+    return "\n".join(lines)
+
+
+def position_size_digest(ps: dict) -> str:
+    """仓位计算结果摘要。``ps`` 来自 ``account.compute_position_size(entry, stop)``。"""
+    if not ps.get("ok"):
+        reasons = "；".join(ps.get("warnings") or []) or "无法计算"
+        return f"## 仓位计算\n❌ 无法给出建议：{reasons}"
+
+    shares = ps["shares"]
+    lots = shares // 100
+    risk_amt = ps["risk_amount"]
+    capital_req = ps["capital_required"]
+    risk_used = ps["risk_pct_used"]
+    risk_actual = ps["risk_pct_actual"]
+
+    lines = [
+        "## 仓位计算结果",
+        f"→ 建议买入 {shares} 股（{lots} 手）",
+        f"承担风险: ¥{risk_amt:,.0f}（{risk_actual:.3f}% 实际 / {risk_used}% 预算）",
+        f"所需资金: ¥{capital_req:,.0f}",
+    ]
+    for w in ps.get("warnings") or []:
+        lines.append(f"⚠️ {w}")
+    return "\n".join(lines)
+
+
+def trade_diagnosis_digest(record: dict) -> str:
+    """单笔已平仓交易的 AI 事后诊断摘要。
+
+    从 closed_position record 的 ``diagnosis`` 字段取（平仓时 ``postmortem.run_and_patch``
+    写回）。``closed_trades_digest`` 故意丢弃 diagnosis 全文（怕多条爆 context），
+    这里按需取单笔展开：判断对/漏/教训/全文。
+    """
+    diag = record.get("diagnosis") or {}
+    if not diag:
+        return "该笔交易暂无 AI 事后诊断（平仓时未生成或失败）。"
+
+    o = record.get("open") or {}
+    c = record.get("close") or {}
+    ts = record.get("ts_code", "?")
+    name = _short(record.get("name"))
+    verdict = o.get("ai_verdict") or "-"
+    conf = o.get("ai_confidence")
+    conf_str = f"{conf}" if conf is not None else "?"
+    pnl = c.get("realized_pnl_pct")
+    days = c.get("trading_days_held")
+    reason = c.get("exit_reason") or "-"
+    days_str = f"{days}日" if days is not None else "-"
+
+    lines = [f"## 平仓诊断 — {ts} {name}"]
+    lines.append(
+        f"AI判决: {verdict}({conf_str}) | 实际盈亏: {_pct(pnl)} | "
+        f"持仓 {days_str} | 退出: {reason}"
+    )
+
+    correctly = diag.get("ai_correctly_identified") or []
+    missed = diag.get("ai_missed") or []
+    lesson = diag.get("lesson") or ""
+    text = diag.get("ai_diagnosis_text") or ""
+
+    if correctly:
+        lines.append(f"\n**判断对的**：{'；'.join(map(str, correctly))}")
+    if missed:
+        lines.append(f"\n**判断漏的/错的**：{'；'.join(map(str, missed))}")
+    if lesson:
+        lines.append(f"\n**教训**：{lesson}")
+    if text:
+        lines.append(f"\n**诊断全文**：\n{text}")
+
+    return "\n".join(lines)

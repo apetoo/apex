@@ -17,12 +17,16 @@ from datetime import datetime
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
-from apex import calibration, evidence_attribution, journal, llm, watchlist
+from apex import account, calibration, evidence_attribution, journal, llm, trades, watchlist
 from apex.journal_views import chat_full, chat_summary, is_today_entry
 from apex.review_views import (
+    account_risk_digest,
     calibration_digest,
     closed_trades_digest,
     evidence_digest,
+    position_size_digest,
+    trade_diagnosis_digest,
+    trade_history_digest,
     watchlist_digest,
 )
 
@@ -52,6 +56,14 @@ chat 不重复跑分析）。
 - "龙虎榜信号对我有用吗 / 什么证据最靠谱 / 哪类论据预测准" → **get_evidence_attribution**
 - 用户消息含 A 股代码且问"之前怎么看/上次分析/历史判断" → **get_stock_analysis**
   （detail=summary 概要，detail=full 全量；返回"无分析记录"=该股未分析过，别臆造）
+- "我最近买卖了什么 / 上周对某股加过仓吗 / 买卖节奏怎么样" → **get_trade_history**
+  （逐笔 buy/sell 流水，含加仓/减仓/单笔止损；和 review_closed_trades 互补，前者看闭环后者看逐笔）
+- "我仓位重不重 / 现在总风险敞口多少 / 超限没" → **get_account_risk**
+  （仓位风控问题前优先调，不要凭持仓数瞎估总风险）
+- "这只 X 块买、Y 块止损我该买多少手 / 仓位多大合适" → **compute_position_size**
+  （entry+stop 必填；返回 ok=false 说明风险预算不足或参数异常，如实告知）
+- "上次某股亏了到底错在哪 / 这笔交易 AI 怎么复盘的" → **get_trade_diagnosis**
+  （取该股最近一笔平仓的 AI 事后诊断；返回"无诊断"=平仓时未生成，别臆造根因）
 
 工具返回"暂无数据/样本不足"时如实告诉用户，别编造数字。复盘结论要引用具体笔数/胜率/
 盈亏，不要空泛。
@@ -193,6 +205,78 @@ _CHAT_TOOLS = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trade_history",
+            "description": (
+                "查询用户逐笔买卖流水(trades.jsonl: 每一笔 buy/sell, 含加仓/减仓/部分平仓/单笔止损)。"
+                "用户问『我最近买卖了什么/上周对某股加过仓吗/最近卖了多少笔/某只股我的买卖节奏』时调用。"
+                "与 review_closed_trades 互补: 后者看闭环交易的判决→盈亏, 本工具看原始逐笔流水。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ts_code": {"type": "string", "description": "可选, 按标的过滤, 如 600519.SH"},
+                    "limit": {"type": "integer", "description": "返回最近多少笔, 默认 20", "default": 20},
+                    "since_days": {"type": "integer", "description": "只看最近 N 天内(与 limit 可组合)"},
+                    "side": {"type": "string", "enum": ["buy", "sell"], "description": "可选, 只看买或卖"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_account_risk",
+            "description": (
+                "查询账户当前总风险敞口: 所有持仓未实现风险合计、占账户百分比、是否超总风险上限。"
+                "用户问『我仓位重不重/现在风险敞口多大/总风险超限没』时调用。"
+                "回答仓位风控问题前优先调此工具拿真实数字, 不要凭持仓数瞎估。"
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_position_size",
+            "description": (
+                "仓位计算器: 给定进场价和止损价, 按账户风险比例模型算出建议手数、承担风险金额、所需资金。"
+                "用户问『这只 X 块买、Y 块止损我该买多少手/仓位多大合适』时调用。"
+                "返回 ok=false 时说明风险预算不足或参数异常, 应如实告知用户。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry": {"type": "number", "description": "进场价"},
+                    "stop": {"type": "number", "description": "止损价"},
+                    "risk_pct": {"type": "number", "description": "可选, 单笔风险比例(%), 默认用账户配置"},
+                },
+                "required": ["entry", "stop"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trade_diagnosis",
+            "description": (
+                "查询某笔已平仓交易的 AI 事后诊断全文: AI 当时判断对的地方、漏掉/错的地方、教训、诊断叙述。"
+                "用户问『我上次某股亏了到底错在哪/这笔交易 AI 怎么复盘的』时调用。"
+                "默认取该股最近一笔平仓; 传 closed_at 精确定位某笔。返回『无诊断』表示平仓时未生成。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ts_code": {"type": "string", "description": "A 股代码, 如 600519.SH"},
+                    "closed_at": {"type": "string", "description": "可选, 精确定位某笔平仓的 closed_at"},
+                },
+                "required": ["ts_code"],
+            },
+        },
+    },
 ]
 
 
@@ -225,6 +309,53 @@ def _dispatch_chat_tool(name: str, args: dict) -> str:
 
         if name == "get_evidence_attribution":
             return evidence_digest(evidence_attribution.load())
+
+        if name == "get_trade_history":
+            ts_code = args.get("ts_code") or None
+            limit = args.get("limit") or 20
+            since_days = args.get("since_days")
+            side = args.get("side")
+            recs = trades.load_trades(ts_code=ts_code, limit=limit, since_days=since_days)
+            if side:
+                recs = [r for r in recs if r.get("side") == side]
+            return trade_history_digest(recs)
+
+        if name == "get_account_risk":
+            actives = watchlist.load().get("active_positions") or []
+            return account_risk_digest(account.current_total_risk(actives), account.load())
+
+        if name == "compute_position_size":
+            entry = args.get("entry")
+            stop = args.get("stop")
+            if entry is None or stop is None:
+                return json.dumps({"error": "entry 和 stop 必填"}, ensure_ascii=False)
+            ps = account.compute_position_size(
+                entry=float(entry), stop=float(stop), risk_pct=args.get("risk_pct")
+            )
+            return position_size_digest(ps)
+
+        if name == "get_trade_diagnosis":
+            ts_code = args.get("ts_code", "")
+            if not ts_code:
+                return json.dumps({"error": "ts_code 不能为空"}, ensure_ascii=False)
+            closed_at = args.get("closed_at")
+            recs = watchlist.load_closed_positions()
+            target = None
+            if closed_at:
+                target = next(
+                    (r for r in recs if (r.get("close") or {}).get("closed_at") == closed_at),
+                    None,
+                )
+            else:
+                matching = [r for r in recs if r.get("ts_code") == ts_code]
+                matching.sort(
+                    key=lambda r: (r.get("close") or {}).get("closed_at") or "",
+                    reverse=True,
+                )
+                target = matching[0] if matching else None
+            if not target:
+                return json.dumps({"error": "无该股平仓记录", "ts_code": ts_code}, ensure_ascii=False)
+            return trade_diagnosis_digest(target)
 
         return json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False)
     except Exception as exc:  # noqa: BLE001 — 工具失败不崩流, 透传给模型
