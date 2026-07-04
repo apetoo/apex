@@ -27,13 +27,17 @@ class ReplacePositionRequest(AddPositionRequest):
 
 
 class AddCandidateRequest(BaseModel):
-    """新增候选。"""
+    """新增候选。ts_code 会经 normalize_ts_code 规范化。
+
+    expires_days: None(默认) → 后端按波动率衰减动态算;
+    显式传值 → 手动覆盖(保留人工干预出口)。
+    """
     ts_code: str
     name: Optional[str] = None
     trigger_price: float
     trigger_direction: str = "above"
     note: str = ""
-    expires_days: int = 7
+    expires_days: Optional[int] = None
     stop_advice: Optional[float] = None
     target_advice: Optional[float] = None
     strategy: Optional[str] = None

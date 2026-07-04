@@ -29,6 +29,7 @@ import {
   useArchiveEntry,
   usePromoteCandidate,
   useUpdateAdvice,
+  useSyncCandidateAi,
 } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
 import { formatPrice } from "@/lib/utils";
@@ -62,6 +63,7 @@ export function WatchlistPage() {
   const archiveMut = useArchiveEntry();
   const promoteMut = usePromoteCandidate();
   const adviceMut = useUpdateAdvice();
+  const syncCandidateMut = useSyncCandidateAi();
   // 正在同步 AI advice 的 ts_code(单只反馈, 避免全局 spinner)
   const [syncingCode, setSyncingCode] = useState<string | null>(null);
 
@@ -237,6 +239,26 @@ export function WatchlistPage() {
     setPromoteShares("100");
     setPromoteStop(c.stop_advice ? String(c.stop_advice) : "");
     setPromoteTargetPrice(c.target_advice ? String(c.target_advice) : "");
+  };
+
+  // —— 过期候选三选一: 重分析 —— 写 sessionStorage 让 AnalyzePage mount 自动 commit 跑 AI
+  const handleReanalyze = (c: Candidate) => {
+    sessionStorage.setItem(
+      "apex.analyze.state",
+      JSON.stringify({ tsCode: c.ts_code, committedCode: c.ts_code, latestVerdict: null }),
+    );
+    navigate("/analyze");
+  };
+
+  // —— 候选同步 AI: 后端读 journal 最近 price_advice 覆盖 trigger/stop/target + 重算过期。不调 AI。
+  const handleSyncCandidateAi = (c: Candidate) => {
+    syncCandidateMut.mutate(
+      { ts_code: c.ts_code },
+      {
+        onError: (e) =>
+          window.alert(`${c.name || c.ts_code} 同步失败 · ${String(e)}\n(可能 journal 暂无 AI 分析)`),
+      },
+    );
   };
 
   const submitPromote = (e?: React.FormEvent) => {
@@ -553,6 +575,9 @@ export function WatchlistPage() {
                         candidate={c}
                         onArchive={handleArchive}
                         onPromote={openPromoteForm}
+                        onReanalyze={handleReanalyze}
+                        onSyncAi={handleSyncCandidateAi}
+                        syncing={syncCandidateMut.isPending && syncCandidateMut.variables?.ts_code === c.ts_code}
                       />
                     ))}
                   </div>

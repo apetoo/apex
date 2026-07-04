@@ -6,6 +6,8 @@ import {
   promoteCandidate,
   closePosition,
   archiveEntry,
+  renewCandidate,
+  syncCandidateAi,
   buy,
   sell,
   updateAdvice,
@@ -19,6 +21,7 @@ import {
   type BuyResponse,
   type SellResponse,
   type UpdateAdvicePayload,
+  type ExpiresMeta,
 } from "./watchlist";
 import { qk } from "./query-keys";
 
@@ -69,6 +72,10 @@ const INVALIDATE: Record<string, string[][]> = {
   ],
   // 归档 → watchlist + triggers
   archiveEntry: [[...qk.watchlist], [...qk.triggers]],
+  // 续期候选 → watchlist + triggers(过期状态变了)
+  renewCandidate: [[...qk.watchlist], [...qk.triggers]],
+  // 同步 AI 到候选 → watchlist(trigger/stop/target/expires 都变) + triggers
+  syncCandidateAi: [[...qk.watchlist], [...qk.triggers]],
   // 更新止损/目标(advice) → 只影响 watchlist(持仓卡显示)
   updateAdvice: [[...qk.watchlist]],
 };
@@ -86,7 +93,7 @@ function invalidateAll(
 /* ── Hooks ────────────────────────────────────────────── */
 
 export function useAddCandidate(): UseMutationResult<
-  { message: string; ts_code: string },
+  { message: string; ts_code: string } & ExpiresMeta,
   Error,
   AddCandidatePayload
 > {
@@ -174,6 +181,38 @@ export function useArchiveEntry(): UseMutationResult<
   return useMutation({
     mutationFn: archiveEntry,
     onSuccess: () => invalidateAll(qc, "archiveEntry"),
+  });
+}
+
+/**
+ * 续期已过期候选(不调 AI, 用今天波动率重算)。变量包 {ts_code} 适配单参 mutationFn。
+ * 返回 renew_count, 调用方可据此提醒"已续 X 次, 该重分析了"。
+ */
+export function useRenewCandidate(): UseMutationResult<
+  { message: string; ts_code: string; renew_count: number } & ExpiresMeta,
+  Error,
+  { ts_code: string }
+> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars) => renewCandidate(vars.ts_code),
+    onSuccess: () => invalidateAll(qc, "renewCandidate"),
+  });
+}
+
+/**
+ * 同步最近 AI 分析到候选(三字段全覆盖 entry/stop/target + 重算过期)。不调 AI。
+ * 与持仓 useUpdateAdvice 对应, 但候选字段名不同(trigger_price/stop_advice/target_advice)。
+ */
+export function useSyncCandidateAi(): UseMutationResult<
+  { message: string; ts_code: string; trigger_price: number; stop_advice: number | null; target_advice: number | null; analyzed_at: string } & ExpiresMeta,
+  Error,
+  { ts_code: string }
+> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars) => syncCandidateAi(vars.ts_code),
+    onSuccess: () => invalidateAll(qc, "syncCandidateAi"),
   });
 }
 

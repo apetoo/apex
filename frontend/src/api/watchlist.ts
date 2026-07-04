@@ -41,12 +41,29 @@ export interface ActivePosition {
   note?: string;
 }
 
+export interface ExpiresMeta {
+  /** 实际生效的过期天数 */
+  expires_days: number;
+  /** 过期天数怎么来的: vol_based=波动率算 / manual=手动覆盖 / fallback=数据缺失退回默认 */
+  method: "vol_based" | "manual" | "fallback";
+  /** 近 20 日日收益率标准差(小数), vol_based 才有 */
+  realized_vol?: number;
+  /** 加候选时现价到 trigger 的距离百分比, vol_based 才有 */
+  distance_pct?: number;
+  /** 临界交易日数 t*=(d/σ)², vol_based 才有 */
+  t_trading?: number;
+}
+
 export interface Candidate {
   ts_code: string;
   name: string;
   trigger_price: number;
   trigger_direction: "below" | "above";
   expires_at: string;
+  /** 过期天数归因(动态过期特性, 历史候选可能没有) */
+  expires_meta?: ExpiresMeta;
+  /** 手动续期次数, 防僵尸候选提醒用 */
+  renew_count?: number;
   note: string;
   stop_advice: number;
   target_advice: number;
@@ -245,26 +262,31 @@ export interface AddPositionPayload {
   position_size_shares?: number;
 }
 
-/** POST /api/watchlist/candidates */
+/** POST /api/watchlist/candidates — 响应带过期归因 meta */
 export async function addCandidate(
   payload: AddCandidatePayload,
-): Promise<{ message: string; ts_code: string }> {
+): Promise<{ message: string; ts_code: string } & ExpiresMeta> {
   if (USE_MOCK) {
+    // 对齐真后端: expires_days 不传(undefined)→ mock 动态默认 7; 显式传→manual
+    const isManual = payload.expires_days != null;
+    const days = payload.expires_days ?? 7;
+    const meta: ExpiresMeta = isManual
+      ? { expires_days: days, method: "manual" }
+      : { expires_days: days, method: "vol_based", realized_vol: 0.03, distance_pct: 5.2, t_trading: 2.99 };
     MOCK_DATA.candidates.push({
       ts_code: payload.ts_code,
       name: payload.name,
       trigger_price: payload.trigger_price,
       trigger_direction: payload.trigger_direction ?? "below",
-      expires_at: new Date(Date.now() + (payload.expires_days ?? 10) * 86400000)
-        .toISOString()
-        .slice(0, 10),
+      expires_at: new Date(Date.now() + days * 86400000).toISOString().slice(0, 10),
+      expires_meta: meta,
       note: payload.note ?? `手动加候选 触发 ${payload.trigger_price}`,
       stop_advice: payload.stop_advice ?? 0,
       target_advice: payload.target_advice ?? 0,
       ...(payload.trigger_low != null ? { trigger_low: payload.trigger_low } : {}),
       ...(payload.trigger_high != null ? { trigger_high: payload.trigger_high } : {}),
     });
-    return { message: "Candidate added (mock)", ts_code: payload.ts_code };
+    return { message: "Candidate added (mock)", ts_code: payload.ts_code, ...meta };
   }
   return api.post("/watchlist/candidates", payload);
 }
@@ -402,6 +424,55 @@ export async function closePosition(
 }
 
 /** POST /api/watchlist/archive */
+/** POST /api/watchlist/candidates/{ts_code}/renew — 续期已过期候选(不调 AI) */
+export async function renewCandidate(
+  ts_code: string,
+): Promise<{ message: string; ts_code: string; renew_count: number } & ExpiresMeta> {
+  if (USE_MOCK) {
+    const c = MOCK_DATA.candidates.find((x) => x.ts_code === ts_code);
+    if (!c) throw new Error(`候选 ${ts_code} 不存在`);
+    const days = 7;
+    const meta: ExpiresMeta = {
+      expires_days: days,
+      method: "vol_based",
+      realized_vol: 0.03,
+      distance_pct: 5.2,
+      t_trading: 2.99,
+    };
+    c.expires_at = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+    c.expires_meta = meta;
+    c.renew_count = (c.renew_count ?? 0) + 1;
+    return { message: "Candidate renewed (mock)", ts_code, renew_count: c.renew_count, ...meta };
+  }
+  return api.post(`/watchlist/candidates/${ts_code}/renew`);
+}
+
+/** POST /api/watchlist/candidates/{ts_code}/sync-ai — 同步最近 AI 分析到候选(三字段全覆盖) */
+export async function syncCandidateAi(
+  ts_code: string,
+): Promise<{
+  message: string;
+  ts_code: string;
+  trigger_price: number;
+  stop_advice: number | null;
+  target_advice: number | null;
+  analyzed_at: string;
+} & ExpiresMeta> {
+  if (USE_MOCK) {
+    const c = MOCK_DATA.candidates.find((x) => x.ts_code === ts_code);
+    if (!c) throw new Error(`候选 ${ts_code} 不存在`);
+    c.trigger_price = 68.7;
+    c.stop_advice = 65.5;
+    c.target_advice = 76;
+    const days = 7;
+    const meta: ExpiresMeta = { expires_days: days, method: "vol_based", realized_vol: 0.04, distance_pct: 3, t_trading: 0.56 };
+    c.expires_at = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+    c.expires_meta = meta;
+    return { message: "Candidate synced (mock)", ts_code, trigger_price: 68.7, stop_advice: 65.5, target_advice: 76, analyzed_at: "2026-07-01T09:53:52+08:00", ...meta };
+  }
+  return api.post(`/watchlist/candidates/${ts_code}/sync-ai`);
+}
+
 export async function archiveEntry(
   payload: ArchivePayload,
 ): Promise<{ message: string; moved: boolean }> {

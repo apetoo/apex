@@ -1,10 +1,35 @@
-import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle } from "lucide-react";
+import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle, Clock, RefreshCw, Sparkles, ChevronDown } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PriceTag } from "@/components/a-share";
-import { getPrices } from "@/api/market";
+import { getPrices, getDailyPrices } from "@/api/market";
+import { useRenewCandidate } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
 import { cn, formatPrice } from "@/lib/utils";
 import type { Candidate } from "@/api/watchlist";
+
+/** expires_at(YYYY-MM-DD) 距今天剩余天数; 过期返回负数。 */
+function daysUntil(expiresAt: string): number | null {
+  const d = new Date(expiresAt + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((d.getTime() - today.getTime()) / 86400000);
+}
+
+/** 把 expires_meta 拼成一行中文归因, 供 title 悬浮。无 meta 返回 null。 */
+function metaTooltip(meta?: Candidate["expires_meta"]): string | null {
+  if (!meta) return null;
+  if (meta.method === "manual") return `手动设置 ${meta.expires_days} 天`;
+  if (meta.method === "fallback") return `数据缺失, 默认 ${meta.expires_days} 天`;
+  if (meta.method === "vol_based") {
+    const vol = meta.realized_vol != null ? `${(meta.realized_vol * 100).toFixed(2)}%` : "?";
+    const dist = meta.distance_pct != null ? `${meta.distance_pct.toFixed(2)}%` : "?";
+    const t = meta.t_trading != null ? meta.t_trading.toFixed(1) : "?";
+    return `波动率算出 ${meta.expires_days} 天 · σ${vol} · 距离${dist} · t*${t}交易日`;
+  }
+  return null;
+}
 
 /**
  * <CompactCandidateCard> — 竖向紧凑候选卡(网格用)
@@ -17,13 +42,43 @@ export function CompactCandidateCard({
   candidate,
   onArchive,
   onPromote,
+  onReanalyze,
+  onSyncAi,
+  syncing,
 }: {
   candidate: Candidate;
   onArchive?: (c: Candidate) => void;
   onPromote?: (c: Candidate) => void;
+  /** 跳分析页重跑 AI(写新 journal)。过期三选一之一。 */
+  onReanalyze?: (c: Candidate) => void;
+  /** 同步最近 AI 分析的 entry/stop/target(三字段全覆盖, 不调 AI)。常驻按钮。 */
+  onSyncAi?: (c: Candidate) => void;
+  syncing?: boolean;
 }) {
   const { ts_code, name, trigger_price, trigger_direction, stop_advice, target_advice } =
     candidate;
+  const expiresMeta = candidate.expires_meta;
+  const renewCount = candidate.renew_count ?? 0;
+  const remaining = daysUntil(candidate.expires_at);
+  const tooltip = metaTooltip(expiresMeta);
+  const isExpiringSoon = remaining != null && remaining <= 2;
+  const isExpired = remaining != null && remaining < 0;
+
+  // 续期下拉(过期三选一入口)
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const renewMut = useRenewCandidate();
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+  const canRenew = renewCount < 3; // 防僵尸: 超 3 次提示该重分析, 不再给续期
+  const showMenu = isExpired && (onReanalyze || canRenew || onArchive);
+
   const hasZone =
     candidate.trigger_low != null && candidate.trigger_high != null;
   const low = candidate.trigger_low ?? null;
@@ -33,10 +88,15 @@ export function CompactCandidateCard({
     queryKey: qk.prices([ts_code]),
     queryFn: () => getPrices([ts_code]),
   });
+  const daily = useQuery({
+    queryKey: qk.dailyPrices([ts_code]),
+    queryFn: () => getDailyPrices([ts_code]),
+  });
 
   const currentPrice = prices.data?.[ts_code] ?? null;
-  const loading = prices.isLoading;
-  const error = prices.isError;
+  const prevClose = daily.data?.[ts_code] ?? null;
+  const loading = prices.isLoading || daily.isLoading;
+  const error = prices.isError || daily.isError;
 
   // 带状触发: 价格进入 [low, high] 才触发; 无区间退回单向阈值(below<=price / above>=price)
   const isTriggered =
@@ -84,15 +144,15 @@ export function CompactCandidateCard({
       </div>
       <p className="mt-0.5 text-xs text-text-secondary">{ts_code}</p>
 
-      {/* 当前价(黑色, 候选不展示当日涨跌) */}
+      {/* 当前价(黑色) + 涨跌(红/绿) */}
       <div className="mt-2">
         <PriceTag
           price={currentPrice}
-          prevClose={null}
+          prevClose={prevClose}
           loading={loading}
           error={error}
           size="lg"
-          showChange={false}
+          showChange
         />
       </div>
 
@@ -138,10 +198,89 @@ export function CompactCandidateCard({
             )}
           </div>
         )}
+        {remaining != null && (
+          isExpired && showMenu ? (
+            <div ref={menuRef} className="relative inline-block">
+              <button
+                type="button"
+                onClick={() => setMenuOpen((v) => !v)}
+                className="inline-flex items-center gap-0.5 text-flat hover:text-text-secondary"
+                title={tooltip ?? "已过期, 点击处理"}
+              >
+                <Clock className="h-3 w-3" />
+                已过期 <ChevronDown className="h-3 w-3" />
+              </button>
+              {menuOpen && (
+                <div className="absolute left-0 top-5 z-10 w-32 rounded-md border border-border bg-bg-card p-1 shadow-lg">
+                  {onReanalyze && (
+                    <button
+                      type="button"
+                      onClick={() => { setMenuOpen(false); onReanalyze(candidate); }}
+                      className="flex w-full items-center gap-1 rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-bg-base"
+                    >
+                      <Sparkles className="h-3 w-3" /> 重分析
+                    </button>
+                  )}
+                  {canRenew ? (
+                    <button
+                      type="button"
+                      disabled={renewMut.isPending}
+                      onClick={() => {
+                        renewMut.mutate(
+                          { ts_code },
+                          { onSuccess: () => setMenuOpen(false) },
+                        );
+                      }}
+                      className="flex w-full items-center gap-1 rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-bg-base disabled:opacity-50"
+                    >
+                      <RefreshCw className={cn("h-3 w-3", renewMut.isPending && "animate-spin")} />
+                      {renewMut.isPending ? "续期中" : `续期${renewCount > 0 ? ` (第${renewCount + 1}次)` : ""}`}
+                    </button>
+                  ) : (
+                    <p className="px-2 py-1 text-[10px] text-amber-600">已续 {renewCount} 次, 该重分析</p>
+                  )}
+                  {onArchive && (
+                    <button
+                      type="button"
+                      onClick={() => { setMenuOpen(false); onArchive(candidate); }}
+                      className="flex w-full items-center gap-1 rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-bg-base"
+                    >
+                      <Archive className="h-3 w-3" /> 归档
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div
+              className={cn(
+                "flex items-center gap-0.5",
+                isExpired ? "text-flat" : isExpiringSoon ? "text-amber-600" : "",
+              )}
+              title={tooltip ?? undefined}
+            >
+              <Clock className="h-3 w-3" />
+              {isExpired
+                ? "已过期"
+                : remaining === 0
+                  ? "今日到期"
+                  : `剩 ${remaining} 天`}
+              {expiresMeta?.method === "vol_based" && (
+                <span className="ml-1 opacity-60">·波动率算</span>
+              )}
+              {expiresMeta?.method === "manual" && (
+                <span className="ml-1 opacity-60">·手动</span>
+              )}
+              {renewCount > 0 && (
+                <span className="ml-1 opacity-60">·续{renewCount}次</span>
+              )}
+            </div>
+          )
+        )}
       </div>
 
-      {/* 操作按钮(可选): 转持仓 / 归档 */}
-      {(onPromote || onArchive) && (
+      {/* 操作按钮(可选): 转持仓 / 同步AI / 归档 */}
+      {(onPromote || onArchive || onSyncAi) && (
         <div className="mt-2 flex items-center gap-1.5">
           {onPromote && (
             <button
@@ -151,6 +290,18 @@ export function CompactCandidateCard({
             >
               <ArrowUpCircle className="h-3 w-3" />
               转持仓
+            </button>
+          )}
+          {onSyncAi && (
+            <button
+              type="button"
+              onClick={() => onSyncAi(candidate)}
+              disabled={syncing}
+              title="用最近一次 AI 分析的 entry/止损/目标覆盖当前值, 顺带重算过期"
+              className="inline-flex items-center gap-0.5 rounded border border-border px-2 py-0.5 text-[11px] text-text-secondary hover:bg-bg-base disabled:opacity-50"
+            >
+              <Sparkles className={cn("h-3 w-3", syncing && "animate-pulse")} />
+              {syncing ? "同步中" : "同步AI"}
             </button>
           )}
           {onArchive && (

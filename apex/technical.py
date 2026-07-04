@@ -236,3 +236,24 @@ def atr_14_pct(bars: list[dict]) -> Optional[float]:
     if close <= 0:
         return None
     return round(atr / close * 100, 2)
+
+
+def realized_vol(bars: list[dict], window: int = 20) -> Optional[float]:
+    """近 window 根日 K 的日收益率标准差（小数，不年化）。
+
+    估算"价格靠噪声漂动一个交易日的典型幅度"。不年化因为下游 t* 是日度口径
+    （年化会放大 √252 倍, 与 t*=(d/σ)² 的日度语义不符）。
+    bars: get_daily_price 解析后的 list[dict], 需含 close, 升序。
+    不足 window+1 根返回 None。
+    """
+    if len(bars) < window + 1:
+        return None
+    try:
+        closes = pd.Series([float(b["close"]) for b in bars[-(window + 1):]])
+    except (TypeError, ValueError, KeyError):
+        return None
+    rets = closes.pct_change().dropna()
+    sigma = rets.std()
+    if sigma is None or not (sigma > 0):  # None / NaN / 0
+        return None
+    return round(float(sigma), 6)

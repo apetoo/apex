@@ -26,4 +26,6 @@ export const qk = {
   journalLatest: (tsCode: string) => ["journal", tsCode, "latest"] as const,
   journalAll: ["journal", "all"] as const,
   trace: (tsCode: string, analyzedAt: string) => ["trace", tsCode, analyzedAt] as const,
+  // 策略体检（因子评测表）—— screener 页常驻展示，run mutation 失效
+  factorIc: ["screener", "factor-ic"] as const,
 } as const;

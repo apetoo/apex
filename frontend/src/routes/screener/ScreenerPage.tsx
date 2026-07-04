@@ -30,10 +30,12 @@ import {
   loadStoredWeights,
   saveWeights,
   getAvailableDates,
+  adaptScreenerReport,
   type ScreenerReport,
   type ScreenerWeights,
   type ScreenerStrategy,
 } from "@/api/screener";
+import { FactorIcCard } from "@/components/a-share/FactorIcCard";
 import { cn, formatRatio } from "@/lib/utils";
 
 /**
@@ -103,9 +105,13 @@ export function ScreenerPage() {
     }
   }, [events]);
 
+  // SSE done 事件透传的是 sc.run() 原始 dict(无 summary/picks/date 字段),
+  // 直接当 ScreenerReport 用会崩 —— 走 adaptScreenerReport 归一化。
+  const rawResult = result as Record<string, unknown> | null;
+  const report = rawResult ? adaptScreenerReport(rawResult) : null;
+
   // 终态: 注入 chat 上下文
   useEffect(() => {
-    const report = result as ScreenerReport | null;
     if (report) {
       setContext(
         [
@@ -119,10 +125,9 @@ export function ScreenerPage() {
         ].join("\n"),
       );
     }
-  }, [result, setContext]);
+  }, [report, setContext]);
 
   const running = status === "connecting" || status === "streaming";
-  const report = (result ?? null) as ScreenerReport | null;
 
   const startScreener = () => {
     setProgressMessages([]);
@@ -198,6 +203,9 @@ export function ScreenerPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* 策略体检（因子评测表，常驻避免 CLI 被遗忘） */}
+      <FactorIcCard />
 
       <div className="grid gap-4 lg:grid-cols-2">
         {/* 策略权重 */}

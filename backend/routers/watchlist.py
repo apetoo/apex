@@ -112,9 +112,13 @@ def update_advice(ts_code: str, req: UpdateAdviceRequest):
 
 @router.post("/candidates")
 def add_candidate(req: AddCandidateRequest):
-    """新增候选（等触发）。"""
+    """新增候选（等触发）。
+
+    响应带 expires_days + method(vol_based/manual/fallback) + 波动率/距离 meta,
+    便于前端回显"为什么是这个过期天数"。
+    """
     ts_code = data_mod.normalize_ts_code(req.ts_code)
-    wl.add_candidate(
+    meta = wl.add_candidate(
         ts_code,
         _resolve_name(ts_code, req.name),
         req.trigger_price,
@@ -127,7 +131,7 @@ def add_candidate(req: AddCandidateRequest):
         trigger_low=req.trigger_low,
         trigger_high=req.trigger_high,
     )
-    return {"message": "Candidate added", "ts_code": ts_code}
+    return {"message": "Candidate added", "ts_code": ts_code, **meta}
 
 
 @router.post("/promote")
@@ -177,6 +181,30 @@ def archive_entry(req: ArchiveRequest):
     ts_code = data_mod.normalize_ts_code(req.ts_code)
     moved = wl.archive_entry(ts_code=ts_code, section=req.section, reason=req.reason)
     return {"message": "Entry archived" if moved else "Entry not found", "moved": moved}
+
+
+@router.post("/candidates/{ts_code}/renew")
+def renew_candidate(ts_code: str):
+    """续期已过期候选: trigger 不动, 用今天波动率+原trigger距离重算过期天数(不调 AI)。
+
+    响应带 renew_count 提示"已续 X 次", 前端据此提醒避免僵尸候选。
+    """
+    code = data_mod.normalize_ts_code(ts_code)
+    result = wl.renew_candidate(code)
+    if result is None:
+        raise ValueError(f"候选 {code} 不存在或 trigger_price 无效")
+    return {"message": "Candidate renewed", "ts_code": code, **result}
+
+
+@router.post("/candidates/{ts_code}/sync-ai")
+def sync_candidate_ai(ts_code: str):
+    """同步最近 AI 分析到候选: entry→trigger / stop_loss→stop_advice / target→target_advice。
+    trigger 变了, 顺带用新 trigger 重算过期天数。不调 AI, 只复用 journal。"""
+    code = data_mod.normalize_ts_code(ts_code)
+    result = wl.sync_candidate_from_journal(code)
+    if result is None:
+        raise ValueError(f"候选 {code} 不存在, 或 journal 无有效 price_advice.entry")
+    return {"message": "Candidate synced from latest AI", "ts_code": code, **result}
 
 
 @router.post("/buy")

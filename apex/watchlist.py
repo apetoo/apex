@@ -765,24 +765,66 @@ def load_closed_positions(limit: Optional[int] = None,
     return out
 
 
+def _dynamic_expiry_days(ts_code: str, trigger_price: float) -> tuple[int, dict]:
+    """基于波动率衰减算候选过期天数。
+
+    随机游走: 价格 t 天后扩散 σ√t。当 σ√t 追上"到触发价距离 d"时,
+    纯噪声就能把价格漂到触发价 → 触发不再携带原分析信号。临界 t* = (d/σ)²。
+    σ 用近 20 日日收益率标准差; t* 严格是交易日数, ×7/5 换算日历天。
+    任何异常/数据不足 → fallback 7 天(原硬编码默认, 保持向后兼容)。
+    """
+    from apex import data as _data
+    from apex.technical import realized_vol
+    FLOOR, CEILING = 3, 30
+    try:
+        raw = _data.get_daily_price(ts_code, adj="qfq")
+        bars = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(bars, list) or len(bars) < 2:
+            raise ValueError("insufficient bars")
+        sigma = realized_vol(bars, window=20)
+        if not sigma or sigma <= 0:
+            raise ValueError("no vol")
+        last_close = float(bars[-1]["close"])
+        if trigger_price <= 0:
+            raise ValueError("bad trigger")
+        distance = abs(last_close - trigger_price) / trigger_price
+        t_trading = (distance / sigma) ** 2
+        days = round(t_trading * 7 / 5)  # 交易日 → 日历天
+        days = max(FLOOR, min(CEILING, days))
+        meta = {
+            "method": "vol_based",
+            "realized_vol": round(sigma, 6),
+            "distance_pct": round(distance * 100, 2),
+            "t_trading": round(t_trading, 2),
+        }
+        return days, meta
+    except Exception:
+        return 7, {"method": "fallback"}
+
+
 def add_candidate(ts_code: str, name: str, trigger_price: float,
                   trigger_direction: str = "above",
                   note: str = "",
-                  expires_days: int = 7,
+                  expires_days: Optional[int] = None,
                   stop_advice: Optional[float] = None,
                   target_advice: Optional[float] = None,
                   strategy: Optional[str] = None,
                   trigger_low: Optional[float] = None,
-                  trigger_high: Optional[float] = None) -> None:
+                  trigger_high: Optional[float] = None) -> dict:
     from datetime import timedelta
     data = _load()
-    expires = (date.today() + timedelta(days=expires_days)).isoformat()
+    if expires_days is None:
+        resolved, meta = _dynamic_expiry_days(ts_code, trigger_price)
+    else:
+        resolved, meta = expires_days, {"method": "manual"}
+    expires = (date.today() + timedelta(days=resolved)).isoformat()
     entry: dict = {
         "ts_code": ts_code,
         "name": name,
         "trigger_price": trigger_price,
         "trigger_direction": trigger_direction,
         "expires_at": expires,
+        "expires_meta": {"expires_days": resolved, **meta},
         "note": note,
     }
     if stop_advice is not None:
@@ -798,3 +840,71 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["trigger_high"] = float(trigger_high)
     data["candidates"].append(entry)
     _save(data)
+    return {"expires_days": resolved, **meta}
+
+
+def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:
+    """从最近一次 AI 分析同步候选的价位: entry→trigger_price / stop_loss→stop_advice /
+    target→target_advice。trigger 变了, 用新 trigger 重算过期天数(距离变了)。
+
+    不调 AI(零成本), 只复用已有 journal。journal 无分析或无 price_advice → None。
+    返回同步后的字段 + 续期天数(因 trigger 变了距离也变)。
+    """
+    from apex import journal
+    latest = journal.load_latest(ts_code)
+    if not latest:
+        return None
+    pa = latest.get("price_advice") or {}
+    entry = pa.get("entry")
+    stop = pa.get("stop_loss")
+    target = pa.get("target")
+    if entry is None or (entry is not None and float(entry) <= 0):
+        return None  # entry 缺/无效, 不同步(触发价不能空)
+
+    data = _load()
+    for item in data["candidates"]:
+        if item.get("ts_code") != ts_code:
+            continue
+        # 三字段全覆盖
+        item["trigger_price"] = float(entry)
+        if stop is not None and float(stop) > 0:
+            item["stop_advice"] = float(stop)
+        if target is not None and float(target) > 0:
+            item["target_advice"] = float(target)
+        # trigger 变了 → 距离变了 → 重算过期(用新 entry 距离今天的波动)
+        resolved, meta = _dynamic_expiry_days(ts_code, float(entry))
+        from datetime import timedelta
+        item["expires_at"] = (date.today() + timedelta(days=resolved)).isoformat()
+        item["expires_meta"] = {"expires_days": resolved, **meta}
+        _save(data)
+        return {
+            "trigger_price": float(entry),
+            "stop_advice": item.get("stop_advice"),
+            "target_advice": item.get("target_advice"),
+            "analyzed_at": latest.get("analyzed_at") or latest.get("date"),
+            "expires_days": resolved,
+            **meta,
+        }
+    return None
+    """续期一个已过期的候选: trigger 不动, 用今天的波动率 + 原 trigger 距离重算过期天数。
+
+    不调 AI(零成本), 纯粋延长观察期。代价是可能养出僵尸候选(多次续期),
+    所以前端续期时应提示"已续 X 次"提醒用户。
+    返回更新后的 meta, 找不到候选返回 None。
+    """
+    from datetime import timedelta
+    data = _load()
+    for item in data["candidates"]:
+        if item.get("ts_code") != ts_code:
+            continue
+        trigger_price = item.get("trigger_price")
+        if not trigger_price or trigger_price <= 0:
+            return None
+        resolved, meta = _dynamic_expiry_days(ts_code, float(trigger_price))
+        item["expires_at"] = (date.today() + timedelta(days=resolved)).isoformat()
+        item["expires_meta"] = {"expires_days": resolved, **meta}
+        renew_count = item.get("renew_count", 0) + 1
+        item["renew_count"] = renew_count
+        _save(data)
+        return {"expires_days": resolved, **meta, "renew_count": renew_count}
+    return None
