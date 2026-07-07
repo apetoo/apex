@@ -22,6 +22,7 @@ from typing import Optional
 from openai import OpenAI
 
 from apex import calibration, config, regime as regime_mod
+from apex.llm import make_client
 from apex.strategies import STRATEGIES
 
 _TZ_CN = timezone(timedelta(hours=8))
@@ -239,7 +240,7 @@ def select(regime: Optional[dict],
     if total_cands == 0:
         return _equal_weights(), "今日无候选，使用等权重（无影响）"
 
-    client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
+    client = make_client(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
     prompt = _build_prompt(regime, candidates_count)
     tool = _build_tool_schema()
 

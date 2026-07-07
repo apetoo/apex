@@ -42,3 +42,15 @@ def total_risk():
     acc = account_mod.load()
     positions = wl.load().get("active_positions", [])
     return account_mod.current_total_risk(positions, account=acc)
+
+
+@router.get("/summary")
+def account_summary():
+    """账户总资产汇总: 总资产 = 总本金 + 累计已实现盈亏 + 未实现浮盈。
+
+    现价 realtime 优先 + daily fallback(同 /api/market/prices)。取不到现价的仓位
+    计入 missing_price_count, 不参与市值/浮盈求和。
+    """
+    acc = account_mod.load()
+    positions = wl.load().get("active_positions", [])
+    return account_mod.summary(positions, account=acc)

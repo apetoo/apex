@@ -23,6 +23,7 @@ from backend.routers import (
     chat,
     market,
     postmortem,
+    push,
     screener,
     watchlist,
 )
@@ -63,6 +64,7 @@ for rtr in (
     screener.router,
     calibration.router,
     postmortem.router,
+    push.router,
     chat.router,
 ):
     app.include_router(rtr, prefix="/api")

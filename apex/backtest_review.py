@@ -20,6 +20,7 @@ from typing import Optional
 from openai import OpenAI
 
 from apex import backtest, config
+from apex.llm import make_client
 
 _TZ_CN = timezone(timedelta(hours=8))
 
@@ -352,7 +353,7 @@ def review(ts_code: Optional[str] = None,
             f"\n\n（以上为 TRAIN 期统计，cutoff={cutoff}；最近 {rc['oos_test_days']} 天作 OOS 验证集，"
             f"系统会用 OOS 集门控你的 weight_hint——样本内看着好但 OOS 亏的策略会被降级 hold。）"
         )
-    client = OpenAI(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
+    client = make_client(api_key=api_key, base_url=cfg.get("deepseek", {}).get("base_url", "https://api.deepseek.com"))
     use_model = (
         model
         or cfg.get("postmortem", {}).get("model")

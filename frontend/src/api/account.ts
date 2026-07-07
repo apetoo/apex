@@ -3,6 +3,7 @@
  *
  * GET /api/account — 账户配置(总资金/风险参数)
  * GET /api/account/risk — 当前持仓总风险
+ * GET /api/account/summary — 总资产汇总(本金+已实现+浮盈)
  */
 
 import { api } from "./client";
@@ -27,6 +28,20 @@ export interface AccountRisk {
   }>;
 }
 
+export interface AccountSummary {
+  total_capital: number;
+  market_value: number;
+  cost_basis: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number | null;
+  realized_pnl_total: number;
+  total_assets: number;
+  total_return_pct: number | null;
+  position_count: number;
+  missing_price_count: number;
+  as_of: string;
+}
+
 const MOCK_ACCOUNT: AccountData = {
   total_capital: 100000,
   risk_per_trade_pct: 1.0,
@@ -42,6 +57,20 @@ const MOCK_RISK: AccountRisk = {
   ],
 };
 
+const MOCK_SUMMARY: AccountSummary = {
+  total_capital: 100000,
+  market_value: 53300,
+  cost_basis: 52000,
+  unrealized_pnl: 1300,
+  unrealized_pnl_pct: 2.5,
+  realized_pnl_total: 3200,
+  total_assets: 104500,
+  total_return_pct: 4.5,
+  position_count: 3,
+  missing_price_count: 0,
+  as_of: "2026-07-05T01:00:00+08:00",
+};
+
 /** GET /api/account */
 export async function getAccount(): Promise<AccountData> {
   if (USE_MOCK) return MOCK_ACCOUNT;
@@ -52,4 +81,10 @@ export async function getAccount(): Promise<AccountData> {
 export async function getAccountRisk(): Promise<AccountRisk> {
   if (USE_MOCK) return MOCK_RISK;
   return api.get<AccountRisk>("/account/risk");
+}
+
+/** GET /api/account/summary */
+export async function getAccountSummary(): Promise<AccountSummary> {
+  if (USE_MOCK) return MOCK_SUMMARY;
+  return api.get<AccountSummary>("/account/summary");
 }

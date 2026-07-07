@@ -237,10 +237,15 @@ export async function getStockInfo(tsCode: string): Promise<StockInfo | null> {
     return name ? { name } : null;
   }
   try {
-    const res = await api.get<StockInfo | { error: string }>(
+    // 后端 data.get_stock_info 走 df.to_json(orient="records") → 是 **records 数组**,
+    // 即便只一行也是 [{...}]。错误态才是 {"error":...} 单对象。
+    // 早期按单对象收, stockInfo.data?.name 永远 undefined(mock 单对象所以盲区)。
+    const res = await api.get<StockInfo | StockInfo[] | { error: string }>(
       `/market/stocks/${encodeURIComponent(tsCode)}/info`,
     );
-    if (!res || "error" in res) return null;
+    if (!res) return null;
+    if (Array.isArray(res)) return res[0] ?? null;
+    if ("error" in res) return null;
     return res;
   } catch {
     return null;

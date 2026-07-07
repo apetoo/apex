@@ -7,6 +7,7 @@
 export const qk = {
   watchlist: ["watchlist"] as const,
   account: ["account"] as const,
+  accountSummary: ["account", "summary"] as const,
   triggers: ["triggers"] as const,
   closed: ["closed"] as const,
   // 近 N 日已平仓（概览今日盈亏用）；close/sell mutation 失效 ["closed"] 前缀即覆盖。
@@ -28,4 +29,6 @@ export const qk = {
   trace: (tsCode: string, analyzedAt: string) => ["trace", tsCode, analyzedAt] as const,
   // 策略体检（因子评测表）—— screener 页常驻展示，run mutation 失效
   factorIc: ["screener", "factor-ic"] as const,
+  // 持仓推送状态（概览页 PushStatusCard 轮询；full mutation 后 refetch）
+  pushStatus: ["push", "status"] as const,
 } as const;

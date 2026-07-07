@@ -3,6 +3,7 @@ Data layer: tushare + akshare + bocha. Functions here are also registered as too
 for the Claude API agent in analyze.py.
 """
 import json
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -14,6 +15,23 @@ import pandas as pd
 from apex import mx_client as _mx
 
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
+
+# 国内 API 直连 opener: 跳系统代理 + certifi CA(免 macOS Python.framework 系统证书
+# 缺失导致 SSL CERTIFICATE_VERIFY_FAILED, 静默 except 让搜索/实时链全失效)。
+# 新浪行情 / 博查搜索 / 妙想搜索 的 urllib 调用都走这个。
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+
+
+def _direct_opener() -> urllib.request.OpenerDirector:
+    """build_opener 跳代理 + certifi SSL context。国内 API urllib 调用走这个。"""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=_SSL_CTX),
+    )
 
 
 def normalize_ts_code(code: str) -> str:
@@ -568,7 +586,7 @@ def get_realtime_price(ts_codes: list[str]) -> dict[str, Optional[float]]:
             "User-Agent": "Mozilla/5.0",
         })
         # 显式跳过系统代理（东财/新浪在国内，外代理会断连）
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = _direct_opener()
         with opener.open(req, timeout=10) as resp:
             raw = resp.read().decode("gbk", errors="ignore")
     except Exception:
@@ -669,7 +687,7 @@ def _sina_prev_close(ts_code: str) -> Optional[float]:
             "Referer": "https://finance.sina.com.cn/",
             "User-Agent": "Mozilla/5.0",
         })
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = _direct_opener()
         with opener.open(req, timeout=10) as resp:
             raw = resp.read().decode("gbk", errors="ignore")
         import re
@@ -1081,7 +1099,8 @@ def web_search(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        opener = _direct_opener()
+        with opener.open(req, timeout=30) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = ""
@@ -1322,7 +1341,7 @@ def get_index_realtime_batch(codes: list[str]) -> str:
             "User-Agent": "Mozilla/5.0",
         })
         # 显式跳过系统代理(新浪在国内, 外代理会断连)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = _direct_opener()
         with opener.open(req, timeout=10) as resp:
             raw = resp.read().decode("gbk", errors="ignore")
     except Exception:

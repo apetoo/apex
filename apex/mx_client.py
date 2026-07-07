@@ -28,7 +28,8 @@ def _post(url: str, payload: dict, key: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        from apex.data import _direct_opener  # 延迟 import 避免循环; 复用 certifi 直连 opener
+        with _direct_opener().open(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = ""

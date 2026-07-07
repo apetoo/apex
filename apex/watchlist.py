@@ -36,6 +36,23 @@ def _save(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _notify(event_type: str, *, ts_code: str, name: str = "",
+             before: Optional[dict] = None, after: Optional[dict] = None,
+             trade: Optional[dict] = None, close: Optional[dict] = None,
+             exit_reason: Optional[str] = None) -> None:
+    """持仓变更推送钩子（旁路）。推送失败/未启用都不阻断主流程。
+
+    before/after 为内部 active_positions record（push 模块内部做对外字段映射）。
+    """
+    try:
+        from apex import push as _push
+        _push.notify(event_type, ts_code=ts_code, name=name,
+                     before=before, after=after, trade=trade, close=close,
+                     exit_reason=exit_reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def is_triggered(entry: dict, current_price: float) -> bool:
     # 带状触发优先：有 trigger_low/trigger_high 时，价格进入此带才触发（避免接飞刀/追高）。
     low = entry.get("trigger_low")
@@ -164,13 +181,17 @@ def add_position(ts_code: str, name: str, entry_price: float,
                  risk_amount: Optional[float] = None,
                  calibrated_confidence: Optional[float] = None,
                  strategy: Optional[str] = None,
-                 regime_at_open: Optional[str] = None) -> None:
+                 regime_at_open: Optional[str] = None,
+                 _notify: bool = True) -> dict:
     """Add new position. Raises DuplicatePositionError if ts_code already in active_positions.
 
     可选字段缺省时不写入对应 key（保持老记录兼容）：
       position_size_shares / risk_amount / calibrated_confidence / strategy
     strategy 是策略归属（screener 4 个策略名之一，或 'manual'/'analyze' 等），用于
-    calibration.compute() 切 by_strategy 桶 + 长期评估各策略胜率。"""
+    calibration.compute() 切 by_strategy 桶 + 长期评估各策略胜率。
+
+    _notify=False 时静默（供 replace_position 聚合为单个 position_replaced 事件）。
+    返回写入的 record。"""
     from datetime import timedelta
     data = _load()
     for existing in data["active_positions"]:
@@ -215,6 +236,10 @@ def add_position(ts_code: str, name: str, entry_price: float,
         record["regime_at_open"] = str(regime_at_open)
     data["active_positions"].append(record)
     _save(data)
+    if _notify:
+        _notify("position_opened", ts_code=ts_code, name=name,
+                before=None, after=record)
+    return record
 
 
 def update_advice(ts_code: str,
@@ -232,6 +257,7 @@ def update_advice(ts_code: str,
     data = _load()
     for pos in data["active_positions"]:
         if pos.get("ts_code") == ts_code:
+            before = dict(pos)
             if stop_loss is not None:
                 pos["stop_loss"] = float(stop_loss)
             if target is not None:
@@ -239,6 +265,8 @@ def update_advice(ts_code: str,
             if calibrated_confidence is not None:
                 pos["calibrated_confidence"] = float(calibrated_confidence)
             _save(data)
+            _notify("position_advice_updated", ts_code=ts_code,
+                    name=pos.get("name", ""), before=before, after=pos)
             return pos
     raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
 
@@ -252,16 +280,24 @@ def replace_position(ts_code: str, name: str, entry_price: float,
                      risk_amount: Optional[float] = None,
                      calibrated_confidence: Optional[float] = None,
                      strategy: Optional[str] = None,
-                     regime_at_open: Optional[str] = None) -> None:
-    """Archive existing position with reason='replaced', then add new one."""
-    archive_entry(ts_code, "active_positions", reason="replaced")
-    add_position(ts_code, name, entry_price, stop_loss, target,
-                 trigger_price, trigger_direction, expires_days,
-                 position_size_shares=position_size_shares,
-                 risk_amount=risk_amount,
-                 calibrated_confidence=calibrated_confidence,
-                 strategy=strategy,
-                 regime_at_open=regime_at_open)
+                     regime_at_open: Optional[str] = None) -> dict:
+    """Archive existing position with reason='replaced', then add new one.
+
+    推送聚合为单个 position_replaced 事件（archive + add 都静默，避免双推）。"""
+    wl = _load()
+    old = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
+    archive_entry(ts_code, "active_positions", reason="replaced", _notify=False)
+    new_rec = add_position(ts_code, name, entry_price, stop_loss, target,
+                           trigger_price, trigger_direction, expires_days,
+                           position_size_shares=position_size_shares,
+                           risk_amount=risk_amount,
+                           calibrated_confidence=calibrated_confidence,
+                           strategy=strategy,
+                           regime_at_open=regime_at_open,
+                           _notify=False)
+    _notify("position_replaced", ts_code=ts_code, name=name,
+            before=old, after=new_rec)
+    return new_rec
 
 
 def promote_candidate(ts_code: str, entry_price: float,
@@ -356,6 +392,7 @@ def buy(ts_code: str, fill_price: float, shares: int,
 
     if existing is not None:
         # 加仓
+        before_snapshot = dict(existing)
         old_shares = int(existing.get("position_size_shares") or 0)
         old_avg = float(existing.get("avg_cost") or existing.get("entry_price") or 0)
         new_shares = old_shares + shares
@@ -400,6 +437,7 @@ def buy(ts_code: str, fill_price: float, shares: int,
             record["strategy"] = str(strategy)
         wl["active_positions"].append(record)
         position = record
+        before_snapshot = None
 
     _save(wl)
     trade = _trades.append_trade(
@@ -409,6 +447,9 @@ def buy(ts_code: str, fill_price: float, shares: int,
         strategy=position.get("strategy") or strategy, regime=regime_label,
         journal_ref=journal_ref, realized_pnl=None, note=note,
     )
+    _notify("position_opened" if existing is None else "position_increased",
+            ts_code=ts_code, name=position.get("name", ""),
+            before=before_snapshot, after=position, trade=trade)
     return {"position": position, "trade": trade}
 
 
@@ -455,6 +496,7 @@ def sell(ts_code: str, fill_price: float, shares: int,
 
     if shares >= holding:
         # 卖光 → 留痕 + 走 close_position(actual_fill_price=avg_cost_before 使 pnl 基准正确)
+        before = dict(pos)
         realized = round((fill_price - avg_cost_before) * holding, 2) if avg_cost_before > 0 else None
         realized_pct = round((fill_price / avg_cost_before - 1), 4) if avg_cost_before > 0 else None
         trade = _trades.append_trade(
@@ -467,7 +509,7 @@ def sell(ts_code: str, fill_price: float, shares: int,
         closed_record = close_position(
             ts_code=ts_code, exit_price=fill_price, exit_reason=exit_reason,
             actual_fill_price=avg_cost_before,
-            record_trade=False,  # 上面已 append_trade, 避免双写
+            record_trade=False,  # 上面已 append_trade, 避免双写；推送也由本分支发出，避免双推
         )
         diagnosis = None
         if postmortem:
@@ -481,9 +523,13 @@ def sell(ts_code: str, fill_price: float, shares: int,
                 _cal.compute()
             except Exception:
                 pass
+        _notify("position_closed", ts_code=ts_code, name=name,
+                before=before, after=None, trade=trade,
+                close=closed_record.get("close"), exit_reason=exit_reason)
         return {"trade": trade, "closed_record": closed_record, "diagnosis": diagnosis}
 
     # 减仓 → 留痕 + 改状态, 不复盘
+    before = dict(pos)
     realized = round((fill_price - avg_cost_before) * shares, 2) if avg_cost_before > 0 else None
     realized_pct = round((fill_price / avg_cost_before - 1), 4) if avg_cost_before > 0 else None
     new_shares = holding - shares
@@ -496,6 +542,8 @@ def sell(ts_code: str, fill_price: float, shares: int,
         strategy=strategy, regime=regime_label, journal_ref=journal_ref,
         realized_pnl=realized, realized_pnl_pct=realized_pct, note=note,
     )
+    _notify("position_decreased", ts_code=ts_code, name=name,
+            before=before, after=pos, trade=trade, exit_reason=exit_reason)
     return {"position": pos, "trade": trade}
 
 
@@ -535,10 +583,12 @@ def dedup_active_positions() -> int:
     return archived_count
 
 
-def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "manual") -> bool:
+def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "manual",
+                  _notify: bool = True) -> bool:
     """Move an entry from active_positions or candidates into archived. Returns True if moved.
 
     section 缺省时自动探测: 候选优先, 再 active_positions。便于前端只传 ts_code+reason。
+    _notify=False 时静默（供 replace_position 聚合事件）。仅 active_positions 归档触发推送。
     """
     wl = _load()
     if section is None:
@@ -551,12 +601,16 @@ def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "ma
     today = date.today().isoformat()
     for i, item in enumerate(wl[section]):
         if item.get("ts_code") == ts_code:
+            before = dict(item)
             item["status"] = f"archived_{reason}"
             item["archived_date"] = today
             item["archived_from"] = section
             wl["archived"].append(item)
             wl[section].pop(i)
             _save(wl)
+            if section == "active_positions" and _notify:
+                _notify("position_archived", ts_code=ts_code,
+                        name=item.get("name", ""), before=before, after=None)
             return True
     return False
 
@@ -720,9 +774,11 @@ def close_position(ts_code: str,
 
     # 平仓即卖光: 追加一条 sell trade 留痕(realized_pnl 与 closed record 同口径, 基准=fill_price)。
     # sell() 卖光分支已自行 append_trade, 走 record_trade=False 避免双写。
+    # 推送同理: 仅直接调用 close_position(POST /close) 时在此推 position_closed；
+    # sell() 卖光分支自行推送, 传 record_trade=False 跳过此处避免双推。
     if record_trade:
         from apex import trades as _trades
-        _trades.append_trade(
+        sell_trade = _trades.append_trade(
             ts_code=ts_code, name=pos.get("name", ""), side="sell",
             fill_price=float(exit_price), shares=shares,
             avg_cost_after=None, shares_after=0,
@@ -731,6 +787,9 @@ def close_position(ts_code: str,
             realized_pnl=realized_pnl_amount, realized_pnl_pct=realized_pnl_pct,
             note=user_notes or exit_reason,
         )
+        _notify("position_closed", ts_code=ts_code, name=pos.get("name", ""),
+                before=dict(pos), after=None, trade=sell_trade,
+                close=record.get("close"), exit_reason=exit_reason)
 
     return record
 
@@ -849,6 +908,8 @@ def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:
 
     不调 AI(零成本), 只复用已有 journal。journal 无分析或无 price_advice → None。
     返回同步后的字段 + 续期天数(因 trigger 变了距离也变)。
+    隐式延长(新 expires_at 晚于旧值)时 renew_count++, 与 renew_candidate 僵尸防护闭环;
+    缩短不计数。返回带 renewed 标记本次是否触发续期。
     """
     from apex import journal
     latest = journal.load_latest(ts_code)
@@ -874,8 +935,14 @@ def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:
         # trigger 变了 → 距离变了 → 重算过期(用新 entry 距离今天的波动)
         resolved, meta = _dynamic_expiry_days(ts_code, float(entry))
         from datetime import timedelta
-        item["expires_at"] = (date.today() + timedelta(days=resolved)).isoformat()
+        old_expires = item.get("expires_at")
+        new_expires = (date.today() + timedelta(days=resolved)).isoformat()
+        item["expires_at"] = new_expires
         item["expires_meta"] = {"expires_days": resolved, **meta}
+        # 隐式延长才计 renew_count(缩短不算续期), 与 renew_candidate 僵尸防护闭环
+        renewed = bool(old_expires and new_expires > old_expires)
+        if renewed:
+            item["renew_count"] = item.get("renew_count", 0) + 1
         _save(data)
         return {
             "trigger_price": float(entry),
@@ -883,9 +950,14 @@ def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:
             "target_advice": item.get("target_advice"),
             "analyzed_at": latest.get("analyzed_at") or latest.get("date"),
             "expires_days": resolved,
+            "renew_count": item.get("renew_count", 0),
+            "renewed": renewed,
             **meta,
         }
     return None
+
+
+def renew_candidate(ts_code: str) -> Optional[dict]:
     """续期一个已过期的候选: trigger 不动, 用今天的波动率 + 原 trigger 距离重算过期天数。
 
     不调 AI(零成本), 纯粋延长观察期。代价是可能养出僵尸候选(多次续期),

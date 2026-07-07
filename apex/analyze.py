@@ -403,7 +403,8 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
 
 
 def _make_client(cfg: dict) -> OpenAI:
-    return OpenAI(
+    from apex.llm import make_client
+    return make_client(
         api_key=cfg["deepseek"]["api_key"],
         base_url=cfg["deepseek"].get("base_url", "https://api.deepseek.com"),
     )

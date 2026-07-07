@@ -32,7 +32,7 @@ import {
   useSyncCandidateAi,
 } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
-import { formatPrice } from "@/lib/utils";
+import { formatPrice, formatAmount } from "@/lib/utils";
 
 /**
  * /watchlist 持仓 & 候选页
@@ -106,6 +106,9 @@ export function WatchlistPage() {
   const [promoteShares, setPromoteShares] = useState("");
   const [promoteStop, setPromoteStop] = useState("");
   const [promoteTargetPrice, setPromoteTargetPrice] = useState("");
+
+  // 交易流水弹窗(原底部平铺 Card, 改弹窗省版面)
+  const [showTrades, setShowTrades] = useState(false);
 
   const submitAdd = (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -329,6 +332,19 @@ export function WatchlistPage() {
           >
             <RefreshCw className="mr-1 h-3.5 w-3.5" />
             刷新
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowTrades(true)}
+          >
+            <ListTree className="mr-1 h-3.5 w-3.5" />
+            交易流水
+            {tradesData && tradesData.length > 0 && (
+              <span className="num ml-1 rounded bg-bg-base px-1.5 text-[10px] text-text-secondary">
+                {tradesData.length}
+              </span>
+            )}
           </Button>
           <Button
             variant="primary"
@@ -588,52 +604,60 @@ export function WatchlistPage() {
         </>
       ) : null}
 
-      <Card>
-        <CardHeader className="flex flex-row items-center gap-2">
-          <ListTree className="h-4 w-4 text-text-secondary" />
-          <CardTitle>交易流水</CardTitle>
-          <span className="num text-xs text-text-secondary">
-            {tradesData?.length ?? 0} 条
+      {/* 交易流水弹窗(原底部平铺 Card, 改弹窗省版面) */}
+      <Dialog
+        open={showTrades}
+        onClose={() => setShowTrades(false)}
+        widthClass="max-w-2xl"
+        title={
+          <span className="flex items-center gap-2">
+            <ListTree className="h-4 w-4 text-text-secondary" />
+            交易流水
+            <span className="num text-xs font-normal text-text-secondary">
+              {tradesData?.length ?? 0} 条
+            </span>
           </span>
-        </CardHeader>
-        <CardContent>
-          {!tradesData || tradesData.length === 0 ? (
-            <p className="py-6 text-center text-sm text-flat">暂无交易记录</p>
-          ) : (
-            <div className="divide-y divide-border">
-              {tradesData.map((t) => (
-                <div key={t.trade_id} className="flex items-center justify-between gap-3 py-2.5">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className={`rounded px-1.5 py-0.5 text-[10px] ${t.side === "buy" ? "bg-up/10 text-up" : "bg-down/10 text-down"}`}>
-                        {t.side === "buy" ? "买入" : "卖出"}
-                      </span>
-                      <p className="truncate text-sm font-medium">{t.name || t.ts_code}</p>
-                      <span className="num text-[11px] text-text-secondary">{t.ts_code}</span>
-                    </div>
-                    <p className="mt-0.5 num text-[11px] text-text-secondary">
-                      {formatPrice(t.fill_price)} × {t.shares} 股 · {t.traded_at.slice(0, 16).replace("T", " ")}
-                      {t.note && <span className="ml-1">· {t.note}</span>}
-                    </p>
+        }
+      >
+        {!tradesData || tradesData.length === 0 ? (
+          <p className="py-6 text-center text-sm text-flat">暂无交易记录</p>
+        ) : (
+          <div className="divide-y divide-border">
+            {tradesData.map((t) => (
+              <div key={t.trade_id} className="flex items-center justify-between gap-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] ${t.side === "buy" ? "bg-up/10 text-up" : "bg-down/10 text-down"}`}>
+                      {t.side === "buy" ? "买入" : "卖出"}
+                    </span>
+                    <p className="truncate text-sm font-medium">{t.name || t.ts_code}</p>
+                    <span className="num text-[11px] text-text-secondary">{t.ts_code}</span>
                   </div>
-                  <div className="text-right">
-                    {t.realized_pnl != null && (
-                      <p className={`num text-sm ${t.realized_pnl >= 0 ? "text-up" : "text-down"}`}>
-                        {t.realized_pnl >= 0 ? "+" : ""}{t.realized_pnl.toFixed(0)} 元
-                      </p>
-                    )}
-                    <p className="num text-[11px] text-text-secondary">
-                      {t.realized_pnl_pct != null
-                        ? `${(t.realized_pnl_pct * 100).toFixed(2)}%`
-                        : "—"}
-                    </p>
-                  </div>
+                  <p className="mt-0.5 num text-[11px] text-text-secondary">
+                    {formatPrice(t.fill_price)} × {t.shares} 股 · {t.traded_at.slice(0, 16).replace("T", " ")}
+                    {t.note && <span className="ml-1">· {t.note}</span>}
+                  </p>
                 </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                <div className="text-right">
+                  {/* 成交金额: 买入=花出, 卖出=回笼; amount 后端已存(fill_price × shares) */}
+                  <p className="num text-sm text-text-primary">{formatAmount(t.amount)}</p>
+                  {/* 盈亏: 仅卖出/平仓有 realized_pnl; 买入显 — */}
+                  {t.realized_pnl != null ? (
+                    <p className={`num text-[11px] ${t.realized_pnl >= 0 ? "text-up" : "text-down"}`}>
+                      {t.realized_pnl >= 0 ? "+" : ""}{t.realized_pnl.toFixed(0)} 元
+                      <span className="opacity-80">
+                        {" "}{t.realized_pnl_pct != null ? `${(t.realized_pnl_pct * 100).toFixed(2)}%` : ""}
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="num text-[11px] text-flat">—</p>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Dialog>
 
       {/* 平仓复盘/归档入口(ED12 inventory, PR1b 占位) */}
       <Card>

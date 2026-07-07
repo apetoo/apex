@@ -177,6 +177,14 @@ export function AnalyzePage() {
                   <span className="text-flat">…</span>
                 ) : null}
               </CardTitle>
+              {/* 行业 · 市场: /info 已返回的字段, AI 常按行业归类, 市场定涨跌停规则(主板±10%/创科±20%/北交所±30%) */}
+              {(stockInfo.data?.industry || stockInfo.data?.market) && (
+                <p className="text-xs text-flat">
+                  {[stockInfo.data?.industry, stockInfo.data?.market]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              )}
             </CardHeader>
             <CardContent>
               <PriceTag

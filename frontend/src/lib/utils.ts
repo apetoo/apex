@@ -57,6 +57,15 @@ export function formatDelta(delta: number | null | undefined): string {
 }
 
 /**
+ * 格式化成交金额(元): 千分位 + "元"。null/0/NaN → —。
+ * 用于交易流水 amount = fill_price × shares(买入=花出, 卖出=回笼)。
+ */
+export function formatAmount(amount: number | null | undefined): string {
+  if (amount == null || amount === 0 || Number.isNaN(amount)) return "—";
+  return `${amount.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 元`;
+}
+
+/**
  * 成交额 千元 → 亿元(÷1e5)。
  * tushare index_daily 的 amount 单位是千元, 新浪实时 amount 已在后端 ÷1000 对齐到千元。
  * 1 亿 = 1e5 千元, 故 ÷1e5。null/undefined/NaN → null(便于上层判空)。

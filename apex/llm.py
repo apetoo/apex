@@ -12,14 +12,30 @@ Usage:
         print(chunk, end="")
 """
 
+import httpx
 from openai import OpenAI
 
 from apex import config as _cfg
 
 
+def make_client(api_key: str, base_url: str) -> OpenAI:
+    """LLM client 工厂。所有 DeepSeek/火山方舟调用走这里。
+
+    httpx.Client(trust_env=False): 不读 all_proxy/http_proxy 环境变量, 直连国内 API,
+    避免后端 uvicorn 继承 shell 的 SOCKS 代理(all_proxy=socks5://) 触发
+    "socksio not installed" 报错。httpx 默认带 certifi 作 CA, 直连 SSL 不依赖系统
+    证书(macOS Python.framework 系统证书缺失也不怕, 区别于 urllib)。
+    """
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        http_client=httpx.Client(trust_env=False),
+    )
+
+
 def _get_client() -> OpenAI:
     conf = _cfg.get()
-    return OpenAI(
+    return make_client(
         api_key=conf["deepseek"]["api_key"],
         base_url=conf["deepseek"].get("base_url", "https://api.deepseek.com"),
     )

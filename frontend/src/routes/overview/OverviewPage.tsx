@@ -11,10 +11,11 @@ import {
 import { MarketIndexBar } from "@/components/a-share";
 import { getPrices, getPrevClosePrices } from "@/api/market";
 import { getWatchlist, getClosedPositions } from "@/api/watchlist";
-import { getAccount } from "@/api/account";
+import { getAccount, getAccountSummary } from "@/api/account";
 import { qk } from "@/api/query-keys";
 import { cn, formatPercent } from "@/lib/utils";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
+import { PushStatusCard } from "@/routes/overview/PushStatusCard";
 
 /**
  * / 概览首页
@@ -22,6 +23,32 @@ import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
  * 顶部两栏: 今日盈亏汇总 + 总资产
  * 下方: 持仓完整列表
  */
+
+const fmtMoney = (n: number | null | undefined) =>
+  n == null || Number.isNaN(n)
+    ? "—"
+    : n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const fmtSigned = (n: number | null | undefined) =>
+  n == null || Number.isNaN(n)
+    ? "—"
+    : `${n >= 0 ? "+" : ""}${n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+function SummaryRow({ label, value, tone }: { label: string; value: string; tone?: number }) {
+  const toneClass =
+    tone == null || tone === 0
+      ? "text-text-primary"
+      : tone > 0
+        ? "text-up"
+        : "text-down";
+  return (
+    <div className="flex justify-between text-text-secondary">
+      <span>{label}</span>
+      <span className={cn("num", toneClass)}>{value}</span>
+    </div>
+  );
+}
+
 export function OverviewPage() {
   const navigate = useNavigate();
 
@@ -35,6 +62,11 @@ export function OverviewPage() {
   const account = useQuery({
     queryKey: qk.account,
     queryFn: getAccount,
+  });
+
+  const summary = useQuery({
+    queryKey: qk.accountSummary,
+    queryFn: getAccountSummary,
   });
 
   const positions = watchlist.data?.active_positions ?? [];
@@ -166,6 +198,7 @@ export function OverviewPage() {
             void daily.refetch();
             void watchlist.refetch();
             void account.refetch();
+            void summary.refetch();
           }}
         >
           <RefreshCw className="mr-1 h-3.5 w-3.5" />
@@ -241,7 +274,7 @@ export function OverviewPage() {
           </CardContent>
         </Card>
 
-        {/* 总资产 */}
+        {/* 总资产: 本金 + 累计已实现 + 浮盈 */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-normal text-text-secondary">
@@ -250,24 +283,49 @@ export function OverviewPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {account.isLoading ? (
+            {summary.isLoading ? (
               <span className="num inline-block h-7 w-24 animate-pulse rounded bg-bg-card" />
-            ) : account.isError ? (
+            ) : summary.isError || !summary.data ? (
               <p className="text-xs text-flat">加载失败</p>
-            ) : totalCapital != null ? (
+            ) : (
               <div>
                 <p className="num text-2xl font-semibold text-text-primary">
-                  {totalCapital.toLocaleString("zh-CN", {
+                  {summary.data.total_assets.toLocaleString("zh-CN", {
                     minimumFractionDigits: 2,
                     maximumFractionDigits: 2,
                   })}
                 </p>
-                <p className="mt-1 text-xs text-text-secondary">
-                  总资金 · 每笔风险 {acc?.risk_per_trade_pct ?? "—"}%
-                </p>
+                {summary.data.total_return_pct != null && (
+                  <p
+                    className={cn(
+                      "num mt-1 text-sm",
+                      summary.data.total_return_pct >= 0 ? "text-up" : "text-down",
+                    )}
+                  >
+                    {formatPercent(summary.data.total_return_pct)} 总收益率
+                  </p>
+                )}
+                <div className="mt-3 space-y-0.5 text-[11px]">
+                  <SummaryRow label="持仓市值" value={fmtMoney(summary.data.market_value)} />
+                  <SummaryRow label="持仓成本" value={fmtMoney(summary.data.cost_basis)} />
+                  <SummaryRow
+                    label="浮盈"
+                    value={`${fmtSigned(summary.data.unrealized_pnl)}${summary.data.unrealized_pnl_pct != null ? `  ${formatPercent(summary.data.unrealized_pnl_pct)}` : ""}`}
+                    tone={summary.data.unrealized_pnl}
+                  />
+                  <SummaryRow
+                    label="已实现"
+                    value={fmtSigned(summary.data.realized_pnl_total)}
+                    tone={summary.data.realized_pnl_total}
+                  />
+                  <SummaryRow label="本金" value={fmtMoney(summary.data.total_capital)} />
+                </div>
+                {summary.data.missing_price_count > 0 && (
+                  <p className="mt-2 text-[10px] text-text-secondary">
+                    {summary.data.missing_price_count} 只无现价, 未计入市值
+                  </p>
+                )}
               </div>
-            ) : (
-              <p className="num text-2xl font-semibold text-flat">—</p>
             )}
           </CardContent>
         </Card>
@@ -311,6 +369,9 @@ export function OverviewPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* 持仓推送：状态 + 手动全量触发 */}
+      <PushStatusCard />
     </div>
   );
 }

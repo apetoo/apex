@@ -302,9 +302,9 @@ def _ai_screen_one(client, model: str, system: str, candidate: dict) -> Optional
 
 def _ai_quick_screen(top_candidates: list[dict], cfg: dict,
                       on_progress=None, regime: Optional[dict] = None) -> list[dict]:
-    from openai import OpenAI
+    from apex.llm import make_client
 
-    client = OpenAI(
+    client = make_client(
         api_key=cfg["deepseek"]["api_key"],
         base_url=cfg["deepseek"].get("base_url", "https://api.deepseek.com"),
     )

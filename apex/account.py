@@ -228,3 +228,82 @@ def current_total_risk(active_positions: list[dict],
         "position_count": counted,
         "missing_size_count": missing,
     }
+
+
+def summary(active_positions: list[dict],
+            account: Optional[dict] = None) -> dict:
+    """汇总账户总资产拆分: 总资产 = 总本金 + 累计已实现盈亏 + 未实现浮盈浮亏。
+
+    现价取数: realtime 优先(Sina 盘中), None 回退 tushare 日线收盘(同 /api/market/prices)。
+    取不到现价的仓位计入 missing_price_count, 不参与市值/浮盈求和(总资产为已知部分下限)。
+
+    返回:
+      total_capital        : 总本金(account.json)
+      market_value         : 持仓市值(现价×股数, 仅取到价仓位)
+      cost_basis           : 持仓成本(成本×股数, 仅取到价仓位)
+      unrealized_pnl       : 浮盈浮亏(市值-成本)
+      unrealized_pnl_pct   : 浮盈占成本百分比
+      realized_pnl_total   : 累计已实现盈亏(trades.jsonl 所有 realized_pnl 之和)
+      total_assets         : 总资产 = 本金 + 已实现 + 浮盈
+      total_return_pct     : 总收益率 = (总资产-本金)/本金
+      position_count       : 活跃仓位数
+      missing_price_count  : 取不到现价的仓位数
+      as_of                : 计算时点(CN 时区 ISO)
+    """
+    from apex import data as _data, trades as _trades
+
+    if account is None:
+        account = load()
+    capital = float(account.get("total_capital") or 0)
+
+    # 累计已实现盈亏: trades.jsonl 所有 realized_pnl 之和(buy 为 None, 跳过)
+    realized_total = 0.0
+    for t in _trades.load_trades():
+        rp = t.get("realized_pnl")
+        if rp is not None:
+            realized_total += float(rp)
+
+    # 现价: realtime 优先 + daily fallback (同 /api/market/prices)
+    codes = [p.get("ts_code") for p in active_positions if p.get("ts_code")]
+    prices: dict[str, Optional[float]] = {}
+    if codes:
+        realtime = _data.get_realtime_price(codes)
+        latest = _data.get_latest_price(codes)
+        for c in codes:
+            cur = realtime.get(c)
+            prices[c] = cur if cur is not None else latest.get(c)
+
+    market_value = 0.0
+    cost_basis = 0.0
+    missing_price = 0
+    for p in active_positions:
+        shares = p.get("position_size_shares") or 0
+        if not shares:
+            continue
+        cur = prices.get(p.get("ts_code"))
+        if cur is None or cur <= 0:
+            missing_price += 1
+            continue
+        shares = float(shares)
+        cost = float(p.get("avg_cost") or p.get("entry_price") or 0)
+        market_value += float(cur) * shares
+        cost_basis += cost * shares
+
+    unrealized = market_value - cost_basis
+    unrealized_pct = (unrealized / cost_basis * 100) if cost_basis > 0 else None
+    total_assets = capital + realized_total + unrealized
+    total_return_pct = ((total_assets - capital) / capital * 100) if capital > 0 else None
+
+    return {
+        "total_capital": round(capital, 2),
+        "market_value": round(market_value, 2),
+        "cost_basis": round(cost_basis, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "unrealized_pnl_pct": round(unrealized_pct, 2) if unrealized_pct is not None else None,
+        "realized_pnl_total": round(realized_total, 2),
+        "total_assets": round(total_assets, 2),
+        "total_return_pct": round(total_return_pct, 2) if total_return_pct is not None else None,
+        "position_count": len(active_positions),
+        "missing_price_count": missing_price,
+        "as_of": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
+    }
