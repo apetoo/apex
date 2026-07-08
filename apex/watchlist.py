@@ -182,7 +182,7 @@ def add_position(ts_code: str, name: str, entry_price: float,
                  calibrated_confidence: Optional[float] = None,
                  strategy: Optional[str] = None,
                  regime_at_open: Optional[str] = None,
-                 _notify: bool = True) -> dict:
+                 emit_notify: bool = True) -> dict:
     """Add new position. Raises DuplicatePositionError if ts_code already in active_positions.
 
     可选字段缺省时不写入对应 key（保持老记录兼容）：
@@ -190,7 +190,7 @@ def add_position(ts_code: str, name: str, entry_price: float,
     strategy 是策略归属（screener 4 个策略名之一，或 'manual'/'analyze' 等），用于
     calibration.compute() 切 by_strategy 桶 + 长期评估各策略胜率。
 
-    _notify=False 时静默（供 replace_position 聚合为单个 position_replaced 事件）。
+    emit_notify=False 时静默（供 replace_position 聚合为单个 position_replaced 事件）。
     返回写入的 record。"""
     from datetime import timedelta
     data = _load()
@@ -236,7 +236,7 @@ def add_position(ts_code: str, name: str, entry_price: float,
         record["regime_at_open"] = str(regime_at_open)
     data["active_positions"].append(record)
     _save(data)
-    if _notify:
+    if emit_notify:
         _notify("position_opened", ts_code=ts_code, name=name,
                 before=None, after=record)
     return record
@@ -286,7 +286,7 @@ def replace_position(ts_code: str, name: str, entry_price: float,
     推送聚合为单个 position_replaced 事件（archive + add 都静默，避免双推）。"""
     wl = _load()
     old = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
-    archive_entry(ts_code, "active_positions", reason="replaced", _notify=False)
+    archive_entry(ts_code, "active_positions", reason="replaced", emit_notify=False)
     new_rec = add_position(ts_code, name, entry_price, stop_loss, target,
                            trigger_price, trigger_direction, expires_days,
                            position_size_shares=position_size_shares,
@@ -294,7 +294,7 @@ def replace_position(ts_code: str, name: str, entry_price: float,
                            calibrated_confidence=calibrated_confidence,
                            strategy=strategy,
                            regime_at_open=regime_at_open,
-                           _notify=False)
+                           emit_notify=False)
     _notify("position_replaced", ts_code=ts_code, name=name,
             before=old, after=new_rec)
     return new_rec
@@ -584,11 +584,11 @@ def dedup_active_positions() -> int:
 
 
 def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "manual",
-                  _notify: bool = True) -> bool:
+                  emit_notify: bool = True) -> bool:
     """Move an entry from active_positions or candidates into archived. Returns True if moved.
 
     section 缺省时自动探测: 候选优先, 再 active_positions。便于前端只传 ts_code+reason。
-    _notify=False 时静默（供 replace_position 聚合事件）。仅 active_positions 归档触发推送。
+    emit_notify=False 时静默（供 replace_position 聚合事件）。仅 active_positions 归档触发推送。
     """
     wl = _load()
     if section is None:
@@ -608,7 +608,7 @@ def archive_entry(ts_code: str, section: Optional[str] = None, reason: str = "ma
             wl["archived"].append(item)
             wl[section].pop(i)
             _save(wl)
-            if section == "active_positions" and _notify:
+            if section == "active_positions" and emit_notify:
                 _notify("position_archived", ts_code=ts_code,
                         name=item.get("name", ""), before=before, after=None)
             return True
