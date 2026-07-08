@@ -227,6 +227,10 @@ def current_total_risk(active_positions: list[dict],
         "over_limit": (pct is not None and pct > max_pct),
         "position_count": counted,
         "missing_size_count": missing,
+        "missing_warning": (
+            f"{missing} 笔持仓缺手数/进场价/止损，未计入总风险"
+            if missing > 0 else None
+        ),
     }
 
 
@@ -305,5 +309,9 @@ def summary(active_positions: list[dict],
         "total_return_pct": round(total_return_pct, 2) if total_return_pct is not None else None,
         "position_count": len(active_positions),
         "missing_price_count": missing_price,
+        "missing_warning": (
+            f"{missing_price} 笔持仓取不到现价，未计入市值/浮盈（总资产为已知部分下限）"
+            if missing_price > 0 else None
+        ),
         "as_of": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
     }

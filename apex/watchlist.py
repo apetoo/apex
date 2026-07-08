@@ -182,6 +182,7 @@ def add_position(ts_code: str, name: str, entry_price: float,
                  calibrated_confidence: Optional[float] = None,
                  strategy: Optional[str] = None,
                  regime_at_open: Optional[str] = None,
+                 size_method: Optional[str] = None,
                  emit_notify: bool = True) -> dict:
     """Add new position. Raises DuplicatePositionError if ts_code already in active_positions.
 
@@ -189,6 +190,8 @@ def add_position(ts_code: str, name: str, entry_price: float,
       position_size_shares / risk_amount / calibrated_confidence / strategy
     strategy 是策略归属（screener 4 个策略名之一，或 'manual'/'analyze' 等），用于
     calibration.compute() 切 by_strategy 桶 + 长期评估各策略胜率。
+    size_method 标注手数来源（'atr_estimated' / 'missing'），仅 promote 兜底推算时传；
+      不传 = 用户明确手填或老记录无此字段。
 
     emit_notify=False 时静默（供 replace_position 聚合为单个 position_replaced 事件）。
     返回写入的 record。"""
@@ -234,6 +237,8 @@ def add_position(ts_code: str, name: str, entry_price: float,
             regime_at_open = None
     if regime_at_open:
         record["regime_at_open"] = str(regime_at_open)
+    if size_method:
+        record["size_method"] = str(size_method)
     data["active_positions"].append(record)
     _save(data)
     if emit_notify:
@@ -307,12 +312,18 @@ def promote_candidate(ts_code: str, entry_price: float,
                       risk_amount: Optional[float] = None,
                       calibrated_confidence: Optional[float] = None,
                       strategy: Optional[str] = None,
-                      regime_at_open: Optional[str] = None) -> None:
+                      regime_at_open: Optional[str] = None) -> dict:
     """Promote a candidate to active position. Archives the candidate with
     reason='promoted', then adds the active position using actual fill values.
 
+    手数处理：未传 position_size_shares 时从最近 journal 的 ATR(14)% 推算
+    (标 size_method=atr_estimated)；推算失败标 size_method=missing 且不写
+    trades 流水(0 股会污染统计)。用户手填 shares 不标 size_method。
+    写入一条 buy trade 到 trades.jsonl（对齐 buy() 流水口径，修断层1）。
+
     strategy 缺省时从候选 record 自动继承（候选时如果带了 strategy 字段）。
     """
+    from apex import trades as _trades
     wl = _load()
     existing = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
     if existing is not None:
@@ -322,15 +333,39 @@ def promote_candidate(ts_code: str, entry_price: float,
         raise ValueError(f"候选 {ts_code} 不存在")
     name = cand.get("name", "")
     inherited_strategy = strategy or cand.get("strategy")
+
+    # 修断层3：用户未填手数时从 journal ATR 推算兜底，避免风控/市值静默漏算
+    size_method: Optional[str] = None
+    resolved_shares = position_size_shares
+    if not resolved_shares:
+        estimated, method = _estimate_shares_from_journal(ts_code, entry_price)
+        if estimated:
+            resolved_shares = estimated
+        size_method = method  # atr_estimated / missing
+
     archive_entry(ts_code, "candidates", reason="promoted")
-    add_position(ts_code, name, entry_price, stop_loss, target,
+    record = add_position(ts_code, name, entry_price, stop_loss, target,
                  trigger_price=None, trigger_direction="below",
                  expires_days=expires_days,
-                 position_size_shares=position_size_shares,
+                 position_size_shares=resolved_shares,
                  risk_amount=risk_amount,
                  calibrated_confidence=calibrated_confidence,
                  strategy=inherited_strategy,
-                 regime_at_open=regime_at_open)
+                 regime_at_open=regime_at_open,
+                 size_method=size_method)
+
+    # 修断层1：promote 也写 buy trade，对齐 buy() 流水口径；
+    # 缺 shares（推算失败）则跳过——0 股会污染 trade_history/未来诊断统计
+    if resolved_shares and resolved_shares > 0:
+        _trades.append_trade(
+            ts_code=ts_code, name=name, side="buy",
+            fill_price=entry_price, shares=resolved_shares,
+            avg_cost_after=entry_price, shares_after=resolved_shares,
+            strategy=inherited_strategy, regime=regime_at_open,
+            journal_ref=_journal_ref_for(ts_code), realized_pnl=None,
+            note="promoted from candidate",
+        )
+    return record
 
 
 def _today_regime() -> Optional[str]:
@@ -363,6 +398,34 @@ def _journal_ref_for(ts_code: str) -> Optional[dict]:
         return None
 
 
+def _estimate_shares_from_journal(ts_code: str, entry_price: float) -> tuple[Optional[int], str]:
+    """从最近 journal 的 ATR(14)% 推算建议手数。零 API 调用（复用已存 journal）。
+
+    返回 (shares, method)：
+      - 推算成功 → (shares, "atr_estimated")
+      - 无 journal / 无 ATR / 风险预算不足 → (None, "missing")
+
+    用于 promote_candidate 用户未填 position_size_shares 时的兜底，
+    避免持仓缺手数导致 account.current_total_risk / summary 静默漏算。
+    """
+    try:
+        from apex import journal as _journal, account as _account
+        latest = _journal.load_latest(ts_code)
+        if not latest:
+            return None, "missing"
+        atr_pct = (latest.get("features") or {}).get("atr_14_pct")
+        if not atr_pct or float(atr_pct) <= 0:
+            return None, "missing"
+        ps = _account.compute_position_size_atr(
+            entry=float(entry_price), atr_pct=float(atr_pct),
+        )
+        if not ps.get("ok") or not ps.get("shares"):
+            return None, "missing"
+        return int(ps["shares"]), "atr_estimated"
+    except Exception:
+        return None, "missing"
+
+
 def buy(ts_code: str, fill_price: float, shares: int,
         stop_loss: Optional[float] = None, target: Optional[float] = None,
         note: str = "", strategy: str = "manual",
@@ -385,6 +448,10 @@ def buy(ts_code: str, fill_price: float, shares: int,
     fill_price = float(fill_price)
     shares = int(shares)
     wl = _load()
+    # 修断层2：绕过 promote 直接 buy 时，归档同 code 候选避免重复触发/推送/成交
+    if any(c.get("ts_code") == ts_code for c in wl.get("candidates", [])):
+        archive_entry(ts_code, "candidates", reason="bought_directly", emit_notify=False)
+        wl = _load()  # archive_entry 已 _save，重新加载
     existing = next((p for p in wl["active_positions"] if p.get("ts_code") == ts_code), None)
 
     regime_label = regime if regime is not None else _today_regime()

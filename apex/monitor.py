@@ -105,7 +105,7 @@ def _classify_candidate_trigger(cand: dict, price: float) -> Optional[dict]:
 
 
 def _emit_trigger(rec: dict, ts_code: str, name: str, section: str, price: float, cls: dict) -> dict:
-    return {
+    out = {
         "ts_code": ts_code,
         "name": name,
         "trigger_type": cls["type"],
@@ -114,6 +114,18 @@ def _emit_trigger(rec: dict, ts_code: str, name: str, section: str, price: float
         "section": section,
         "detected_at": datetime.now(_TZ_CN).isoformat(timespec="seconds"),
     }
+    # 带上建议价上下文：推送/前端直接看到止损/目标，不用再翻 watchlist 找候选 record
+    if section == "candidates":
+        for k in ("stop_advice", "target_advice", "trigger_low", "trigger_high", "note"):
+            v = rec.get(k)
+            if v is not None:
+                out[k] = v
+    else:  # active_positions
+        for k in ("stop_loss", "target", "entry_price"):
+            v = rec.get(k)
+            if v is not None:
+                out[k] = v
+    return out
 
 
 def check_once(notify_enabled: bool = True,
@@ -184,7 +196,14 @@ def check_once(notify_enabled: bool = True,
                 "candidate": "⚡️ 候选触发",
             }.get(t["trigger_type"], "🔔 触发")
             title = f"{label} {t['name']} {t['ts_code']}"
-            body = f"现价 {t['current_price']} ｜ 触发位 {t['trigger_price']}"
+            parts = [f"现价 {t['current_price']}", f"触发位 {t['trigger_price']}"]
+            stop = t.get("stop_advice") or t.get("stop_loss")
+            tgt = t.get("target_advice") or t.get("target")
+            if stop is not None:
+                parts.append(f"止损 {stop}")
+            if tgt is not None:
+                parts.append(f"目标 {tgt}")
+            body = " ｜ ".join(parts)
             try:
                 notify.notify(title, body)
                 notified += 1
