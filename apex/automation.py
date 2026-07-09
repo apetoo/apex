@@ -368,13 +368,18 @@ def task_screener_and_promote() -> str:
     print("  🔎 盘后粗筛 + 分析入候选")
     print("=" * 50)
 
-    # 1. 粗筛
-    try:
-        result = screener.run(on_progress=lambda m: print(f"    {m}"))
-        picks = result.get("results", []) or []
-    except Exception as e:
-        print(f"\n  ✗ 粗筛失败: {e}")
-        return "screener_fail"
+    # 1. 粗筛（今日已跑过则复用 jsonl，避免重复花 DeepSeek）
+    existing = screener.load_by_date(_today())
+    if existing and existing.get("top_scored"):
+        picks = existing["top_scored"]
+        print(f"\n  复用今日粗筛缓存: {len(picks)} 条")
+    else:
+        try:
+            result = screener.run(on_progress=lambda m: print(f"    {m}"))
+            picks = result.get("top_scored", []) or []
+        except Exception as e:
+            print(f"\n  ✗ 粗筛失败: {e}")
+            return "screener_fail"
     print(f"\n  粗筛完成: {len(picks)} 条")
 
     # 2. 取 top N（按 ai_score 降序，缺省 score）
