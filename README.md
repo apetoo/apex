@@ -1,100 +1,375 @@
-# apex — A股 AI 交易闭环系统
+# apex - A股 AI 交易闭环系统
 
-个人 A 股量化工具：DeepSeek AI 分析 + 持仓追踪 + 回测。
+个人 A 股量化工具：DeepSeek AI 分析 + 持仓追踪 + vectorbt 回测 + 盘后粗筛 + 模拟实盘自动化。单用户工具，文件存储。
 
-## 安装
+解耦三层架构：
+- **`apex/`** — 服务层（数据 / 分析 / 回测 / 筛选 / 自动化），无框架、无 DB
+- **`backend/`** — FastAPI 薄路由层，挂在 `apex.*` 之上，统一 `/api` 前缀
+- **`frontend/`** — Vite + React UI（雪球风，红涨绿跌），走 `/api` 调后端
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-## 配置
+## 一、环境准备
 
-编辑 `config.yaml`，填入 token 和 API key：
+- **Python ≥ 3.12**
+- **Node.js ≥ 18**（前端）
+- **[uv](https://docs.astral.sh/uv/)** — 推荐的 Python 环境与依赖管理工具
 
-```yaml
-tushare:
-  token: "你的 tushare token"   # tushare.pro 注册获取
-
-deepseek:
-  api_key: "sk-..."             # platform.deepseek.com 获取
-  model: "deepseek-chat"        # deepseek-chat = V3，deepseek-reasoner = R1
-```
-
-路径配置（默认不用改）：
-
-```yaml
-paths:
-  journal_dir: "~/.stock-journal"           # AI 分析日志
-  watchlist_file: "~/.stock-watchlist/watchlist.json"  # 持仓 & 候选
-  prompt_file: "~/.claude/skills/stock-analyze/prompts/expert-persona.md"
-```
-
-## 启动 Web UI
-
-后端 (FastAPI):
+安装 uv（已装可跳过）：
 
 ```bash
-uvicorn backend.main:app --reload --port 8000
+# macOS
+brew install uv
+# 或官方脚本
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-前端 (Vite + React, 雪球风):
+## 二、安装
+
+### 后端（Python）
+
+在仓库根目录：
+
+```bash
+# 1. 创建虚拟环境（.venv，自动选 Python 3.12+）
+uv venv
+
+# 2. 激活
+source .venv/bin/activate
+
+# 3. 安装依赖（完整依赖清单在 requirements.txt）
+uv pip install -r requirements.txt
+```
+
+> 不想激活也可以直接用 `.venv/bin/python`、`.venv/bin/uvicorn` 运行。
+> 依赖包括：`openai` / `tushare` / `akshare` / `vectorbt` / `pandas` / `numpy` / `pyarrow` / `click` / `pyyaml` / `fastapi` / `uvicorn` / `sse-starlette` / `pytest`。
+
+验证语法（无测试套件时的兜底）：
+
+```bash
+python -c "import ast; ast.parse(open('apex/analyze.py').read())"
+```
+
+### 前端（Node）
 
 ```bash
 cd frontend
-npm install        # 首次
-npm run dev        # http://localhost:5173
+npm install
 ```
 
-dev 模式默认走 mock 数据(后端不在也能跑可视化),要切真后端:
+---
+
+## 三、配置
+
+编辑仓库根目录的 **`config.yaml`**（启动时由 `apex.config.load()` 读一次，缓存为模块单例）。
+
+### Token / API Key
+
+YAML 里的值**优先**；留空则回退到环境变量（`TUSHARE_TOKEN` / `DEEPSEEK_API_KEY` / `BOCHA_API_KEY` / `MX_APIKEY`）。
+
+```yaml
+tushare:
+  token: ""                      # tushare.pro 注册获取（或 env TUSHARE_TOKEN）
+
+deepseek:
+  api_key: ""                    # platform.deepseek.com 获取（或 env DEEPSEEK_API_KEY）
+  base_url: "https://api.deepseek.com"   # OpenAI 兼容端点；火山方舟等亦可
+  model: "deepseek-chat"         # deepseek-chat=V3, deepseek-reasoner=R1
+  max_tool_iterations: 12        # AI 工具调用循环上限
+  history_limit: 8               # 分析时注入 prompt 的历史判断条数
+
+bocha:
+  api_key: ""                    # web 搜索（或 env BOCHA_API_KEY）
+
+mx:
+  api_key: ""                    # 妙想金融数据 API（或 env MX_APIKEY）
+```
+
+### 路径（默认不用改，均 tilde 展开到 `$HOME`）
+
+```yaml
+paths:
+  journal_dir: "~/.stock-journal"                              # AI 分析日志目录
+  watchlist_file: "~/.stock-watchlist/watchlist.json"          # 持仓 & 候选
+  prompt_file: "apex/prompts/expert-persona.md"                # 分析师 persona prompt
+  screener_dir: "~/.stock-journal/screener"                    # 粗筛报告
+  screener_prompt_file: "apex/prompts/screener_quick.md"
+```
+
+### 回测
+
+```yaml
+backtest:
+  lookforward_days: 10                # 每个看多信号向前回测的天数
+  min_entries_for_analysis: 5         # 少于该条数不跑统计
+  min_review_samples: 8               # AI 复盘最小可成交信号数
+  max_inject_age_days: 30             # 复盘反哺 analyze 的最大时效
+  oos_test_days: 30                   # OOS 验证：最近 N 天作 test 集
+  costs:                              # 交易成本（回测扣减）
+    commission_rate: 0.00025          # 佣金 万2.5（双向）
+    stamp_duty_rate: 0.001            # 印花税 千1（卖出）
+    slippage: 0.001                   # 单边滑点 10bp
+```
+
+### 通知
+
+```yaml
+notify:
+  enabled: true
+  channel: "console"          # console（终端打印）| bark（iOS 推送）
+  bark:
+    base_url: "https://api.day.app/<your-key>/"
+```
+
+### 代理（可选）
+
+全局 HTTP 代理，影响 DeepSeek / tushare / bocha 等所有出站请求。留空不走代理；新浪行情接口代码内显式 bypass，不受影响。shell 的 `HTTPS_PROXY` / `HTTP_PROXY` 优先级高于此配置。
+
+```yaml
+proxy:
+  http_proxy: ""              # 例: http://127.0.0.1:7890
+  https_proxy: ""
+  no_proxy: ""                # 例: localhost,127.0.0.1,.cn
+```
+
+### 粗筛（screener）
+
+```yaml
+screener:
+  enabled: true
+  ai_enabled: true            # 关掉则只跑规则层不调 AI
+  ai_model: "deepseek-chat"
+  top_n_for_ai: 15            # 送入 AI 的候选数
+  rule_weights:               # 各类信号权重（龙虎榜/涨停/概念/北向/行业）
+    dragon_tiger: 2.0
+    limit_up: 1.8
+    concept: 1.5
+    northbound: 1.2
+    industry: 1.0
+  filters:
+    min_float_mv_yi: 30             # 排除流通市值 < 30 亿
+    exclude_st: true                # 排除 ST
+    exclude_new_listings_days: 60   # 排除上市 60 天内新股
+  concurrency: 8
+```
+
+### 持仓推送（push）
+
+apex 主动调消费方 webhook，把持仓变更推出去（接口文档见 `docs/integration/positions-push-api.md`）。
+
+```yaml
+push:
+  enabled: true
+  base_url: "http://127.0.0.1:8899/api/apex"
+  path: "/positions/push"
+  incremental:
+    enabled: true            # 持仓变更实时推（push.enabled=false 时仍不发）
+  log_file: "~/.stock-journal/push_log.jsonl"   # 推送审计日志
+```
+
+### 自动撮合 / 模拟实盘（auto_trade）
+
+```yaml
+auto_trade:
+  enabled: false             # 本地人工环境保持 false；服务器部署改 true
+  top_n_picks: 5             # 粗筛后分析几只（按 ai_score 降序）
+  holding_period_days: 10    # 持有期满强制平仓（exit_reason=expired）
+  bullish_verdicts: ["看多", "偏多"]   # 哪些 verdict 入候选
+```
+
+> 成交价 = `trigger_price`（口径一致）；T+1；单只失败不中断；幂等靠状态机。
+> 已知简化：涨跌停 / 除权未还原，首版接受。
+
+---
+
+## 四、启动
+
+### 后端（FastAPI）
+
+```bash
+# 激活 .venv 后
+uvicorn backend.main:app --reload --port 8000
+# API 文档: http://localhost:8000/docs
+# 健康检查: http://localhost:8000/api/health
+```
+
+### 前端（Vite + React）
+
+```bash
+cd frontend
+npm run dev          # http://localhost:5173
+```
+
+dev 模式 Vite 把 `/api` 代理到 `127.0.0.1:8000`。前端默认走 **mock 数据**（后端不在也能跑可视化），要切真后端：
 
 ```bash
 VITE_USE_MOCK=0 npm run dev
 ```
 
+### 页面路由
+
 | 路由 | 功能 |
 |---|---|
-| `/` | 概览(联调/市场温度) |
-| `/watchlist` | 持仓 + 候选(价格/止损目标/盈亏/触发) |
-| `/analyze` | 个股分析(SSE trace 流式 + verdict 注入 chat) |
-| `/backtest` | 逐笔 P&L + 统计(柱状图替代净值曲线) |
-| `/screener` | 多策略粗筛(权重可调 + SSE 进度 + AI 综合) |
-| 右下角 | 全局 chat(单次注入当前页上下文) |
+| `/` | 概览（市场温度 + 持仓 + chat 触发） |
+| `/watchlist` | 持仓 / 候选 / 归档三标签（价格 / 止损目标 / 盈亏 / 触发，内联新增表单） |
+| `/analyze` | 个股分析（SSE trace 流式 + verdict 注入 chat + 个股历史概要） |
+| `/journal` | 跨股票全量历史 + 搜索 + 点行抽屉看完整结果 |
+| `/backtest` | 逐信号柱状图 + 统计表 + 已平仓交易 |
+| `/screener` | 多策略粗筛（权重滑块 localStorage + SSE 进度 + AI 综合） |
+| 右下角 | 全局 chat（单次注入当前页上下文） |
+| `/system` | 「我的交易系统」（守规 + 样本门控 + 上下文） |
 
-## CLI 命令
+---
+
+## 五、CLI 命令
+
+入口 `main.py`（基于 click，支持别名 `ls`/`bt`/`an`）。运行前先激活 `.venv`。
 
 ```bash
-# 分析单只股票
+# 分析单只股票（ts_code 必须带后缀，如 002050.SZ / 603019.SH / 838810.BJ）
 python main.py analyze 002050.SZ
+python main.py an 002050.SZ --no-save        # 别名 + 不落盘
 
-# 每日晨报（检查 watchlist 触发，自动重分析）
-python main.py daily
+# 每日晨报：持仓状态 + 候选触发检查
+python main.py briefing
 
-# 回测所有历史判断
+# 回测所有看多信号（或限定单只）
 python main.py backtest
+python main.py bt --ts-code 002050.SZ --detail
 
-# 回测特定股票，指定持仓天数
-python main.py backtest --ts-code 002050.SZ --days 5
+# 查看 watchlist（持仓 / 候选 / 归档概要，带实时价格）
+python main.py watchlist
+python main.py ls --no-realtime
 
-# 查看 watchlist
-python main.py watchlist list
+# 查询实时行情（多只）
+python main.py realtime 002241.SZ 002050.SZ
 
-# 添加持仓（进场 44，止损 43.2，目标 48，现价跌破 44.75 时触发重分析）
-python main.py watchlist add 002050.SZ --entry 44 --stop 43.2 --target 48 --trigger 44.75 --direction below --name 三花智控
+# 候选提升为持仓（实际成交后）：填实际成交价
+python main.py promote 002050.SZ --entry-price 45.0 --stop-loss 42.0 --target 50.0
 
-# 添加候选（涨过 38.5 时触发）
-python main.py watchlist watch 000034.SZ --trigger 38.5 --direction above --name 神州数码
+# 盘后筛选器（规则 + 可选 AI 二次筛选）
+python main.py screener
+python main.py screener --rule-only --top-n 20
 ```
 
-## 数据说明
+> **ts_code 规范**：系统内部一律用带交易所后缀的形式（首 digit 决定：6→SH、0/3→SZ、4/8→BJ）。所有 API 入口都会先过 `data.normalize_ts_code()`；CLI 手输时最好直接带后缀。
 
-- **分析日志**：`~/.stock-journal/<代码>.jsonl`，每次分析追加一行
-- **Watchlist**：`~/.stock-watchlist/watchlist.json`，持仓 + 候选 + 已归档
-- **回测结果**：`~/.stock-journal/backtest_last.csv`，每次覆盖
+---
 
-## 每日自动晨报（可选 cron）
+## 六、自动化（`apex.automation`）
+
+全自动交易助手，支持四种模式：
 
 ```bash
-# 每天早上 9:15 跑晨报
-15 9 * * 1-5 cd /Users/wanmingyu/workspace/my/apex && python main.py daily >> ~/.stock-journal/daily.log 2>&1
+# 1. 单次：按当前时段执行对应任务（cron 友好）
+python -m apex.automation
+
+# 2. 长连：交易时段持续运行，到点自动干活 + 每 60s 盯触发价
+python -m apex.automation --loop
+
+# 3. 盘后一次性自动撮合 + 粗筛入候选（服务器 cron 用，需 auto_trade.enabled=true）
+python -m apex.automation --auto-trade
+
+# 4. 查看今天干了什么
+python -m apex.automation --status
 ```
+
+### 长连模式（`--loop`）时间表
+
+| 时段 | 任务 |
+|---|---|
+| 09:00（morning_ready） | 晨报 + 持仓 / 候选触发检查 |
+| 09:30–11:30（morning） | 盘中分析 #1（从候选 / 归档挑一只） |
+| 13:00–15:00（afternoon） | 盘中分析 #2 |
+| 14:30–15:00（close） | 尾盘分析 #3 |
+| 15:30（postmarket） | 盘后筛选器 |
+| 全天交易时段 | 每 60s 盯触发价（复用 monitor，命中即推送） |
+
+非交易日跳过；状态记录在 `~/.stock-journal/automation_state.json`（按天重置，幂等防重复）。
+
+### 自动撮合（`--auto-trade`，模拟实盘）
+
+需 `config.auto_trade.enabled=true`，否则跳过。流程：
+
+1. **先平仓**：`entry_date < 今日` 的持仓，用今日 OHLC 判止损 / 止盈 / 到期（同日同时触及止损止盈 → 保守按先止损）。今日新 promote 的不判（T+1）。
+2. **再 promote**：候选用今日 OHLC 判触发，命中则按 `trigger_price` 成交，止损 / 目标缺省用 `entry×0.93 / ×1.10` 兜底。
+3. **粗筛入候选**：screener 取 top N → 逐个 analyze → verdict ∈ bullish_verdicts 且不重复 → `add_candidate`。
+
+> tushare 当日日线约 17:00 后才更新，故撮合走 **cron 不走 loop**（loop 的 15:30 postmarket 会跑空）。
+
+### 服务器 cron（推荐）
+
+```bash
+# 每交易日 18:33 跑一次自动撮合（等 tushare 当日数据出齐）
+33 18 * * 1-5 cd /opt/apex && /opt/apex/.venv/bin/python -m apex.automation --auto-trade >> ~/.stock-journal/automation.log 2>&1
+```
+
+本地人工盯盘可用 `--loop` 常驻（交易日开盘前启动，收盘后 Ctrl-C 停）。
+
+---
+
+## 七、数据存储
+
+全部在 `$HOME` 下（仓库内无数据），便于备份 / 迁移：
+
+| 路径 | 说明 |
+|---|---|
+| `~/.stock-journal/<ts_code>.jsonl` | 每只股票一份 AI 分析日志，append-only |
+| `~/.stock-journal/backtest_last.csv` | 最近一次回测结果，每次覆盖 |
+| `~/.stock-journal/screener/` | 盘后粗筛报告 |
+| `~/.stock-journal/automation_state.json` | 自动化状态（按天重置） |
+| `~/.stock-journal/push_log.jsonl` | 持仓推送审计日志 |
+| `~/.stock-watchlist/watchlist.json` | watchlist（active / candidates / archived） |
+
+备份：
+
+```bash
+tar -czf apex-data-$(date +%Y%m%d).tar.gz ~/.stock-watchlist ~/.stock-journal
+```
+
+---
+
+## 八、生产部署
+
+前端 build + nginx 反代 + systemd 管 uvicorn，详见 **[`docs/deploy/README.md`](docs/deploy/README.md)**。要点：
+
+- 后端 systemd unit 用 `--workers 1`（SSE 流式需常驻连接，多 worker 会让 stream 中断）
+- nginx 必须 `proxy_buffering off` + `proxy_read_timeout 600s`（单次 AI 分析可能跑 5–10 分钟）
+- 前端 build 前设 `VITE_USE_MOCK=0`，否则上线后全走前端 mock
+- CORS 上线收紧到实际域名（默认 `allow_origins=["*"]`）
+
+```bash
+# 前端构建
+cd frontend
+VITE_USE_MOCK=0 npm run build      # 产物到 dist/，由 nginx 直接服务
+
+# 后端
+sudo systemctl restart apex-backend
+```
+
+---
+
+## 九、目录结构
+
+```
+apex/
+├── apex/                 # 服务层（data/analyze/watchlist/backtest/screener/automation/...）
+├── backend/              # FastAPI 薄路由（routers/ + core/ + schemas/），全挂 /api
+├── frontend/             # Vite + React UI（api/ components/ routes/ hooks/）
+├── docs/
+│   ├── deploy/           # nginx.conf + systemd + 部署说明
+│   ├── integration/      # 持仓推送 API 文档
+│   └── adr/              # 架构决策记录
+├── tests/                # pytest 单测
+├── config.yaml           # 配置（token / 路径 / 回测 / 通知 / 代理 / 粗筛 / 推送 / 自动撮合）
+├── requirements.txt      # Python 依赖清单
+├── pyproject.toml        # uv 项目元信息（requires-python >=3.12）
+└── main.py               # CLI 入口（click）
+```
+
+## 十、关键约定
+
+- **交易流程：candidate → position**，不是 analysis → position。AI verdict 常建议尚未触及的进场价，故分析不直接建仓：`add_candidate(trigger_price=AI建议进场价)` → 实际成交后 `promote_candidate(entry_price=实际成交价)`。
+- **软删除**：watchlist 不做硬删，归档项的 `status` 字段记录原因（`archived_manual` / `archived_replaced` / `archived_promoted` / `archived_dedup` / `expired`）。
+- **收盘触发复盘 + 重新校准**：`close_position` 写平仓记录后，后端跑 `postmortem.run_and_patch`（AI 诊断）+ `calibration.compute()`。
+- **实时 vs 日线**：`get_realtime_price`（新浪，盘中）为主，`get_latest_price`（tushare 日线收盘）为停牌 / 失败回退。
