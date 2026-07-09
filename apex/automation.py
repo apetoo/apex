@@ -370,7 +370,7 @@ def task_screener_and_promote() -> str:
 
     # 1. 粗筛
     try:
-        result = screener.run()
+        result = screener.run(on_progress=lambda m: print(f"    {m}"))
         picks = result.get("results", []) or []
     except Exception as e:
         print(f"\n  ✗ 粗筛失败: {e}")
@@ -396,6 +396,7 @@ def task_screener_and_promote() -> str:
         if code in existing_codes:
             print(f"  ⏭ {code} 已在候选/持仓，跳过")
             continue
+        print(f"  🔍 分析 {code} {pick.get('name','')} ...")
         try:
             res = analyze.run(code, save=True)
         except Exception as e:
@@ -404,7 +405,7 @@ def task_screener_and_promote() -> str:
         verdict = res.get("verdict", "?")
         pa = res.get("price_advice") or {}
         entry = pa.get("entry")
-        print(f"  🔍 {code} {pick.get('name','')} -> {verdict} (entry={entry})")
+        print(f"    -> {verdict} (entry={entry})")
         if verdict not in acfg["bullish_verdicts"]:
             continue
         if not entry or float(entry) <= 0:
