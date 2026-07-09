@@ -66,9 +66,21 @@ def _ai_plan_for(ts_code: str, entry_date: Optional[str]) -> dict:
     cutoff = entry_date + "T23:59:59"
     before = [e for e in entries
               if (e.get("analyzed_at") or e.get("date") or "") <= cutoff]
-    pool = before or entries
-    latest = sorted(pool, key=lambda e: e.get("analyzed_at") or e.get("date") or "")[-1]
+    if not before:
+        return {}   # 入场前无分析 -> 无计划（不回退到入场后，避免 look-ahead bias）
+    latest = sorted(before, key=lambda e: e.get("analyzed_at") or e.get("date") or "")[-1]
     return latest.get("price_advice") or {}
+
+
+def _resolve_ai_plan(c: dict) -> dict:
+    """取开仓时 AI 计划 price_advice。优先读 close 时烘焙的快照 open.ai_price_advice
+    （确定、无 look-ahead、与 ai_verdict 同源）；老记录无快照时回退到 _ai_plan_for
+    （仅入场前分析，不回退未来）。"""
+    op = c.get("open") or {}
+    pa = op.get("ai_price_advice")
+    if pa and isinstance(pa, dict):
+        return pa
+    return _ai_plan_for(c.get("ts_code"), op.get("entry_date"))
 
 
 def _hold_bucket(days: Optional[int]) -> str:
@@ -327,7 +339,7 @@ def _proxy_emotional(closed: list, all_trades: list, buys: list) -> dict:
     for c in closed:
         op = c.get("open") or {}
         fill = op.get("actual_fill_price") or op.get("entry_price")
-        plan = _ai_plan_for(c.get("ts_code"), op.get("entry_date"))
+        plan = _resolve_ai_plan(c)
         ai_entry = (plan or {}).get("entry")
         if not fill or not ai_entry or float(ai_entry) <= 0:
             continue
@@ -362,7 +374,7 @@ def _ai_adherence(closed: list) -> dict:
         op = c.get("open") or {}
         cl = c.get("close") or {}
         fill = op.get("actual_fill_price") or op.get("entry_price")
-        plan = _ai_plan_for(c.get("ts_code"), op.get("entry_date"))
+        plan = _resolve_ai_plan(c)
         ai_entry = (plan or {}).get("entry")
         stop = op.get("stop_loss")
         low = cl.get("low_during_hold")
@@ -389,6 +401,7 @@ def _ai_adherence(closed: list) -> dict:
             "entry_band_ok": entry_band_ok,
             "stop_set": stop_set,
             "stop_honored": stop_honored,
+            "has_ai_plan": bool(plan and plan.get("entry")),  # 有可用 AI 入场计划（看多判断且 entry>0）
             "score": _score([entry_band_ok, stop_set, stop_honored]),
         })
 

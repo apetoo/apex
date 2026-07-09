@@ -171,9 +171,10 @@ def migrate_and_backfill() -> dict:
 
     # PR4: closed_positions 回填（regime 从缓存 / sector 走 tushare）+ trades 重建
     try:
-        bf = _backfill_closed_regime_sector()
+        bf = _backfill_closed_open_fields()
         stats["closed_regime_filled"] = bf.get("regime_filled", 0)
         stats["closed_sector_filled"] = bf.get("sector_filled", 0)
+        stats["closed_price_advice_filled"] = bf.get("price_advice_filled", 0)
     except Exception:
         pass
     try:
@@ -742,7 +743,9 @@ def _latest_journal_for(ts_code: str, before: Optional[str] = None) -> Optional[
         from apex import journal as _journal
         entries = _journal.load_entries(ts_code=ts_code)
         if before:
-            entries = [e for e in entries if (e.get("date") or "") <= before]
+            # 用 analyzed_at（canonical）比对；before 是日期则补到当天 23:59:59 以纳入同日分析
+            cutoff = before if "T" in before else before + "T23:59:59"
+            entries = [e for e in entries if (e.get("analyzed_at") or e.get("date") or "") <= cutoff]
         if not entries:
             return None
         return sorted(entries, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
@@ -767,24 +770,26 @@ def _sector_for(ts_code: str) -> Optional[str]:
     return None
 
 
-def _backfill_closed_regime_sector() -> dict:
-    """PR4: 回填 closed_positions.jsonl 里 open.regime_at_open / open.sector 缺失项。
+def _backfill_closed_open_fields() -> dict:
+    """PR4: 回填 closed_positions.jsonl 里 open 块缺失字段。
 
-    - regime 只从缓存读（regime.load(entry_date)），**不主动 collect 历史**：老记录
-      entry_date 若不在 regime 缓存则留 null（ADR：只回填可干净重建的）。
-    - sector 走 tushare 行业（membership 稳定，可安全回填）。
+    - regime_at_open：只从缓存读（regime.load(entry_date)），不主动 collect 历史。
+    - sector：tushare 行业（membership 稳定）。
+    - ai_price_advice：开仓时 AI 计划快照（与 close 时同源 _latest_journal_for），
+      让 system 层读快照而非重新查找（消除 look-ahead + 口径不一）。
     只填 null，绝不覆盖已有值；原子写（temp + os.replace）。
-    返回 {regime_filled, sector_filled, rewritten}。"""
+    返回 {regime_filled, sector_filled, price_advice_filled, rewritten}。"""
     import os
     import tempfile
     from apex import regime as _regime_mod
 
     path = _closed_positions_path()
     if not path.exists():
-        return {"regime_filled": 0, "sector_filled": 0, "rewritten": False}
+        return {"regime_filled": 0, "sector_filled": 0,
+                "price_advice_filled": 0, "rewritten": False}
 
     rows: list[str] = []
-    regime_filled = sector_filled = 0
+    regime_filled = sector_filled = price_advice_filled = 0
     rewritten = False
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -814,6 +819,17 @@ def _backfill_closed_regime_sector() -> dict:
                     op["sector"] = ind
                     sector_filled += 1
                     changed = True
+            if not op.get("ai_price_advice"):
+                # 老记录无烘焙的 AI 计划快照 -> 用入场前最近分析补（与 close 时同源）
+                try:
+                    jo = _latest_journal_for(rec.get("ts_code", ""), before=op.get("entry_date"))
+                except Exception:
+                    jo = None
+                pa = (jo or {}).get("price_advice")
+                if pa:
+                    op["ai_price_advice"] = pa
+                    price_advice_filled += 1
+                    changed = True
             if changed:
                 rec["open"] = op
                 rewritten = True
@@ -831,7 +847,8 @@ def _backfill_closed_regime_sector() -> dict:
                 os.unlink(tmp)
             except OSError:
                 pass
-    return {"regime_filled": regime_filled, "sector_filled": sector_filled, "rewritten": rewritten}
+    return {"regime_filled": regime_filled, "sector_filled": sector_filled,
+            "price_advice_filled": price_advice_filled, "rewritten": rewritten}
 
 
 def _build_reconstructed_closed(ts_code: str, buys: list, sells: list) -> Optional[dict]:
@@ -1162,6 +1179,7 @@ def close_position(ts_code: str,
             "ai_confidence": (journal_at_open or {}).get("confidence"),
             "ai_features": (journal_at_open or {}).get("features"),
             "ai_analysis_text": (journal_at_open or {}).get("analysis_text"),
+            "ai_price_advice": (journal_at_open or {}).get("price_advice"),
             "screener_signals": None,
             "screener_rule_score": None,
         },

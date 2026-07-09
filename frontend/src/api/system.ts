@@ -88,6 +88,7 @@ export interface SystemView {
       entry_band_ok: boolean | null;
       stop_set: boolean;
       stop_honored: boolean | null;
+      has_ai_plan: boolean;
       score: number | null;
     }>;
     aggregate: {
