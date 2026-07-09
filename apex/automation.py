@@ -190,7 +190,7 @@ def task_screener() -> str:
     print("  🔎 盘后筛选器")
     print("=" * 50)
     try:
-        result = screener.run(ai_enabled=True)
+        result = screener.run()
         count = len(result.get("results", []))
         print(f"\n  → 筛选完成: {count} 条结果")
         state = _load_state()
@@ -370,7 +370,7 @@ def task_screener_and_promote() -> str:
 
     # 1. 粗筛
     try:
-        result = screener.run(ai_enabled=True)
+        result = screener.run()
         picks = result.get("results", []) or []
     except Exception as e:
         print(f"\n  ✗ 粗筛失败: {e}")
