@@ -10,6 +10,25 @@ SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept",
 
 EXIT_REASON_ENUM = ["stop_hit", "target_hit", "manual", "expired", "other"]
 
+# 「我的交易系统」层（ADR-0001）：Setup 是用户声明的交易原型维度，与 strategy（决策来源）正交。
+# 种子词表可扩展（用户可加自定义）；AI 在 record_verdict 时预填，用户在 candidate/promote 时确认/覆盖。
+SETUP_SEED = [
+    "打板", "首板", "龙回头", "板块轮动", "超跌反弹",
+    "趋势突破", "业绩驱动", "题材炒作", "低位反转",
+]
+
+# Rule 检查表项词表（结构化、可自动评分）。每项 key 对应一个可观测的纪律条件。
+# params 存参数（如 entry_band 的容差、sizing_cap 的百分比），checked 三态：True/False/None(未覆盖)。
+RULE_ITEMS = [
+    "entry_band",        # 入仓价在 AI plan entry ± 容差内
+    "stop_formula",      # 止损按规则设置（如 fill-1.5×ATR）
+    "sizing_cap",        # 单票仓位 ≤ 上限
+    "no_average_down",   # 不加仓于亏损
+    "max_hold_days",     # 持仓 ≤ 上限天数
+    "sector_conc_cap",   # 板块集中度 ≤ 上限
+    "no_chase",          # 不追高（入场不在 >X% 涨幅后）
+]
+
 
 class SignalRecord(TypedDict, total=False):
     ts_code: str
@@ -51,6 +70,20 @@ class PriceAdviceSchema(TypedDict, total=False):
     position_size_pct: Optional[int]
 
 
+class RuleChecklistItemSchema(TypedDict, total=False):
+    """单条 Rule 检查项（ADR-0001 自录层）。"""
+    key: str          # RULE_ITEMS 之一，或自定义
+    params: dict      # 参数（容差/百分比/天数等）
+    checked: Optional[bool]  # True=遵守 / False=违规 / None=未覆盖（无法判定）
+
+
+class RuleChecklistSchema(TypedDict, total=False):
+    """用户在 promote 时提交的 Rule 检查表 + 自由备注。结构化项驱动自动守规评分，
+    note 纳结构装不下的规则。随持仓写入 closed.open，供 close 后守规算分。"""
+    items: list
+    note: str
+
+
 class RepeatAnalysisSchema(TypedDict, total=False):
     """24h 重复分析限幅记录（痛点#3透明化）。
 
@@ -84,3 +117,4 @@ class JournalEntry(TypedDict, total=False):
     source: str
     analysis_text: str
     repeat_analysis: RepeatAnalysisSchema
+    setup_tag: Optional[str]   # ADR-0001: AI 预填的交易原型（SETUP_SEED 之一或自定义），供 candidate/promote 继承

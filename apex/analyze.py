@@ -353,6 +353,14 @@ TOOLS = [
                             "new_info 非空且客观技术面确有变化才不限幅，否则方向限 ±1 档、conf 限 ±2。"
                         ),
                     },
+                    "setup_tag": {
+                        "type": "string",
+                        "description": (
+                            "本次分析对应的交易原型（setup），用于「我的交易系统」层聚类与未来 Rule Discovery。"
+                            "从种子词表选一：打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转；"
+                            "都不贴切则填「其他:<自定义>」。基于本次分析最核心的驱动逻辑判断，非看多方向也填（描述若入场的话是什么 setup）。"
+                        ),
+                    },
                 },
                 "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence"],
             },
@@ -1367,7 +1375,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | **蓝筹/白马 + 基本面证据 < 2 条** | **−2**（基本面权重 50% 但没有实质证据，置信度必须打折扣） |\n"
                 "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
                 "\n"
-                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。\n"
+                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。setup_tag 从种子词表（打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转）选最贴切本次驱动逻辑的一个，都不贴切填「其他:<自定义>」。\n"
                 "\n"
                 "6) **自我检查（在调用 record_verdict 前完成，写在 message content 末尾）**：\n"
                 "   - [ ] 我的四维权重与声明的股票类型是否一致？\n"
@@ -1375,6 +1383,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   - [ ] 题材/游资股：我是否错误地把\"基本面\"当成了主要判断依据？\n"
                 "   - [ ] 周期股：我是否在 PE 很低时说\"估值便宜\"（这是周期股陷阱）？\n"
                 "   - [ ] 我的 K 线分析深度是否与股票类型匹配（蓝筹股不需要逐根 K 线数浪）？\n"
+                "   - [ ] setup_tag 是否反映了本次最核心的驱动逻辑（而非随便选一个）？\n"
                 "   如果任一条不通过，回到对应步骤修正后再调 record_verdict。"
             ),
         },
@@ -1639,6 +1648,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "repeat_analysis": repeat_info,
         "prompt_version": "2.5.0",
         "source": "standalone",
+        "setup_tag": verdict_data.get("setup_tag"),
     }
 
     if save:

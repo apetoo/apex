@@ -1,0 +1,7 @@
+# 0001 - Two-layer adherence with Setup as a new dimension
+
+The "my trading system" page measures **Adherence** against two distinct plans, not one: the **AI Plan** (verdict + `price_advice`, already in the journal) and the user's own **Rule** (a structured checklist committed at entry). We introduce **Setup** as a new trade-archetype dimension (打板 / 板块轮动 / 超跌反弹 …), AI-prefilled in the verdict and confirmed by the user — explicitly *not* a reuse of the existing `strategy` field, which means decision-source (`manual`/`analyze`) and is orthogonal. Capture is split to mirror the decision stages: Setup tag at candidate creation (thesis), Rule checklist at `promote_candidate` (commitment); Adherence is auto-scored at close.
+
+Rejected: single-layer (AI-only) adherence, because it tracks "the AI's system" rather than the user's — the user explicitly wants their own; collapsing Setup into `strategy`, because the code already assigns `strategy` a different meaning and overloading it would corrupt `calibration.py`'s grouping; free-text Rules and a single capture point, because both forfeit auto-scoring and the Rule-Discovery clustering that is the long-term destination.
+
+Cost: schema touches across verdict / candidate / promote / closed, and a heavier entry UX — accepted because forward-capture cannot be retro-filled onto the 4 historical trades, so it must be right the first time. See `CONTEXT.md` for the canonical terms (AI Plan, Setup, Rule, Adherence vs Strategy).

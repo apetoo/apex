@@ -14,6 +14,7 @@ export const qk = {
   closedRecent: ["closed", "recent"] as const,
   trades: ["trades"] as const,
   calibration: ["calibration"] as const,
+  system: ["system"] as const,
   // 带参数的细粒度 key
   prices: (codes: string[]) => ["market", "prices", codes] as const,
   dailyPrices: (codes: string[]) => ["market", "prices-daily", codes] as const,

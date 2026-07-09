@@ -33,6 +33,7 @@ import {
 } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
 import { formatPrice, formatAmount } from "@/lib/utils";
+import { SETUP_SEED, RULE_ITEMS, RULE_ITEM_LABELS } from "@/lib/trading-system";
 
 /**
  * /watchlist 持仓 & 候选页
@@ -106,6 +107,11 @@ export function WatchlistPage() {
   const [promoteShares, setPromoteShares] = useState("");
   const [promoteStop, setPromoteStop] = useState("");
   const [promoteTargetPrice, setPromoteTargetPrice] = useState("");
+  // ADR-0001: setup 确认/覆盖 + 自录 Rule 检查表（承诺项，close 后守规算分）
+  const [promoteSetup, setPromoteSetup] = useState("");
+  const [promoteSetupCustom, setPromoteSetupCustom] = useState("");
+  const [promoteRuleKeys, setPromoteRuleKeys] = useState<Set<string>>(new Set());
+  const [promoteRuleNote, setPromoteRuleNote] = useState("");
 
   // 交易流水弹窗(原底部平铺 Card, 改弹窗省版面)
   const [showTrades, setShowTrades] = useState(false);
@@ -242,6 +248,22 @@ export function WatchlistPage() {
     setPromoteShares("100");
     setPromoteStop(c.stop_advice ? String(c.stop_advice) : "");
     setPromoteTargetPrice(c.target_advice ? String(c.target_advice) : "");
+    // setup 从候选继承（候选的 setup 由 AI verdict setup_tag 预填）
+    const st = c.setup;
+    if (typeof st === "string" && st) {
+      if ((SETUP_SEED as readonly string[]).includes(st)) {
+        setPromoteSetup(st);
+        setPromoteSetupCustom("");
+      } else {
+        setPromoteSetup("其他");
+        setPromoteSetupCustom(st);
+      }
+    } else {
+      setPromoteSetup("");
+      setPromoteSetupCustom("");
+    }
+    setPromoteRuleKeys(new Set());
+    setPromoteRuleNote("");
   };
 
   // —— 过期候选三选一: 重分析 —— 写 sessionStorage 让 AnalyzePage mount 自动 commit 跑 AI
@@ -272,8 +294,33 @@ export function WatchlistPage() {
     const stop = Number(promoteStop);
     const target = Number(promoteTargetPrice);
     if (!entry || !shares || !stop || !target) return;
+    const finalSetup =
+      promoteSetup === "其他"
+        ? promoteSetupCustom.trim()
+          ? `其他:${promoteSetupCustom.trim()}`
+          : undefined
+        : promoteSetup || undefined;
+    const rule_checklist =
+      promoteRuleKeys.size > 0 || promoteRuleNote.trim()
+        ? {
+            items: Array.from(promoteRuleKeys).map((key) => ({
+              key,
+              params: {},
+              checked: null as boolean | null,
+            })),
+            note: promoteRuleNote.trim() || undefined,
+          }
+        : undefined;
     promoteMut.mutate(
-      { ts_code: promoteTarget.ts_code, entry_price: entry, shares, stop_loss: stop, target },
+      {
+        ts_code: promoteTarget.ts_code,
+        entry_price: entry,
+        shares,
+        stop_loss: stop,
+        target,
+        setup: finalSetup,
+        rule_checklist,
+      },
       { onSuccess: () => setPromoteTarget(null) },
     );
   };
@@ -824,6 +871,72 @@ export function WatchlistPage() {
                 />
               </div>
             </div>
+
+            {/* ADR-0001: setup 确认/覆盖 + 自录 Rule 检查表（承诺项，close 后守规算分） */}
+            <div className="rounded-md border border-border bg-bg-base/50 p-3">
+              <label className="mb-1 block text-xs text-text-secondary">
+                Setup（交易原型）
+              </label>
+              <div className="flex gap-2">
+                <select
+                  value={promoteSetup}
+                  onChange={(e) => setPromoteSetup(e.target.value)}
+                  className="flex-1 rounded-md border border-border bg-bg-card px-2 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                >
+                  <option value="">不标注</option>
+                  {SETUP_SEED.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                  <option value="其他">其他（自定义）</option>
+                </select>
+                {promoteSetup === "其他" && (
+                  <input
+                    type="text"
+                    value={promoteSetupCustom}
+                    onChange={(e) => setPromoteSetupCustom(e.target.value)}
+                    placeholder="自定义 setup"
+                    className="flex-1 rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+                  />
+                )}
+              </div>
+
+              <label className="mb-1 mt-3 block text-xs text-text-secondary">
+                Rule 检查表（承诺项，close 后评估守规）
+              </label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {RULE_ITEMS.map((key) => (
+                  <label
+                    key={key}
+                    className="flex items-center gap-1.5 text-xs"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={promoteRuleKeys.has(key)}
+                      onChange={(e) =>
+                        setPromoteRuleKeys((prev) => {
+                          const next = new Set(prev);
+                          if (e.target.checked) next.add(key);
+                          else next.delete(key);
+                          return next;
+                        })
+                      }
+                      className="accent-text-primary"
+                    />
+                    {RULE_ITEM_LABELS[key] ?? key}
+                  </label>
+                ))}
+              </div>
+              <input
+                type="text"
+                value={promoteRuleNote}
+                onChange={(e) => setPromoteRuleNote(e.target.value)}
+                placeholder="规则备注（如「破 MA10 必走」）"
+                className="mt-2 w-full rounded-md border border-border bg-bg-card px-3 py-1.5 text-xs focus:border-text-secondary focus:outline-none"
+              />
+            </div>
+
             {promoteMut.isError && (
               <p className="text-xs text-down">失败 · {String(promoteMut.error)}</p>
             )}

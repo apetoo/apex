@@ -25,6 +25,7 @@ from backend.routers import (
     postmortem,
     push,
     screener,
+    system,
     watchlist,
 )
 
@@ -65,6 +66,7 @@ for rtr in (
     calibration.router,
     postmortem.router,
     push.router,
+    system.router,
     chat.router,
 ):
     app.include_router(rtr, prefix="/api")

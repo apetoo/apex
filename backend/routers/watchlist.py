@@ -128,6 +128,7 @@ def add_candidate(req: AddCandidateRequest):
         stop_advice=req.stop_advice,
         target_advice=req.target_advice,
         strategy=req.strategy,
+        setup=req.setup,
         trigger_low=req.trigger_low,
         trigger_high=req.trigger_high,
     )
@@ -149,6 +150,8 @@ def promote_candidate(req: PromoteCandidateRequest):
         calibrated_confidence=req.calibrated_confidence,
         strategy=req.strategy,
         regime_at_open=req.regime_at_open,
+        setup=req.setup,
+        rule_checklist=req.rule_checklist,
     )
     return {"message": "Candidate promoted", "ts_code": ts_code}
 

@@ -1,5 +1,5 @@
 import { NavLink, Route, Routes } from "react-router-dom";
-import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch, History } from "lucide-react";
+import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch, History, Target } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ChatPanel } from "@/components/base";
 import { ChatContextProvider } from "@/hooks/useChatContext";
@@ -9,6 +9,7 @@ import { AnalyzePage } from "@/routes/analyze/AnalyzePage";
 import { JournalPage } from "@/routes/journal/JournalPage";
 import { BacktestPage } from "@/routes/backtest/BacktestPage";
 import { ScreenerPage } from "@/routes/screener/ScreenerPage";
+import { SystemPage } from "@/routes/system/SystemPage";
 
 /**
  * 路由表(ED: 概览首页 + 四 Tab 1:1 平移 + 全局浮动 chat)
@@ -30,6 +31,7 @@ const NAV = [
   { to: "/journal", label: "历史", icon: History, end: false },
   { to: "/backtest", label: "回测", icon: LineChart, end: false },
   { to: "/screener", label: "筛选", icon: ScanSearch, end: false },
+  { to: "/system", label: "我的系统", icon: Target, end: false },
 ];
 
 function App() {
@@ -79,6 +81,7 @@ function App() {
               path="/screener"
               element={<ScreenerPage />}
             />
+            <Route path="/system" element={<SystemPage />} />
           </Routes>
         </main>
 

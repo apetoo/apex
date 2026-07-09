@@ -169,6 +169,18 @@ def migrate_and_backfill() -> dict:
     except Exception:
         pass
 
+    # PR4: closed_positions 回填（regime 从缓存 / sector 走 tushare）+ trades 重建
+    try:
+        bf = _backfill_closed_regime_sector()
+        stats["closed_regime_filled"] = bf.get("regime_filled", 0)
+        stats["closed_sector_filled"] = bf.get("sector_filled", 0)
+    except Exception:
+        pass
+    try:
+        stats["closed_reconstructed"] = _reconstruct_closed_from_trades()
+    except Exception:
+        pass
+
     return stats
 
 
@@ -183,6 +195,8 @@ def add_position(ts_code: str, name: str, entry_price: float,
                  strategy: Optional[str] = None,
                  regime_at_open: Optional[str] = None,
                  size_method: Optional[str] = None,
+                 setup: Optional[str] = None,
+                 rule_checklist: Optional[dict] = None,
                  emit_notify: bool = True) -> dict:
     """Add new position. Raises DuplicatePositionError if ts_code already in active_positions.
 
@@ -225,6 +239,10 @@ def add_position(ts_code: str, name: str, entry_price: float,
         record["calibrated_confidence"] = float(calibrated_confidence)
     if strategy:
         record["strategy"] = str(strategy)
+    if setup:
+        record["setup"] = str(setup)              # ADR-0001: 交易原型，candidate 继承或用户确认
+    if rule_checklist:
+        record["rule_checklist"] = rule_checklist  # ADR-0001: 自录 Rule 检查表，close 后守规算分
     # regime_at_open：调用方未传则从今日 regime 缓存取。无缓存就空（不主动 collect 避免延迟）
     if regime_at_open is None:
         try:
@@ -237,6 +255,10 @@ def add_position(ts_code: str, name: str, entry_price: float,
             regime_at_open = None
     if regime_at_open:
         record["regime_at_open"] = str(regime_at_open)
+    # sector（行业）：前向捕获，供「我的交易系统」板块归因。tushare 行业 membership 稳定，开仓时查一次。
+    sector = _sector_for(ts_code)
+    if sector:
+        record["sector"] = sector
     if size_method:
         record["size_method"] = str(size_method)
     data["active_positions"].append(record)
@@ -312,7 +334,9 @@ def promote_candidate(ts_code: str, entry_price: float,
                       risk_amount: Optional[float] = None,
                       calibrated_confidence: Optional[float] = None,
                       strategy: Optional[str] = None,
-                      regime_at_open: Optional[str] = None) -> dict:
+                      regime_at_open: Optional[str] = None,
+                      setup: Optional[str] = None,
+                      rule_checklist: Optional[dict] = None) -> dict:
     """Promote a candidate to active position. Archives the candidate with
     reason='promoted', then adds the active position using actual fill values.
 
@@ -333,6 +357,7 @@ def promote_candidate(ts_code: str, entry_price: float,
         raise ValueError(f"候选 {ts_code} 不存在")
     name = cand.get("name", "")
     inherited_strategy = strategy or cand.get("strategy")
+    inherited_setup = setup or cand.get("setup")  # ADR-0001: setup 也从候选继承
 
     # 修断层3：用户未填手数时从 journal ATR 推算兜底，避免风控/市值静默漏算
     size_method: Optional[str] = None
@@ -352,6 +377,8 @@ def promote_candidate(ts_code: str, entry_price: float,
                  calibrated_confidence=calibrated_confidence,
                  strategy=inherited_strategy,
                  regime_at_open=regime_at_open,
+                 setup=inherited_setup,
+                 rule_checklist=rule_checklist,
                  size_method=size_method)
 
     # 修断层1：promote 也写 buy trade，对齐 buy() 流水口径；
@@ -723,6 +750,321 @@ def _latest_journal_for(ts_code: str, before: Optional[str] = None) -> Optional[
         return None
 
 
+def _sector_for(ts_code: str) -> Optional[str]:
+    """ts_code -> tushare 行业（industry，point-in-time 基本稳定）。失败/缺省返回 None。"""
+    if not ts_code:
+        return None
+    from apex import data as _data
+    try:
+        info_raw = _data.get_stock_info(ts_code=ts_code)
+        info_list = json.loads(info_raw)
+        if isinstance(info_list, list) and info_list:
+            ind = info_list[0].get("industry")
+            if ind:
+                return str(ind)
+    except Exception:
+        pass
+    return None
+
+
+def _backfill_closed_regime_sector() -> dict:
+    """PR4: 回填 closed_positions.jsonl 里 open.regime_at_open / open.sector 缺失项。
+
+    - regime 只从缓存读（regime.load(entry_date)），**不主动 collect 历史**：老记录
+      entry_date 若不在 regime 缓存则留 null（ADR：只回填可干净重建的）。
+    - sector 走 tushare 行业（membership 稳定，可安全回填）。
+    只填 null，绝不覆盖已有值；原子写（temp + os.replace）。
+    返回 {regime_filled, sector_filled, rewritten}。"""
+    import os
+    import tempfile
+    from apex import regime as _regime_mod
+
+    path = _closed_positions_path()
+    if not path.exists():
+        return {"regime_filled": 0, "sector_filled": 0, "rewritten": False}
+
+    rows: list[str] = []
+    regime_filled = sector_filled = 0
+    rewritten = False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            raw = line.rstrip("\n")
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                rows.append(raw)  # 坏行原样保留
+                continue
+            op = rec.get("open") or {}
+            changed = False
+            if not op.get("regime_at_open"):
+                ed = op.get("entry_date") or ""
+                try:
+                    r = _regime_mod.load(ed) if ed else None
+                except Exception:
+                    r = None
+                if r and r.get("label"):
+                    op["regime_at_open"] = r["label"]
+                    regime_filled += 1
+                    changed = True
+            if not op.get("sector"):
+                ind = _sector_for(rec.get("ts_code", ""))
+                if ind:
+                    op["sector"] = ind
+                    sector_filled += 1
+                    changed = True
+            if changed:
+                rec["open"] = op
+                rewritten = True
+                rows.append(json.dumps(rec, ensure_ascii=False, default=str))
+            else:
+                rows.append(raw)
+    if rewritten:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(rows) + "\n")
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return {"regime_filled": regime_filled, "sector_filled": sector_filled, "rewritten": rewritten}
+
+
+def _build_reconstructed_closed(ts_code: str, buys: list, sells: list) -> Optional[dict]:
+    """把一组完整 round-trip 的 trades 合成一条 closed 记录（quality-flagged）。
+
+    入场=首笔 buy（价/日）；出场=末笔 sell（价/日）；avg_cost=加权平均买入价；
+    realized_pnl_pct=(exit-avg_cost)/avg_cost；shares=总买入股数。
+    high/low/AI 特征/止损/目标全 None（无法干净重建）-> source/quality 标低质量。
+    """
+    if not buys or not sells:
+        return None
+    first_buy = buys[0]
+    last_sell = sells[-1]
+    entry_date = (first_buy.get("traded_at") or "")[:10] or None
+    exit_date = (last_sell.get("traded_at") or "")[:10] or None
+    buy_shares = sum(int(t.get("shares") or 0) for t in buys)
+    buy_amount = sum(float(t.get("fill_price") or 0) * int(t.get("shares") or 0) for t in buys)
+    avg_cost = round(buy_amount / buy_shares, 4) if buy_shares else None
+    exit_price = float(last_sell.get("fill_price") or 0)
+    realized_pnl_pct = None
+    realized_pnl_amount = None
+    if avg_cost and avg_cost > 0 and exit_price > 0:
+        realized_pnl_pct = round((exit_price - avg_cost) / avg_cost, 4)
+        realized_pnl_amount = round((exit_price - avg_cost) * buy_shares, 2)
+    # trades 里每笔 sell 已带 realized_pnl，取末笔兜底（与 closed record 单值口径近似）
+    sell_pnls = [float(t.get("realized_pnl") or 0) for t in sells if t.get("realized_pnl") is not None]
+    realized_pnl_sum = round(sum(sell_pnls), 2) if sell_pnls else None
+
+    days_held = 0
+    try:
+        if entry_date and exit_date:
+            days_held = max(0, (date.fromisoformat(exit_date) - date.fromisoformat(entry_date)).days)
+    except Exception:
+        pass
+
+    return {
+        "ts_code": ts_code,
+        "name": first_buy.get("name") or "",
+        "source": "reconstructed_from_trades",
+        "quality": "low",   # 缺 AI 特征 / 止损目标 / 期间高低点
+        "open": {
+            "entry_date": entry_date,
+            "entry_price": avg_cost,
+            "avg_cost": avg_cost,
+            "actual_fill_price": float(first_buy.get("fill_price") or 0) or None,
+            "position_size_shares": buy_shares or None,
+            "stop_loss": None, "target": None,
+            "risk_amount": None, "calibrated_confidence": None,
+            "strategy": first_buy.get("strategy"),
+            "regime_at_open": None, "setup": None, "rule_checklist": None,
+            "sector": _sector_for(ts_code),
+            "ai_verdict": None, "ai_confidence": None, "ai_features": None, "ai_analysis_text": None,
+            "screener_signals": None, "screener_rule_score": None,
+        },
+        "close": {
+            "exit_date": exit_date,
+            "actual_exit_price": exit_price or None,
+            "exit_reason": "manual",   # 重建无法判定真实出场原因，标 manual + source 区分
+            "days_held": days_held,
+            "trading_days_held": None,
+            "high_during_hold": None, "low_during_hold": None,
+            "realized_pnl_pct": realized_pnl_pct,
+            "realized_pnl_amount": realized_pnl_amount or realized_pnl_sum,
+            "user_notes": "从 trades.jsonl 重建（无 AI 特征/止损目标/期间高低点）",
+            "closed_at": last_sell.get("traded_at") or datetime.now(_TZ_CN).isoformat(timespec="seconds"),
+        },
+        "diagnosis": None,
+    }
+
+
+def _reconstruct_closed_from_trades() -> dict:
+    """PR4: 从 trades.jsonl 重建「完整平仓」记录补进 closed_positions.jsonl。
+
+    只重建「累计卖出 == 累计买入」的完整 round-trip；部分平仓（仍持仓）不重建
+    （其已实现盈亏留在 trades.jsonl 供行为分析用）。已存在同 ts_code closed 记录的
+    跳过（保守去重，v1 不支持同股多次独立 round-trip 重建）。重建记录带
+    source='reconstructed_from_trades' + quality='low'。幂等：重复运行不会追加重复记录。
+    返回 {reconstructed, skipped_already_closed, skipped_partial, open_only}。"""
+    from collections import defaultdict
+    from apex import trades as _trades
+
+    path = _closed_positions_path()
+    existing_codes: set[str] = set()
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("ts_code"):
+                    existing_codes.add(rec["ts_code"])
+
+    by_code: dict[str, list] = defaultdict(list)
+    for t in _trades.load_trades():
+        by_code[t.get("ts_code")].append(t)
+
+    reconstructed = skipped_already = skipped_partial = open_only = 0
+    new_records: list[dict] = []
+    for code, tlst in by_code.items():
+        tlst = sorted(tlst, key=lambda t: t.get("traded_at") or "")
+        buy_shares = sum(int(t.get("shares") or 0) for t in tlst if t.get("side") == "buy")
+        sell_shares = sum(int(t.get("shares") or 0) for t in tlst if t.get("side") == "sell")
+        if sell_shares == 0:
+            open_only += 1
+            continue
+        if sell_shares < buy_shares:
+            skipped_partial += 1
+            continue
+        if code in existing_codes:
+            skipped_already += 1
+            continue
+        rec = _build_reconstructed_closed(
+            code,
+            [t for t in tlst if t.get("side") == "buy"],
+            [t for t in tlst if t.get("side") == "sell"],
+        )
+        if rec:
+            new_records.append(rec)
+            reconstructed += 1
+
+    if new_records:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for rec in new_records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+    return {
+        "reconstructed": reconstructed,
+        "skipped_already_closed": skipped_already,
+        "skipped_partial": skipped_partial,
+        "open_only": open_only,
+    }
+
+
+def _eval_one_rule(key: str, *, fill_price: Optional[float], stop_loss,
+                   ai_entry, ai_low, ai_high, ai_features: dict,
+                   buys_in_hold: list) -> Optional[bool]:
+    """单条 Rule 客观评估。True=遵守 / False=违规 / None=无法客观判定（留自评）。
+
+    可客观评估（无需用户参数）：entry_band / stop_formula / no_average_down / no_chase。
+    需参数的（sizing_cap / max_hold_days / sector_conc_cap）一律返回 None，待用户自评。"""
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    if key == "entry_band":
+        # 入场带：fill 落在 AI plan [entry_low, entry_high] 内；无带则 ±2% of entry
+        fp = _f(fill_price)
+        if fp is None or fp <= 0:
+            return None
+        lo, hi = _f(ai_low), _f(ai_high)
+        if lo is not None and hi is not None:
+            return lo <= fp <= hi
+        ae = _f(ai_entry)
+        if ae is not None and ae > 0:
+            return abs(fp - ae) / ae <= 0.02
+        return None  # 无 AI plan，无法判定
+
+    if key == "stop_formula":
+        # 止损按规则设置：stop_loss 存在且 > 0（承诺设止损却没设 = 违规）
+        s = _f(stop_loss)
+        return bool(s is not None and s > 0)
+
+    if key == "no_average_down":
+        # 不加仓于亏损：持仓期间多笔 buy 且后续价 < 前笔 = 违规
+        if len(buys_in_hold) <= 1:
+            return True
+        for i in range(1, len(buys_in_hold)):
+            prev = _f(buys_in_hold[i - 1].get("fill_price"))
+            cur = _f(buys_in_hold[i].get("fill_price"))
+            if prev is not None and cur is not None and cur < prev:
+                return False
+        return True
+
+    if key == "no_chase":
+        # 不追高：fill <= ai_entry * 1.05（与 fomo 代理同阈值）；无 AI plan 用特征代理
+        fp = _f(fill_price)
+        ae = _f(ai_entry)
+        if fp is not None and ae is not None and ae > 0:
+            return fp <= ae * 1.05
+        pos = (ai_features or {}).get("ma5_position")
+        pvma = _f((ai_features or {}).get("price_vs_ma5_pct"))
+        if pos is not None and pvma is not None:
+            return not (pos == "above" and pvma > 3)
+        return None
+
+    # sizing_cap / max_hold_days / sector_conc_cap：需用户参数，无法客观判定
+    return None
+
+
+def _evaluate_rule_checklist(rule: dict, *, ts_code: str, fill_price: Optional[float],
+                             stop_loss, ai_plan: dict, ai_features: dict,
+                             entry_date: str, exit_date: str) -> dict:
+    """close 时评估自录 Rule 检查表：可客观评估的项设 checked=True/False，
+    需参数的项留 null（待自评）。已有 checked 值不覆盖（尊重用户自评）。
+    返回更新后的 rule dict（原地改 items）。"""
+    items = rule.get("items") or []
+    if not items:
+        return rule
+
+    buys_in_hold: list = []
+    try:
+        from apex import trades as _trades
+        tlst = sorted(_trades.load_trades(ts_code=ts_code),
+                      key=lambda t: t.get("traded_at") or "")
+        for t in tlst:
+            ta = (t.get("traded_at") or "")[:10]
+            if t.get("side") == "buy" and ta and entry_date <= ta <= exit_date:
+                buys_in_hold.append(t)
+    except Exception:
+        pass
+
+    ai_entry = ai_plan.get("entry")
+    ai_low = ai_plan.get("entry_low")
+    ai_high = ai_plan.get("entry_high")
+
+    for item in items:
+        if item.get("checked") is not None:
+            continue
+        val = _eval_one_rule(item.get("key"), fill_price=fill_price, stop_loss=stop_loss,
+                             ai_entry=ai_entry, ai_low=ai_low, ai_high=ai_high,
+                             ai_features=ai_features, buys_in_hold=buys_in_hold)
+        if val is not None:
+            item["checked"] = val
+    return rule
+
+
 class PositionNotFoundError(Exception):
     pass
 
@@ -787,6 +1129,17 @@ def close_position(ts_code: str,
 
     journal_at_open = _latest_journal_for(ts_code, before=entry_date)
 
+    # ADR-0001: close 时评估自录 Rule 检查表（承诺 -> 客观判定遵守/违规）
+    evaluated_rule = pos.get("rule_checklist")
+    if evaluated_rule and evaluated_rule.get("items"):
+        evaluated_rule = _evaluate_rule_checklist(
+            evaluated_rule, ts_code=ts_code, fill_price=fill_price,
+            stop_loss=pos.get("stop_loss"),
+            ai_plan=(journal_at_open or {}).get("price_advice") or {},
+            ai_features=(journal_at_open or {}).get("features") or {},
+            entry_date=entry_date, exit_date=exit_date,
+        )
+
     record = {
         "ts_code": ts_code,
         "name": pos.get("name", ""),
@@ -802,6 +1155,9 @@ def close_position(ts_code: str,
             "calibrated_confidence": pos.get("calibrated_confidence"),
             "strategy": pos.get("strategy"),
             "regime_at_open": pos.get("regime_at_open"),
+            "setup": pos.get("setup"),
+            "rule_checklist": evaluated_rule,
+            "sector": pos.get("sector") or _sector_for(ts_code),
             "ai_verdict": (journal_at_open or {}).get("verdict"),
             "ai_confidence": (journal_at_open or {}).get("confidence"),
             "ai_features": (journal_at_open or {}).get("features"),
@@ -935,6 +1291,7 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
                   stop_advice: Optional[float] = None,
                   target_advice: Optional[float] = None,
                   strategy: Optional[str] = None,
+                  setup: Optional[str] = None,
                   trigger_low: Optional[float] = None,
                   trigger_high: Optional[float] = None) -> dict:
     from datetime import timedelta
@@ -959,6 +1316,8 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["target_advice"] = target_advice
     if strategy:
         entry["strategy"] = str(strategy)
+    if setup:
+        entry["setup"] = str(setup)   # ADR-0001: 交易原型，可由 AI verdict setup_tag 预填
     # 买入区间（带状触发）：有则 is_triggered 走 low<=price<=high，无则退回单向阈值。
     if trigger_low is not None:
         entry["trigger_low"] = float(trigger_low)

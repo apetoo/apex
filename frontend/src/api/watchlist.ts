@@ -1,4 +1,5 @@
 import { api } from "./client";
+import type { RuleChecklist } from "@/lib/trading-system";
 
 /**
  * Watchlist API
@@ -39,6 +40,10 @@ export interface ActivePosition {
   calibrated_confidence?: number;
   strategy?: string;
   note?: string;
+  /** ADR-0001: 交易原型（candidate 继承或 promote 时确认） */
+  setup?: string;
+  /** ADR-0001: 自录 Rule 检查表，close 后守规算分 */
+  rule_checklist?: RuleChecklist;
 }
 
 export interface ExpiresMeta {
@@ -69,6 +74,8 @@ export interface Candidate {
   target_advice: number;
   trigger_low?: number | null;
   trigger_high?: number | null;
+  /** ADR-0001: 交易原型，可由 AI verdict setup_tag 预填 */
+  setup?: string;
 }
 
 export interface WatchlistData {
@@ -225,6 +232,8 @@ export interface AddCandidatePayload {
   expires_days?: number;
   trigger_low?: number;
   trigger_high?: number;
+  /** ADR-0001: 交易原型（可由 AI verdict setup_tag 预填） */
+  setup?: string;
 }
 
 export interface ClosePositionPayload {
@@ -250,6 +259,10 @@ export interface PromotePayload {
   shares: number;
   stop_loss: number;
   target: number;
+  /** ADR-0001: 交易原型（确认/覆盖候选的 setup） */
+  setup?: string;
+  /** ADR-0001: 自录 Rule 检查表（承诺项，checked 入场时为 null，close 后评估） */
+  rule_checklist?: RuleChecklist;
 }
 
 export interface AddPositionPayload {
@@ -283,6 +296,7 @@ export async function addCandidate(
       note: payload.note ?? `手动加候选 触发 ${payload.trigger_price}`,
       stop_advice: payload.stop_advice ?? 0,
       target_advice: payload.target_advice ?? 0,
+      ...(payload.setup ? { setup: payload.setup } : {}),
       ...(payload.trigger_low != null ? { trigger_low: payload.trigger_low } : {}),
       ...(payload.trigger_high != null ? { trigger_high: payload.trigger_high } : {}),
     });
@@ -379,6 +393,8 @@ export async function promoteCandidate(
           .slice(0, 10),
         status: "active",
         position_size_shares: payload.shares,
+        ...(payload.setup ? { setup: payload.setup } : {}),
+        ...(payload.rule_checklist ? { rule_checklist: payload.rule_checklist } : {}),
       });
       MOCK_DATA.archived.push({
         ...c,

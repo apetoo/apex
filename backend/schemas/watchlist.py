@@ -41,6 +41,7 @@ class AddCandidateRequest(BaseModel):
     stop_advice: Optional[float] = None
     target_advice: Optional[float] = None
     strategy: Optional[str] = None
+    setup: Optional[str] = None
     trigger_low: Optional[float] = None
     trigger_high: Optional[float] = None
 
@@ -57,6 +58,8 @@ class PromoteCandidateRequest(BaseModel):
     calibrated_confidence: Optional[float] = None
     strategy: Optional[str] = None
     regime_at_open: Optional[str] = None
+    setup: Optional[str] = None
+    rule_checklist: Optional[dict] = None
 
 
 class ClosePositionRequest(BaseModel):

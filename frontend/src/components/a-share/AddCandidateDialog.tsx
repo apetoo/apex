@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Dialog, Button } from "@/components/base";
 import { useAddCandidate } from "@/api/mutations";
 import { cn } from "@/lib/utils";
+import { SETUP_SEED } from "@/lib/trading-system";
 
 /**
  * <AddCandidateDialog> — 把 AI 分析结果一键挂成候选
@@ -39,6 +40,8 @@ export function AddCandidateDialog({
   const [direction, setDirection] = useState<"below" | "above">("below");
   const [expiresDays, setExpiresDays] = useState("7");
   const [note, setNote] = useState("");
+  const [setup, setSetup] = useState("");
+  const [setupCustom, setSetupCustom] = useState("");
 
   // 打开时按 verdict 预填(每次打开都重置, 避免上次残留)
   useEffect(() => {
@@ -52,6 +55,20 @@ export function AddCandidateDialog({
     setDirection("below");
     setExpiresDays("7");
     setNote(entry ? `AI分析 触发 ${entry}` : "AI分析 加入候选");
+    // ADR-0001: setup 从 AI verdict 的 setup_tag 预填，种子词表内的直接选，其他走自定义
+    const st = verdict.setup_tag;
+    if (typeof st === "string" && st) {
+      if ((SETUP_SEED as readonly string[]).includes(st)) {
+        setSetup(st);
+        setSetupCustom("");
+      } else {
+        setSetup("其他");
+        setSetupCustom(st);
+      }
+    } else {
+      setSetup("");
+      setSetupCustom("");
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -61,6 +78,12 @@ export function AddCandidateDialog({
     if (!tsCode || !tp) return;
     const low = triggerLow ? Number(triggerLow) : undefined;
     const high = triggerHigh ? Number(triggerHigh) : undefined;
+    const finalSetup =
+      setup === "其他"
+        ? setupCustom.trim()
+          ? `其他:${setupCustom.trim()}`
+          : undefined
+        : setup || undefined;
     addMut.mutate(
       {
         ts_code: tsCode,
@@ -76,6 +99,7 @@ export function AddCandidateDialog({
         // 带状触发：low/high 都填才走区间, 否则退回单向阈值
         trigger_low: low,
         trigger_high: high,
+        setup: finalSetup,
       },
       { onSuccess: () => onClose() },
     );
@@ -190,6 +214,34 @@ export function AddCandidateDialog({
               onChange={(e) => setExpiresDays(e.target.value)}
               className={inputCls}
             />
+          </div>
+        </div>
+
+        <div>
+          <label className={labelCls}>Setup（交易原型）</label>
+          <div className="flex gap-2">
+            <select
+              value={setup}
+              onChange={(e) => setSetup(e.target.value)}
+              className="flex-1 rounded-md border border-border bg-bg-card px-2 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+            >
+              <option value="">不标注</option>
+              {SETUP_SEED.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+              <option value="其他">其他（自定义）</option>
+            </select>
+            {setup === "其他" && (
+              <input
+                type="text"
+                value={setupCustom}
+                onChange={(e) => setSetupCustom(e.target.value)}
+                placeholder="自定义 setup"
+                className="flex-1 rounded-md border border-border bg-bg-card px-3 py-1.5 text-sm focus:border-text-secondary focus:outline-none"
+              />
+            )}
           </div>
         </div>
 
