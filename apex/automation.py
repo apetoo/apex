@@ -251,9 +251,9 @@ def _triggered_today(candidate: dict, ohlc: dict) -> bool:
         return False
     direction = candidate.get("trigger_direction", "below")
     if direction == "below":
-        return low < float(trigger)
+        return low <= float(trigger)
     if direction == "above":
-        return high > float(trigger)
+        return high >= float(trigger)
     return False
 
 
@@ -323,6 +323,8 @@ def task_auto_trade() -> str:
         code = cand.get("ts_code")
         if not code or code in active_codes:
             continue  # 已有持仓，不重复 promote
+        if cand.get("expires_at") and cand["expires_at"] < today:
+            continue  # 过期候选不撮合（信号失效）
         ohlc = _fetch_day_ohlc(code, today)
         if not ohlc:
             continue
