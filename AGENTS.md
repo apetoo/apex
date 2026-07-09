@@ -1,59 +1,37 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+给自治 coding agent（Hermes / Codex / Claude 等）的 apex 项目交接。**完整架构与约定以 `CLAUDE.md` 为准（SSOT）**，本文件只做导向 + agent 行为红线。
 
-## Project
+> ⚠ 早期文档里 "main.py 不存在 / streamlit 是主入口" 已失效：Streamlit 在 commit `675807e` 退役，`main.py` click CLI 现已存在，UI 是 FastAPI 后端 + Vite 前端。
 
-Personal A-share (Chinese stock market) trading loop: DeepSeek AI analysis + watchlist tracking + vectorbt backtesting. Single-user tool, file-based storage.
+## apex 是什么
+个人 A 股交易闭环：DeepSeek 分析 + watchlist + vectorbt 回测 + 盘后模拟撮合 + 交易系统自检。单用户、文件存储、无 DB。
 
-## Run
+- **后端** FastAPI `:8000`，路由全挂 `/api`（`backend/main.py`）
+- **前端** Vite + React（`frontend/`），dev 代理 `/api` -> `127.0.0.1:8000`
+- **存储**（都在 `$HOME`，仓库外）：`~/.stock-journal/<ts_code>.jsonl`、`~/.stock-watchlist/watchlist.json`、`~/.stock-trades/trades.jsonl`、`~/.stock-closed/closed_positions.jsonl`
 
-```bash
-pip install -r requirements.txt          # deps (Python 3.12+)
-streamlit run app.py                      # primary entry point — opens http://localhost:8501
-```
+## 已经自动化的（别重复自动化）
+**日线循环**：晨报 -> 盘中分析×3 -> 盘后筛选 -> 模拟撮合，由 `apex/automation.py` 的 cron/loop 自己跑（`SCHEDULE` + `run_once()` + `loop()`），触发监控在 `apex/monitor.py`。
+agent 的活是 **meta 环**：月度复盘、纪律解读、提案——**不是日线交易**，别去接管 `automation.py` 调度。
 
-The README references `python main.py ...` CLI commands, but **`main.py` does not exist**. Treat those as stale; the only working entry point is `app.py`. Modules under `apex/` (e.g. `apex.briefing.run()`) are importable but have no CLI wrapper.
+## agent 能用的入口
+- **CLI**：`python main.py {analyze, backtest, briefing, watchlist, promote, realtime, screener}`（别名 `an/bt/ls`）
+- **后端 HTTP（更全）**：`http://127.0.0.1:8000/api/...`，端点见 `backend/routers/`。复盘类（`postmortem` / `calibration` / `system`）只有 HTTP、没 CLI。
+- **复盘 skill**：`hermes/skills/monthly-review/`（Hermes 下 `/monthly-review`）
 
-There is no test suite, lint config, or build step. Validation is done via `python -c "import ast; ast.parse(open('apex/<file>.py').read())"` for syntax and tempdir-based smoke tests against `apex.watchlist` / `apex.journal` for behavior.
+## 硬红线（任何 skill 都不许越）
+1. 不改 `config.yaml`、不调策略权重 / 因子开关 / screener 权重。策略变更 = 写提案到 `proposals/`，人审。
+2. 不动持仓：不 `promote` / `buy` / `sell` / `close` / `archive` / 增删 `candidates`。这些走人审。
+3. 真实下单（券商 API）永远不交给 agent，只做 dashboard 提醒。
+4. 样本 `n < 30` 不下结论（ADR-0002）；OOS 反过拟合优先于历史拟合。
+5. AI 守规双层（ADR-0001）：`MANDATORY_SEARCH_CATEGORIES = [earnings, shareholders, regulatory, money_flow]` 4 类必搜，别为省调用次数放宽 `record_verdict` 校验。
 
-## Configuration
+## 三层权限
+- **Tier 1 - 自动**：只读分析（backtest / postmortem / calibration / system / screener 查询 / briefing / watchlist 查询）
+- **Tier 2 - 提案**：策略 / 参数 / calibration 调整 -> `proposals/`，人审才生效
+- **Tier 3 - 人 only**：真钱开关、仓位 sizing、回撤 kill-switch
 
-`config.yaml` at repo root, loaded once via `apex.config.load()` into a module-level singleton. Tokens in YAML take priority; env vars (`TUSHARE_TOKEN`, `DEEPSEEK_API_KEY`, `BOCHA_API_KEY`) are the **fallback**, not the primary source. Path fields are tilde-expanded on load.
-
-Default storage paths (all outside the repo, in `$HOME`):
-- `~/.stock-journal/<ts_code>.jsonl` — one JSON line per AI analysis
-- `~/.stock-watchlist/watchlist.json` — single file with `active_positions` / `candidates` / `archived`
-
-## Architecture
-
-Three layers, no framework, no DB. Read these together to make sense of any change:
-
-**`apex/data.py`** — outbound data layer. Tushare (primary) with akshare fallback for daily K-line; Sina Finance HTTP for realtime intraday (proxies stripped via custom opener); Bocha for web search. The `TOOL_FUNCTIONS` dict at the bottom auto-registers functions as tools for the AI agent — adding a new tool means adding to both `TOOLS` (in `analyze.py`) and `TOOL_FUNCTIONS` (here).
-
-**`apex/analyze.py`** — DeepSeek agent loop using OpenAI-compatible function calling. `run(ts_code)` injects formatted journal history into the user prompt (so the AI can review past calls), spins a tool-call loop until `record_verdict` is invoked, then does one final text round to capture the analyst's narrative. `max_tool_iterations` caps the loop. Verdict + features get written to the journal jsonl.
-
-**`apex/journal.py`** — append-only jsonl reader/writer keyed by ts_code. `validate_entry` fills missing required feature keys with `None` and rejects unknown verdicts (`schemas.VERDICT_ENUM`). `merge_legacy_files()` is a one-shot migration that consolidates pre-suffix filenames (`603019.jsonl` → `603019.SH.jsonl`) and renames originals to `*.jsonl.legacy`.
-
-**`apex/watchlist.py`** — JSON file with three sections: `active_positions` (real holdings), `candidates` (waiting for trigger), `archived` (soft-delete with `status: archived_<reason>`). Key invariant: **one position per `ts_code`** in `active_positions`. `add_position` raises `DuplicatePositionError` (carrying the existing record) on conflict; the UI catches this and offers a replace-or-cancel decision via `st.session_state["_dup_pos"]`.
-
-**`apex/backtest.py`** — vectorbt-based. Each bullish journal entry becomes its own `Portfolio.from_signals` over an N-day window starting at `entry_date`, using `price_advice.stop_loss/target` as fractional SL/TP anchored to the actual fill price. One-portfolio-per-entry to avoid signal collision when the same stock has multiple verdicts.
-
-**`app.py`** — Streamlit UI, three tabs (Watchlist / Analyze / Backtest). Single file (~480 lines).
-
-## Critical conventions
-
-**ts_code normalization.** Everything below the UI assumes the suffixed form (`002050.SZ`, `603019.SH`, `838810.BJ`). Always pass user input through `data.normalize_ts_code()` before storing, looking up history, or calling tushare. The first digit determines exchange: 6→SH, 0/3→SZ, 4/8→BJ.
-
-**Trading flow: candidate → position, not analysis → position.** Earlier versions had a single "+ 添加到持仓" button after analysis; this turned out to be wrong because AI verdicts often suggest entry prices that aren't yet met. The current model:
-- "加为候选（等触发）" — `add_candidate()` with trigger_price = AI's suggested entry, optional `stop_advice` / `target_advice` carried forward from the analysis
-- "已成交，记为持仓" — direct `add_position()` for already-filled trades
-- `promote_candidate(ts_code, entry_price, stop_loss, target)` — once filled, archives the candidate as `archived_promoted` and creates the active position with **actual** fill values (not the trigger price). Validates no duplicate position **before** archiving the candidate so failures leave state intact for UI recovery.
-
-**Soft delete via `archive_entry`.** Nothing is hard-deleted from the watchlist. `status` field on archived items records the reason: `archived_manual`, `archived_replaced`, `archived_promoted`, `archived_dedup`, `expired`.
-
-**One-shot migration on Streamlit startup.** `migrate_and_backfill()` runs once per session, gated by `st.session_state["_migrated"]`. It normalizes legacy ts_codes, backfills missing names via tushare, merges legacy unsuffixed journal files, and dedups duplicate active positions. Add new one-shot fixes here rather than scattering migration logic.
-
-**Realtime vs daily price.** `get_realtime_price` (Sina, intraday) is the primary; `get_latest_price` (tushare daily close) is the fallback used when realtime returns None (suspended / API failure). The UI caches both in `st.session_state["prices"]` / `["realtime_prices"]` and clears them on refresh or after any mutation.
-
-**Adding an AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The agent dispatches by name through `_dispatch_tool` which only looks at `TOOL_FUNCTIONS`.
+## 操作类 vs 策略类 skill（自我改进的边界）
+- **操作类**（怎么跑复盘、怎么读报告、怎么格式化推送）：允许自我改进。
+- **策略类**（选哪些因子、何时进场、权重多少）：**禁止自我改进、禁止自动新建**，只能由人维护。这是防止自校准闭环过拟合漂移的闸。
