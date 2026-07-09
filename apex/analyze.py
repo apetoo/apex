@@ -344,6 +344,15 @@ TOOLS = [
                             "「观望」及更弱的方向应填 0。"
                         ),
                     },
+                    "new_info": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "本次分析相比上次的新增信息（事件/数据/形态变化），无则填空数组。"
+                            "24h 内重复分析时，系统据此判断是否豁免限幅："
+                            "new_info 非空且客观技术面确有变化才不限幅，否则方向限 ±1 档、conf 限 ±2。"
+                        ),
+                    },
                 },
                 "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence"],
             },
@@ -574,6 +583,154 @@ def _resolve_outcome_for_entry(entry: dict,
         return f" → 持仓中（开仓 {e_date}）"
 
     return " → 未跟进（未开仓）"
+
+
+# ── 24h 重复分析限幅（痛点#3透明化）─────────────────────────────────────
+# 技术面变化阈值：用于客观交叉验证 AI 声称的"本次有新增信息"。
+# 任一关键指标变化超阈值即视为客观有变化；全部低于阈值 -> AI 空口声称，不豁免限幅。
+_FEATURE_DIFF_THRESHOLDS = {
+    "price_vs_ma5_pct": 3.0,   # 百分点
+    "rsi_14": 10.0,            # RSI 单位
+    "volume_ratio": 0.3,       # 量比
+}
+
+
+def _verdict_index(verdict: str) -> int:
+    """verdict 在 VERDICT_ENUM 中的档位 index，未找到返回 -1。"""
+    try:
+        return VERDICT_ENUM.index(verdict)
+    except ValueError:
+        return -1
+
+
+def _clamp_verdict_delta(last_verdict: str, raw_verdict: str, max_delta: int = 1) -> str:
+    """把方向变化限制在 ±max_delta 档内，返回 clamp 后的 verdict。
+    last 或 raw 不在 ENUM 内时原样返回 raw（无法判定档位差不强制）。"""
+    last_idx = _verdict_index(last_verdict)
+    raw_idx = _verdict_index(raw_verdict)
+    if last_idx < 0 or raw_idx < 0:
+        return raw_verdict
+    delta = raw_idx - last_idx
+    if abs(delta) <= max_delta:
+        return raw_verdict
+    clamped_idx = last_idx + max(-max_delta, min(max_delta, delta))
+    clamped_idx = max(0, min(len(VERDICT_ENUM) - 1, clamped_idx))
+    return VERDICT_ENUM[clamped_idx]
+
+
+def _features_changed(last_feat: dict, cur_feat: dict) -> bool:
+    """客观交叉验证：本次 features vs 上次，任一关键指标变化超阈值即 True。
+    用于驳回 AI 空口声称"有新增信息"（防编造/漂移，宁可错杀）。"""
+    for key, thresh in _FEATURE_DIFF_THRESHOLDS.items():
+        lv = last_feat.get(key)
+        cv = cur_feat.get(key)
+        if lv is None or cv is None:
+            continue
+        try:
+            if abs(float(cv) - float(lv)) >= thresh:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _compute_repeat_analysis(
+    history_entries: list[dict],
+    raw_verdict: str,
+    raw_confidence: Optional[int],
+    new_info: list,
+    cur_features: dict,
+) -> dict:
+    """计算本次分析相比上次的 24h 重复限幅信息。
+
+    - is_repeat: 距最近一次分析 < 24h（客观硬条件）
+    - new_info_verified: AI 自报有新增 且 技术面客观变化超阈值
+    - 限幅由调用方根据 is_repeat & not new_info_verified 执行（宁可错杀）
+    """
+    out: dict = {
+        "is_repeat": False,
+        "hours_since_last": None,
+        "last_verdict": None,
+        "last_confidence": None,
+        "last_analyzed_at": None,
+        "verdict_delta": 0,
+        "confidence_delta": 0,
+        "new_info_claimed": list(new_info or []),
+        "new_info_verified": False,
+        "limited": False,
+        "limit_rule": None,
+        "raw_verdict": raw_verdict,
+        "raw_confidence": raw_confidence,
+    }
+    if not history_entries:
+        return out
+    last = history_entries[-1]  # load_entries 按时间正序，最后一条即最近
+    last_at = last.get("analyzed_at") or last.get("date")
+    if not last_at:
+        return out
+    try:
+        last_dt = datetime.fromisoformat(last_at)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=_TZ_CN)
+    except (ValueError, TypeError):
+        return out
+    now_dt = datetime.now(_TZ_CN)
+    hours = (now_dt - last_dt).total_seconds() / 3600.0
+    out["hours_since_last"] = round(hours, 2)
+    if hours < 0 or hours >= 24:
+        return out  # 不在 24h 内，不算重复
+    out["is_repeat"] = True
+    out["last_verdict"] = last.get("verdict")
+    out["last_confidence"] = last.get("confidence")
+    out["last_analyzed_at"] = last_at
+    last_idx = _verdict_index(last.get("verdict", ""))
+    raw_idx = _verdict_index(raw_verdict)
+    if last_idx >= 0 and raw_idx >= 0:
+        out["verdict_delta"] = raw_idx - last_idx
+    if raw_confidence is not None and last.get("confidence") is not None:
+        try:
+            out["confidence_delta"] = int(raw_confidence) - int(last["confidence"])
+        except (TypeError, ValueError):
+            pass
+    # 客观交叉验证：AI 声称有新增 + 技术面真的变了 -> 才豁免限幅
+    if out["new_info_claimed"]:
+        out["new_info_verified"] = _features_changed(last.get("features") or {}, cur_features or {})
+    return out
+
+
+def _apply_repeat_limit(
+    repeat_info: dict,
+    raw_verdict: str,
+    raw_confidence: Optional[int],
+) -> tuple[str, Optional[int]]:
+    """根据 repeat_info 决定是否限幅，返回 (limited_verdict, limited_confidence)。
+
+    24h 内重复 + 无客观新增 -> 方向 ±1 档 / conf ±2（宁可错杀，防 LLM 漂移）。
+    就地修改 repeat_info['limited'] / ['limit_rule']。
+    """
+    limited_verdict = raw_verdict
+    limited_confidence = raw_confidence
+    if repeat_info["is_repeat"] and not repeat_info["new_info_verified"]:
+        rules = []
+        if abs(repeat_info["verdict_delta"]) > 1:
+            limited_verdict = _clamp_verdict_delta(
+                repeat_info["last_verdict"], raw_verdict, max_delta=1,
+            )
+            if limited_verdict != raw_verdict:
+                rules.append("verdict_delta_clamped")
+        if raw_confidence is not None and repeat_info["last_confidence"] is not None:
+            try:
+                delta = int(raw_confidence) - int(repeat_info["last_confidence"])
+                if abs(delta) > 2:
+                    limited_confidence = int(repeat_info["last_confidence"]) + max(-2, min(2, delta))
+                    limited_confidence = max(1, min(10, limited_confidence))
+                    rules.append("conf_clamped")
+            except (TypeError, ValueError):
+                pass
+        if rules:
+            repeat_info["limited"] = True
+            repeat_info["limit_rule"] = "+".join(rules)
+    return limited_verdict, limited_confidence
 
 
 def _format_history(entries: list[dict], ts_code: str, limit: int = 8) -> str:
@@ -1106,8 +1263,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             except Exception:
                 pass
 
+    history_entries = journal.load_entries(ts_code=ts_code)
     history_block = _format_history(
-        journal.load_entries(ts_code=ts_code), ts_code=ts_code, limit=history_limit,
+        history_entries, ts_code=ts_code, limit=history_limit,
     )
     portfolio_block = _format_portfolio_context(ts_code)
     intraday_block, intraday_ctx = _format_intraday_block(ts_code)
@@ -1205,7 +1363,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | 多头判断 + 业绩超预期（最近季度净利润 yoy ≥ +30%）且 PE_TTM ≤ 30 | **+1** |\n"
                 "   | 空头判断 + ST/退市风险 或 监管立案/处罚 | **+1** |\n"
                 "   | 空头判断 + regime 弱势（任一 regime 利空命中） | 顺势，不扣不加 |\n"
-                "   | **24h 内重复分析且无新增基本面数据** | 方向最多变化 ±1 档，conf 最多变化 ±2（防 LLM 随机性导致剧烈摆动） |\n"
+                "   | **24h 内重复分析** | 系统自动限幅：方向 ±1 档 / conf ±2（防 LLM 随机漂移）。AI 如实给判断、不要自行压分；在 record_verdict 的 new_info 列出本次新增信息，系统据此判断是否豁免限幅 |\n"
                 "   | **蓝筹/白马 + 基本面证据 < 2 条** | **−2**（基本面权重 50% 但没有实质证据，置信度必须打折扣） |\n"
                 "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
                 "\n"
@@ -1426,12 +1584,27 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             raw_confidence = max(1, min(10, int(raw_confidence)))
         except (TypeError, ValueError):
             raw_confidence = None
+
+    # ── 24h 重复分析限幅（痛点#3：宁可错杀，防 LLM 随机漂移）──
+    # 代码层强制：24h 内重复 + 无客观新增 -> 方向 ±1 档 / conf ±2。
+    # prompt 已改成"系统自动限幅，AI 如实给判断"，避免双重限幅。
+    repeat_info = _compute_repeat_analysis(
+        history_entries,
+        raw_verdict,
+        raw_confidence,
+        verdict_data.get("new_info", []),
+        verdict_data.get("features", {}),
+    )
+    limited_verdict, limited_confidence = _apply_repeat_limit(
+        repeat_info, raw_verdict, raw_confidence,
+    )
+
     cal_score: Optional[float] = None
     cal_explanation = ""
-    if raw_confidence is not None:
+    if limited_confidence is not None:
         try:
             cal_score, cal_explanation = calibration.calibrate_confidence(
-                int(raw_confidence), raw_verdict,
+                int(limited_confidence), limited_verdict,
             )
             if cal_score is not None:
                 cal_score = max(1.0, min(10.0, float(cal_score)))
@@ -1446,8 +1619,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "name": stock_name,
         "date": now_cn.date().isoformat(),
         "analyzed_at": now_cn.isoformat(timespec="seconds"),
-        "verdict": raw_verdict,
-        "confidence": raw_confidence,
+        "verdict": limited_verdict,
+        "confidence": limited_confidence,
         "calibrated_confidence": cal_score,
         "calibration_explanation": cal_explanation,
         "price_advice": {
@@ -1463,6 +1636,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "searches_performed": searches_performed,
         "market_context": market_ctx,
         "analysis_text": analysis_text.strip(),
+        "repeat_analysis": repeat_info,
         "prompt_version": "2.5.0",
         "source": "standalone",
     }

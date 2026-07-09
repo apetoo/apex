@@ -29,6 +29,13 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
   const calibrated = verdict.calibrated_confidence;
   const calExplanation =
     typeof verdict.calibration_explanation === "string" ? verdict.calibration_explanation : "";
+  // 24h 重复分析限幅标记（痛点#3透明化）。老 entry 无此字段，?. 兼容。
+  const ra = (verdict.repeat_analysis ?? {}) as Record<string, unknown>;
+  const limited = ra.limited === true;
+  const isRepeat = ra.is_repeat === true;
+  const limitTooltip = limited
+    ? `AI 原始 ${String(ra.raw_confidence ?? "-")}(${String(ra.raw_verdict ?? "-")}) -> 限幅 ${String(verdict.confidence ?? "-")}(${String(verdict.verdict ?? "-")})${ra.limit_rule ? ` · ${String(ra.limit_rule)}` : ""}`
+    : "";
 
   return (
     <Card>
@@ -45,6 +52,22 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
               <span className="text-flat"> / 校准 {String(calibrated)}</span>
             )}
           </span>
+          {limited && (
+            <span
+              className="rounded bg-bg-base px-1.5 py-0.5 text-[10px] text-flat"
+              title={limitTooltip}
+            >
+              🔄 已限幅
+            </span>
+          )}
+          {!limited && isRepeat && (
+            <span
+              className="rounded bg-bg-base px-1.5 py-0.5 text-[10px] text-flat"
+              title="24h 内重复分析，有新增信息未限幅"
+            >
+              🔄 24h 重复
+            </span>
+          )}
         </div>
       </CardHeader>
       <CardContent className="space-y-4 pt-0">
