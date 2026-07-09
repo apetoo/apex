@@ -172,6 +172,25 @@ def _benchmark_return(entry_date: str, exit_date: str) -> Optional[float]:
         return None
 
 
+def _benchmark_from_series(bench_series: Optional[pd.Series],
+                           fill_date: str, exit_date: str) -> Optional[float]:
+    """从预拉的 hs300 全段 Series 切片算 close-to-close 收益，替代 per-signal index_daily。
+    fill_date/exit_date 为 'YYYY-MM-DD'；Series index=datetime。失败返 None。
+    语义与 _benchmark_return 一致：seg 首末 close 的 close-to-close。
+    """
+    if bench_series is None or bench_series.empty:
+        return None
+    try:
+        seg = bench_series.loc[fill_date:exit_date]
+    except Exception:
+        return None
+    if len(seg) < 2:
+        return None
+    c0 = float(seg.iloc[0])
+    c1 = float(seg.iloc[-1])
+    return (c1 - c0) / c0 if c0 > 0 else None
+
+
 def _fetch_daily(code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """拉单票日线（market_cache parquet 缓存为主, akshare 兜底），不算 MA、不截断 tail(60)。
 
@@ -271,7 +290,8 @@ def _limit_down_locked(prev_close: float, low: float, high: float, close: float,
 
 
 def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
-                  include_benchmark: bool) -> Optional[dict]:
+                  include_benchmark: bool,
+                  bench_series: Optional[pd.Series] = None) -> Optional[dict]:
     """单条信号 × 单持有期 → 一行结果。
 
     bars: DataFrame, index=trade_date(datetime, 升序), 需含 open/high/low/close。
@@ -433,7 +453,12 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     else:
         mae = mfe = None
 
-    bench = _benchmark_return(fill_date, exit_date) if include_benchmark else None
+    if include_benchmark:
+        bench = (_benchmark_from_series(bench_series, fill_date, exit_date)
+                 if bench_series is not None
+                 else _benchmark_return(fill_date, exit_date))
+    else:
+        bench = None
     excess = round(total_return - bench, 4) if bench is not None else None
 
     base.update({
@@ -473,6 +498,33 @@ def _load_bars(code: str, entry_date: str, holding_period: int) -> pd.DataFrame:
     return df
 
 
+def _load_bars_by_code(entries: list, holding_period: int) -> dict:
+    """按 ts_code 聚合信号，每 code 拉一次覆盖该 code 所有信号日的全段日线（qfq）。
+
+    替代 per-signal _load_bars 的同 code 重复后补：28 信号 17 code 时，
+    adj_factor 后补从 N×2 降到 code数×2。返回 {ts_code: DataFrame(index=trade_date 升序)}，
+    失败/无数据的 code 不进 dict。调用方按 entry_date 从全段 loc[entry_date:] 切片复用。
+    """
+    by_code: dict = {}
+    for e in entries:
+        d = e.get("date", "")
+        if d:
+            by_code.setdefault(e.get("ts_code", ""), []).append(d)
+    out = {}
+    for code, dates in by_code.items():
+        if not code:
+            continue
+        start = min(dates).replace("-", "")
+        end = _add_days(max(dates), holding_period + 20).replace("-", "")
+        try:
+            df = market_cache.load_daily_full(code, start_date=start, end_date=end, adj="qfq")
+        except Exception:
+            df = pd.DataFrame()
+        if df is not None and not df.empty:
+            out[code] = df
+    return out
+
+
 def _prefetch_signals(codes, entries, holding_period: int) -> None:
     """批量预热所有信号的日线 parquet（按交易日横截面，调用数与 code 数解耦）。
 
@@ -502,19 +554,35 @@ def _run_entries(long_entries: list, holding_period: int,
 
     run() 只取 fillable；aggregate/sweep 各取所需。失败案例不再静默丢弃。
     """
+    # per-code 去重：同 code 多信号共享一次全段拉取，各信号 loc[entry_date:] 切片复用，
+    # 消除同 code 重复后补 adj_factor。bench 全段一次拉，替代 per-signal index_daily。
+    bars_by_code = _load_bars_by_code(long_entries, holding_period)
+    bench_series = None
+    if include_benchmark:
+        dates = [e.get("date", "") for e in long_entries if e.get("date")]
+        if dates:
+            try:
+                bench_series = market_cache.load_index_daily(
+                    _BENCHMARK_CODE, min(dates),
+                    _add_days(max(dates), holding_period + 20))
+            except Exception:
+                bench_series = None
+
     rows = []
     counts = {"unfillable": 0, "truncated": 0, "no_fill_bar": 0}
     for entry in long_entries:
         entry_date = entry.get("date", "")
         if not entry_date:
             continue
-        bars = _load_bars(entry["ts_code"], entry_date, holding_period)
+        bars_full = bars_by_code.get(entry["ts_code"])
+        bars = bars_full.loc[entry_date:] if bars_full is not None and not bars_full.empty else pd.DataFrame()
         if bars.empty or len(bars) < 2:
             # 连 T+1 fill bar 都没有：无法成交（停牌/退市当日即终/缺数据）。
             # 不静默丢弃——计入 no_fill_bar，让 aggregate 透明披露多少信号因数据缺失无法回测。
             counts["no_fill_bar"] += 1
             continue
-        row = _simulate_one(entry, bars, holding_period, include_benchmark)
+        row = _simulate_one(entry, bars, holding_period, include_benchmark,
+                            bench_series=bench_series)
         if row is None:
             counts["no_fill_bar"] += 1
             continue
@@ -600,19 +668,32 @@ def run_sweep(ts_code: Optional[str] = None,
                       "excess_sum": 0.0, "excess_n": 0}
                  for hp in holding_periods}
 
-    # 按 entry 缓存 bars（拉到 max_hp 窗口，各 hp 复用切片）
+    # per-code 去重：同 code 共享全段（max_hp 窗口），各 entry loc[entry_date:] 切片，各 hp 复用
+    bars_by_code = _load_bars_by_code(long_entries, max_hp)
+    bench_series = None
+    if include_benchmark:
+        dates = [e.get("date", "") for e in long_entries if e.get("date")]
+        if dates:
+            try:
+                bench_series = market_cache.load_index_daily(
+                    _BENCHMARK_CODE, min(dates),
+                    _add_days(max(dates), max_hp + 20))
+            except Exception:
+                bench_series = None
     for entry in long_entries:
         entry_date = entry.get("date", "")
         if not entry_date:
             continue
-        bars = _load_bars(entry["ts_code"], entry_date, max_hp)
+        bars_full = bars_by_code.get(entry["ts_code"])
+        bars = bars_full.loc[entry_date:] if bars_full is not None and not bars_full.empty else pd.DataFrame()
         if bars.empty or len(bars) < 2:
             # 连 T+1 fill bar 都没有：所有 hp 都计 no_fill_bar（生存者偏差透明化）
             for hp in holding_periods:
                 agg[hp]["no_fill_bar"] += 1
             continue
         for hp in holding_periods:
-            row = _simulate_one(entry, bars, hp, include_benchmark)
+            row = _simulate_one(entry, bars, hp, include_benchmark,
+                                bench_series=bench_series)
             if row is None:
                 agg[hp]["no_fill_bar"] += 1
                 continue

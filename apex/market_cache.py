@@ -186,15 +186,23 @@ def _ensure_daily_range(ts_code: str, start: str, end: str) -> pd.DataFrame:
     cached_max = cached["trade_date"].iloc[-1]
     fetched = False
 
-    # 前补（更早历史）
+    # 前补（更早历史）- 失败 fallback cached，不冒泡（限频/网络抖动不该丢已有数据）
     if start < cached_min:
-        pre = _fetch_daily_raw(ts_code, start, _prev_date(cached_min))
+        try:
+            pre = _fetch_daily_raw(ts_code, start, _prev_date(cached_min))
+        except Exception as e:
+            print(f"⚠ cache 前补 {ts_code} 失败: {type(e).__name__}: {e}，用缓存已有数据")
+            pre = pd.DataFrame()
         if not pre.empty:
             cached = pd.concat([pre, cached], ignore_index=True)
             fetched = True
-    # 后补（更新数据）
+    # 后补（更新数据）- 失败 fallback cached，不冒泡
     if end > cached_max:
-        nxt = _fetch_daily_raw(ts_code, _next_date(cached_max), end)
+        try:
+            nxt = _fetch_daily_raw(ts_code, _next_date(cached_max), end)
+        except Exception as e:
+            print(f"⚠ cache 后补 {ts_code} 失败: {type(e).__name__}: {e}，用缓存已有数据")
+            nxt = pd.DataFrame()
         if not nxt.empty:
             cached = pd.concat([cached, nxt], ignore_index=True)
             fetched = True
