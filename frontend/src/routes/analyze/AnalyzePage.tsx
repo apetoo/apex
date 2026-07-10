@@ -7,7 +7,7 @@ import { getJournal, getTrace } from "@/api/analyze";
 import { getPrices, getDailyPrices, getStockInfo } from "@/api/market";
 import { qk } from "@/api/query-keys";
 import { useChatContext } from "@/hooks/useChatContext";
-import { cn } from "@/lib/utils";
+import { cn, normalizeTsCode } from "@/lib/utils";
 
 /**
  * /analyze 个股分析页
@@ -48,17 +48,7 @@ function loadPersistedState(): PersistedAnalyzeState | null {
   }
 }
 
-/** 前端 ts_code 归一化(镜像后端 data.normalize_ts_code: 6→SH, 0/3→SZ, 4/8→BJ)。非法返回 null。 */
-function normalizeTsCode(raw: string): string | null {
-  const s = raw.trim().toUpperCase();
-  if (!/^\d{6}(\.(SH|SZ|BJ))?$/.test(s)) return null;
-  if (s.length === 6) {
-    const d = s[0];
-    const suf = d === "6" ? "SH" : d === "0" || d === "3" ? "SZ" : d === "4" || d === "8" ? "BJ" : null;
-    return suf ? `${s}.${suf}` : null;
-  }
-  return s;
-}
+// normalizeTsCode 已提取到 @/lib/utils
 
 export function AnalyzePage() {
   // 仅 mount 时读一次 sessionStorage(切回页面时拿最新持久化值)。

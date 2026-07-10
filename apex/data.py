@@ -4,6 +4,7 @@ for the Claude API agent in analyze.py.
 """
 import json
 import ssl
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -15,6 +16,11 @@ import pandas as pd
 from apex import mx_client as _mx
 
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
+
+# akshare 的 stock_zh_a_minute 内部用 py_mini_racer(V8) 执行新浪解密 JS, V8 的
+# AddressPoolManager 是进程级单例, 多线程并发 MiniRacer() 会 FATAL 崩进程。
+# FastAPI 同步端点在 threadpool 并发跑(分时看板多股), 必须用此锁序列化 akshare 调用。
+_AKSHARE_LOCK = threading.Lock()
 
 # 国内 API 直连 opener: 跳系统代理 + certifi CA(免 macOS Python.framework 系统证书
 # 缺失导致 SSL CERTIFICATE_VERIFY_FAILED, 静默 except 让搜索/实时链全失效)。
@@ -41,9 +47,9 @@ def normalize_ts_code(code: str) -> str:
         return code
     if not code.isdigit() or len(code) != 6:
         return code
-    if code.startswith("6"):
+    if code.startswith(("6", "5")):  # 6 沪市个股, 5 沪市 ETF/基金
         return f"{code}.SH"
-    if code.startswith(("0", "3")):
+    if code.startswith(("0", "3", "1")):  # 0/3 深市个股, 1 深市 ETF/基金
         return f"{code}.SZ"
     if code.startswith(("8", "4")):
         return f"{code}.BJ"
@@ -673,36 +679,6 @@ def get_prev_close(ts_codes: list[str]) -> dict[str, Optional[float]]:
     return result
 
 
-def _sina_prev_close(ts_code: str) -> Optional[float]:
-    """从新浪行情取昨收价（真实价，不复权）。失败返 None。
-
-    与 akshare 分时线口径一致（均为真实成交价），避免用 qfq 日线昨收导致除权日算错。
-    """
-    try:
-        symbol = ts_code.split(".")[0]
-        suffix = ts_code.split(".")[1] if "." in ts_code else ""
-        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sh")
-        url = f"https://hq.sinajs.cn/list={prefix}{symbol}"
-        req = urllib.request.Request(url, headers={
-            "Referer": "https://finance.sina.com.cn/",
-            "User-Agent": "Mozilla/5.0",
-        })
-        opener = _direct_opener()
-        with opener.open(req, timeout=10) as resp:
-            raw = resp.read().decode("gbk", errors="ignore")
-        import re
-        m = re.search(r'="([^"]*)"', raw)
-        if not m:
-            return None
-        fields = m.group(1).split(",")
-        if len(fields) < 3:
-            return None
-        pc = float(fields[2])
-        return pc if pc > 0 else None
-    except Exception:
-        return None
-
-
 def _intraday_shape(open_p: float, last: float, prev_close: Optional[float],
                     high: float, low: float) -> str:
     """根据开盘/现价/昨收/高低点判断盘中走势形态文字。"""
@@ -724,27 +700,140 @@ def _intraday_shape(open_p: float, last: float, prev_close: Optional[float],
     return base
 
 
-def get_intraday_bars(ts_code: str) -> dict:
-    """底层：取个股当日 1 分钟 K 线（akshare，真实价不复权）+ 昨收 + 昨量。
+def _tx_intraday_bars(ts_code: str) -> Optional[dict]:
+    """腾讯分时(明文JSON,HTTPS,不限流,可并发,含昨收/名)。当日分时。
 
-    供 get_intraday_snapshot（给 AI 的特征）和 app.py 分时图（给人看）复用。
-    返回 dict：{trade_date, as_of_time, is_intraday, prev_close, prev_vol_shou,
-               bars: [{time, open, high, low, close, vol, amount}, ...]}
-    任何失败返回空 dict（fail-soft）。bars 按时间升序，仅含当日。
+    secid: SH->sh, SZ->sz; BJ->bj(失败 fallback akshare)。
+    分时点 "HHMM price cumvol cumamount" 差分为单分钟; 昨收 qt[4]/名 qt[1]。
+    失败返 None。
     """
+    try:
+        symbol = ts_code.split(".")[0]
+        suffix = ts_code.split(".")[1] if "." in ts_code else ""
+        prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix)
+        if not prefix:
+            return None
+        code = f"{prefix}{symbol}"
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        opener = _direct_opener()
+        with opener.open(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        blk = (payload.get("data") or {}).get(code) or {}
+        data_blk = blk.get("data") or {}
+        pts = data_blk.get("data") or []
+        if not pts:
+            return None
+        date = data_blk.get("date") or datetime.today().strftime("%Y-%m-%d")
+        if len(date) == 8 and "-" not in date:  # 腾讯返回 "20260710" -> "2026-07-10"
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+        qt = (blk.get("qt") or {}).get(code) or []
+        prev_close = float(qt[4]) if len(qt) > 4 and qt[4] else None
+        name = qt[1] if len(qt) > 1 else None
+
+        bars = []
+        prev_vol = 0.0
+        prev_amt = 0.0
+        for pt in pts:
+            parts = pt.split()
+            if len(parts) < 4:
+                continue
+            hhmm = parts[0]
+            price = float(parts[1])
+            cumvol = float(parts[2])
+            cumamt = float(parts[3])
+            bars.append({
+                "time": f"{date} {hhmm[:2]}:{hhmm[2:4]}:00",
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "vol": (cumvol - prev_vol) * 100,  # 手 -> 股(与 akshare 一致, 前端 VWAP=amount/vol 元/股)
+                "amount": cumamt - prev_amt,
+            })
+            prev_vol, prev_amt = cumvol, cumamt
+        if not bars:
+            return None
+        last_time = bars[-1]["time"]
+        now = datetime.today()
+        is_intraday = (date == now.strftime("%Y-%m-%d")) and (last_time[11:16] < "15:00")
+        return {
+            "trade_date": date.replace("-", ""),
+            "as_of_time": last_time,
+            "is_intraday": is_intraday,
+            "prev_close": round(prev_close, 2) if prev_close else None,
+            "prev_vol_shou": None,
+            "name": name,
+            "bars": bars,
+        }
+    except Exception:
+        return None
+
+
+def _prev_vol_from_daily(ts_code: str, trade_date_norm: str) -> Optional[float]:
+    """从日线(不复权)取昨日量(手),供 AI 量比。失败返 None。"""
+    try:
+        dbars = json.loads(get_daily_price(ts_code, adj="none"))
+        prev_bars = [b for b in dbars if str(b.get("trade_date")) < trade_date_norm]
+        if prev_bars:
+            return float(prev_bars[-1].get("vol") or 0)
+    except Exception:
+        pass
+    return None
+
+
+def get_intraday_bars(ts_code: str, trade_date: Optional[str] = None,
+                      with_prev_vol: bool = True) -> dict:
+    """底层：取个股 1 分钟分时 + 昨收 (+ 昨量)。
+
+    数据源：当日优先腾讯分时(明文JSON,不限流,可并发,含昨收/名)；历史日或腾讯失败
+    fallback akshare(stock_zh_a_minute,V8 需 _AKSHARE_LOCK 串行)。
+
+    trade_date:
+      - None：当日
+      - "YYYYMMDD"/"YYYY-MM-DD"：历史交易日(仅 akshare 可查,最近约5-8日)
+
+    with_prev_vol: 是否补取 prev_vol_shou(昨日量,AI 量比用)。看板传 False 省一次日线;
+                   AI 路径(get_intraday_snapshot)默认 True。
+
+    供 get_intraday_snapshot(AI 特征)和分时看板复用。
+    返回 dict：{trade_date, as_of_time, is_intraday, prev_close, prev_vol_shou, [name], bars}
+    任何失败返回空 dict(fail-soft)。bars 按时间升序,仅含选定日。
+    """
+    # ── 当日: 优先腾讯(快, 含昨收/名, 可并发) ──
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    want_today = (not trade_date) or (trade_date.replace("-", "") == today_str.replace("-", ""))
+    if want_today:
+        tx = _tx_intraday_bars(ts_code)
+        if tx and tx.get("bars"):
+            if with_prev_vol:
+                tx["prev_vol_shou"] = _prev_vol_from_daily(ts_code, tx["trade_date"])
+            return tx
+        # 腾讯失败(BJ/接口异常) -> fallback akshare
+
+    # ── fallback: akshare(历史日 或 腾讯失败) ──
     out: dict = {}
     try:
         import akshare as ak
         symbol = ts_code.split(".")[0]
         suffix = ts_code.split(".")[1] if "." in ts_code else ""
         prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix, "sh")
-        df = ak.stock_zh_a_minute(symbol=f"{prefix}{symbol}", period="1", adjust="")
+        with _AKSHARE_LOCK:  # 序列化 mini_racer(V8) 初始化, 防并发 FATAL
+            df = ak.stock_zh_a_minute(symbol=f"{prefix}{symbol}", period="1", adjust="")
         if df is None or df.empty:
             return out
         df = df.copy()
         df["day"] = df["day"].astype(str)
-        last_date = df["day"].iloc[-1][:10]
-        today_df = df[df["day"].str.startswith(last_date)].reset_index(drop=True)
+
+        # 选定日期：传入则归一为 YYYY-MM-DD 并过滤，否则取 akshare 最新一天
+        if trade_date:
+            sel = trade_date.replace("-", "")
+            sel_date = f"{sel[:4]}-{sel[4:6]}-{sel[6:8]}" if len(sel) == 8 else trade_date
+            today_df = df[df["day"].str.startswith(sel_date)].reset_index(drop=True)
+            last_date = sel_date
+        else:
+            last_date = df["day"].iloc[-1][:10]
+            today_df = df[df["day"].str.startswith(last_date)].reset_index(drop=True)
         if today_df.empty:
             return out
         for col in ("open", "high", "low", "close", "volume"):
@@ -759,23 +848,22 @@ def get_intraday_bars(ts_code: str) -> dict:
 
         last_row = today_df.iloc[-1]
         as_of_time = str(last_row["day"])
-        trade_date = last_date.replace("-", "")
+        trade_date_norm = last_date.replace("-", "")
         now = datetime.today()
         is_intraday = (last_date == now.strftime("%Y-%m-%d")) and (as_of_time[11:16] < "15:00")
 
-        # 昨收（真实价）：新浪优先，失败回落日线不复权
-        prev_close = _sina_prev_close(ts_code)
+        # 昨收 + 昨量: 从日线取(口径正确, 历史日也准; 替代旧新浪昨收 + or True 浪费)
+        prev_close: Optional[float] = None
         prev_vol_shou: Optional[float] = None
-        if not prev_close or True:  # 昨收和昨量都从日线取一次（不复权真实价）
-            try:
-                bars = json.loads(get_daily_price(ts_code, adj="none"))
-                prev_bars = [b for b in bars if str(b.get("trade_date")) != trade_date]
-                if prev_bars:
-                    if not prev_close:
-                        prev_close = float(prev_bars[-1]["close"])
+        try:
+            dbars = json.loads(get_daily_price(ts_code, adj="none"))
+            prev_bars = [b for b in dbars if str(b.get("trade_date")) < trade_date_norm]
+            if prev_bars:
+                prev_close = float(prev_bars[-1]["close"])
+                if with_prev_vol:
                     prev_vol_shou = float(prev_bars[-1].get("vol") or 0)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         bars_list = []
         for _, r in today_df.iterrows():
@@ -790,7 +878,7 @@ def get_intraday_bars(ts_code: str) -> dict:
             })
 
         out = {
-            "trade_date": trade_date,
+            "trade_date": trade_date_norm,
             "as_of_time": as_of_time,
             "is_intraday": is_intraday,
             "prev_close": round(prev_close, 2) if prev_close else None,
@@ -800,7 +888,6 @@ def get_intraday_bars(ts_code: str) -> dict:
     except Exception:
         pass
     return out
-
 
 def _intraday_session_segments(bars: list[dict], prev_close: Optional[float]) -> Optional[list[dict]]:
     """量价段分析：把当日分为早盘(09:30-10:30)/中盘(10:30-11:30,13:00-14:00)/尾盘(14:00-15:00)。

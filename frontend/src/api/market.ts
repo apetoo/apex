@@ -253,7 +253,10 @@ export async function getStockInfo(tsCode: string): Promise<StockInfo | null> {
 }
 
 /** GET /api/market/intraday/{ts_code}/bars — 当日分时 */
-export async function getIntradayBars(tsCode: string): Promise<IntradayBars> {
+export async function getIntradayBars(
+  tsCode: string,
+  tradeDate?: string,
+): Promise<IntradayBars> {
   if (USE_MOCK) {
     // mock: 9:30-15:00 每分钟一根, 价格在 prev 附近随机游走
     const prev = MOCK_DATA[tsCode]?.price ?? 10;
@@ -287,7 +290,8 @@ export async function getIntradayBars(tsCode: string): Promise<IntradayBars> {
     }
     return { trade_date: "20260627", is_intraday: true, prev_close: prev, bars };
   }
+  const qs = tradeDate ? `?trade_date=${tradeDate}` : "";
   return api.get<IntradayBars>(
-    `/market/intraday/${encodeURIComponent(tsCode)}/bars`,
+    `/market/intraday/${encodeURIComponent(tsCode)}/bars${qs}`,
   );
 }

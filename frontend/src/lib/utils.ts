@@ -84,3 +84,25 @@ export function formatVolume(yi: number | null | undefined): string {
   if (yi >= 10000) return `${(yi / 10000).toFixed(2)} 万亿`;
   return `${yi.toFixed(0)} 亿`;
 }
+
+/**
+ * ts_code 归一化(镜像后端 data.normalize_ts_code: 6->SH, 0/3->SZ, 4/8->BJ)。
+ * 接受 "601318" / "601318.SH" / "601318.sh"，非法返回 null。
+ */
+export function normalizeTsCode(raw: string): string | null {
+  const s = raw.trim().toUpperCase();
+  if (!/^\d{6}(\.(SH|SZ|BJ))?$/.test(s)) return null;
+  if (s.length === 6) {
+    const d = s[0];
+    const suf =
+      d === "6" || d === "5"
+        ? "SH" // 6 沪市个股, 5 沪市 ETF/基金
+        : d === "0" || d === "3" || d === "1"
+          ? "SZ" // 0/3 深市个股, 1 深市 ETF/基金
+          : d === "4" || d === "8"
+            ? "BJ"
+            : null;
+    return suf ? `${s}.${suf}` : null;
+  }
+  return s;
+}

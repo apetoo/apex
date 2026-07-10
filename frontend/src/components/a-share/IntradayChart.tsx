@@ -32,6 +32,12 @@ import { cn } from "@/lib/utils";
  */
 export interface IntradayChartProps {
   tsCode: string;
+  /** YYYYMMDD；缺省=当日(后端取 akshare 最新一天) */
+  tradeDate?: string;
+  /** 数据到位回调, 供卡片头取最新价/涨跌幅(避免父层重复拉一次 bars) */
+  onDataLoaded?: (data: IntradayBars) => void;
+  /** 图表高度(px), 默认 320; 看板可传 220 更紧凑 */
+  height?: number;
   className?: string;
 }
 
@@ -45,21 +51,19 @@ const VOL_DOWN = "rgba(43, 168, 74, 0.4)";
 
 /**北京时间 "YYYY-MM-DD HH:MM:SS" → chart 用 UTCTimestamp(偏移 +8h 让显示对) */
 function bjTimeToTs(s: string): number {
-  // Date.parse 把无时区后缀的串当本地时间。前端跑在北京时区机器上正好;
-  // 为稳, 显式按北京时间构造再转 UTC 秒, 最后 +8h 偏移给 chart。
+  // 北京时间 "YYYY-MM-DD HH:MM:SS" 直接当 UTC 解析(不偏移): ts 的 HH:MM == 北京 HH:MM。
+  // 时区无关 -- fmtTickLabel 用 getUTCHours 还原, 不依赖运行机器本地时区
+  // (旧逻辑假设机器在北京时区, 非北京机器刻度偏移显示成 UTC 时间)。
   const [d, t] = s.split(" ");
   const [Y, M, D] = d.split("-").map(Number);
   const [h, m] = (t || "00:00:00").split(":").map(Number);
-  // UTC 秒(假设输入是北京时间): 北京 = UTC+8, 所以 UTC = 北京 - 8h
-  const utcSec = Date.UTC(Y, M - 1, D, h - 8, m, 0) / 1000;
-  // chart 当 UTC 渲染会再 -8h, 加回 8h 让标签显示成北京时间
-  return utcSec + 8 * 3600;
+  return Date.UTC(Y, M - 1, D, h, m, 0) / 1000;
 }
 
 /** 把时间戳(已偏移) 格式化成北京时间 HH:MM 给轴标签 */
 function fmtTickLabel(ts: number): string {
-  // ts 是"偏移后的 UTC 秒"; 减 8h 得真 UTC, 再转北京 HH:MM
-  const d = new Date((ts - 8 * 3600) * 1000);
+  // ts 是"北京当 UTC"秒; getUTCHours 直接还原北京 HH:MM
+  const d = new Date(ts * 1000);
   const h = String(d.getUTCHours()).padStart(2, "0");
   const m = String(d.getUTCMinutes()).padStart(2, "0");
   return `${h}:${m}`;
@@ -102,7 +106,7 @@ function buildSeriesData(data: IntradayBars) {
   return { priceData, vwapData, volData, lineColor, prevClose };
 }
 
-export function IntradayChart({ tsCode, className }: IntradayChartProps) {
+export function IntradayChart({ tsCode, tradeDate, onDataLoaded, height, className }: IntradayChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const priceSeriesRef = useRef<ISeriesApi<"Area"> | null>(null);
@@ -113,11 +117,12 @@ export function IntradayChart({ tsCode, className }: IntradayChartProps) {
   // 拉数据 + 喂给 chart
   useEffect(() => {
     let cancelled = false;
-    getIntradayBars(tsCode)
+    getIntradayBars(tsCode, tradeDate)
       .then((data) => {
         if (cancelled) return;
         loadRef.current = { code: tsCode, data };
         applyData(data);
+        onDataLoaded?.(data);
       })
       .catch(() => {
         // fail-soft: 留空图
@@ -126,7 +131,7 @@ export function IntradayChart({ tsCode, className }: IntradayChartProps) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tsCode]);
+  }, [tsCode, tradeDate]);
 
   function applyData(data: IntradayBars) {
     if (!chartRef.current) return;
@@ -188,7 +193,7 @@ export function IntradayChart({ tsCode, className }: IntradayChartProps) {
         tickMarkFormatter: (ts: number) => fmtTickLabel(ts),
       },
       width: containerRef.current.clientWidth,
-      height: 320,
+      height: height ?? 320,
     });
     chartRef.current = chart;
 

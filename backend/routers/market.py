@@ -105,9 +105,16 @@ def get_index_realtime_batch(
 
 
 @router.get("/intraday/{ts_code}/bars")
-def get_intraday_bars(ts_code: str):
-    """当日分时 K 线 + VWAP 原始数据。"""
-    return data.get_intraday_bars(data.normalize_ts_code(ts_code))
+def get_intraday_bars(
+    ts_code: str,
+    trade_date: Optional[str] = Query(
+        None, description="YYYYMMDD，默认当日；传入则取该交易日（仅最近约 5-8 日可查）"
+    ),
+):
+    """分时 K 线 + VWAP 原始数据。trade_date 缺省=当日。看板不需要量比, 省一次日线。"""
+    return data.get_intraday_bars(
+        data.normalize_ts_code(ts_code), trade_date=trade_date, with_prev_vol=False
+    )
 
 
 @router.get("/intraday/{ts_code}/snapshot")
