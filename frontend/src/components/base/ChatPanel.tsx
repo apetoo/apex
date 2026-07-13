@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { MessageCircle, X, Send, Square, AlertCircle, RefreshCw, Trash2 } from "lucide-react";
 import { useSSE } from "@/hooks/useSSE";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useChatContext } from "@/hooks/useChatContext";
 import { chatFetchFn } from "@/api/chat";
 import { Button, Markdown } from "@/components/base";
@@ -27,7 +28,8 @@ type ChunkEvent = { content: string } | Record<string, never>;
 export function ChatPanel() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
-  const [history, setHistory] = useState<ChatMsg[]>([]);
+  // 历史持久化到 localStorage: 刷新/重开浏览器仍保留(streamingReply 临时态不持久化)
+  const [history, setHistory] = useLocalStorage<ChatMsg[]>("apex.chat.history", []);
   const [streamingReply, setStreamingReply] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 

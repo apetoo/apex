@@ -3,6 +3,7 @@ Data layer: tushare + akshare + bocha. Functions here are also registered as too
 for the Claude API agent in analyze.py.
 """
 import json
+import os
 import ssl
 import threading
 import urllib.error
@@ -524,6 +525,18 @@ def get_fundamentals(ts_code: str) -> str:
     except Exception:
         result["quarters"] = []
         result["summary"] = None
+
+    # ── Part 3: trailing PEG（成长股估值用，防 AI 仅凭静态 PE_TTM 偏空误杀高成长标的）──
+    # PEG = pe_ttm / 净利润同比增速(%)。仅当增速 > 0 才有意义；负增长/缺失 -> None。
+    # 仅供参考：trailing PEG 用历史增速，前瞻判断仍需 AI 用 mx_data_query 查一致预期。
+    try:
+        pe_ttm = (result.get("valuation") or {}).get("pe_ttm")
+        quarters = result.get("quarters") or []
+        np_yoy = quarters[0].get("netprofit_yoy") if quarters else None
+        peg_ttm = round(pe_ttm / np_yoy, 2) if (pe_ttm and np_yoy and np_yoy > 0) else None
+        result["valuation"]["peg_ttm"] = peg_ttm
+    except Exception:
+        pass
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1576,6 +1589,204 @@ def _compute_stock_relative(
         return None
 
 
+# ── 市场情绪面评分（A 股语境：涨停/跌停/炸板/连板 -> 三维度 score + regime + market_style）──
+# 设计：原始数据作证据，三维度 score+level 供 AI 直接引用，regime/market_style 是 Python 预计算结论。
+# 调阈值只改下面的分段断点常量，不动判断逻辑。新增数据源（涨跌家数/两融）时扩 _score_* 即可，不动 prompt。
+
+# 分段线性断点 [(x, y)]：x=原始值, y=0-100 分。升序。
+_BR_LIMIT_UP = [(0, 0), (20, 25), (40, 50), (60, 70), (100, 100)]            # 涨停家数 -> 广度
+_BR_CONSEC = [(0, 0), (3, 30), (5, 60), (7, 80), (10, 100)]                  # 最高连板 -> 接力
+_BR_STRONG_POOL = [(0, 0), (30, 30), (60, 60), (100, 100)]                   # 强势股池家数 -> 接力厚度
+_BR_LIMIT_DOWN = [(0, 100), (20, 75), (50, 40), (100, 15), (200, 0)]         # 跌停家数 -> 风险偏好(反向)
+_BR_BROKEN_RATE = [(0, 100), (20, 70), (40, 40), (60, 10), (100, 0)]         # 炸板率% -> 风险偏好(反向)
+_BR_UP_DOWN_RATIO = [(0, 0), (0.3, 20), (1, 50), (2, 80), (3, 100)]          # 涨停/跌停比 -> 风险偏好
+
+
+def _piecewise_score(value: float, breaks) -> int:
+    """分段线性映射。breaks = [(x0,y0),...] 升序，value 超出两端夹断。"""
+    if value <= breaks[0][0]:
+        return max(0, breaks[0][1])
+    if value >= breaks[-1][0]:
+        return breaks[-1][1]
+    for i in range(len(breaks) - 1):
+        x0, y0 = breaks[i]
+        x1, y1 = breaks[i + 1]
+        if x0 <= value <= x1:
+            if x1 == x0:
+                return y1
+            return round(y0 + (y1 - y0) * (value - x0) / (x1 - x0))
+    return breaks[-1][1]
+
+
+def _level_from_score(score: int) -> str:
+    """score -> strong/mid/weak 三档（> =67 strong, >=34 mid, else weak）。"""
+    if score >= 67:
+        return "strong"
+    if score >= 34:
+        return "mid"
+    return "weak"
+
+
+def _score_breadth(limit_up_count: int) -> dict:
+    s = _piecewise_score(limit_up_count, _BR_LIMIT_UP)
+    return {"score": s, "level": _level_from_score(s)}
+
+
+def _score_momentum(max_consecutive: int, strong_count: int) -> dict:
+    s = round(_piecewise_score(max_consecutive, _BR_CONSEC) * 0.6
+              + _piecewise_score(strong_count, _BR_STRONG_POOL) * 0.4)
+    # 连板是接力核心信号：连板<=3 强制 weak（强势股池的"60日新高"不算真接力）
+    if max_consecutive <= 3:
+        s = min(s, 33)
+    return {"score": s, "level": _level_from_score(s)}
+
+
+def _score_risk_appetite(limit_down_count: int, broken_rate: float,
+                         up_down_ratio) -> dict:
+    ratio_val = up_down_ratio if up_down_ratio is not None else 0
+    s = round(_piecewise_score(limit_down_count, _BR_LIMIT_DOWN) * 0.4
+              + _piecewise_score(broken_rate, _BR_BROKEN_RATE) * 0.3
+              + _piecewise_score(ratio_val, _BR_UP_DOWN_RATIO) * 0.3)
+    return {"score": s, "level": _level_from_score(s)}
+
+
+def _map_regime(total_score: int) -> str:
+    """total_score -> 五档情绪温度计（>=80 亢奋 / >=60 偏热 / >=40 中性 / >=20 偏冷 / else 恐慌）。"""
+    if total_score >= 80:
+        return "亢奋"
+    if total_score >= 60:
+        return "偏热"
+    if total_score >= 40:
+        return "中性"
+    if total_score >= 20:
+        return "偏冷"
+    return "恐慌"
+
+
+def _infer_market_style(breadth_lv: str, momentum_lv: str,
+                        risk_lv: str, risk_score: int) -> str:
+    """三维度档位组合 -> A 股语境市场风格（优先级规则）。
+
+    与 regime 正交：regime 是连续温度计，market_style 是离散结构。
+    可同时「偏冷+抱团」（少数高标撑着大盘冷）。
+    """
+    if breadth_lv == "weak" and momentum_lv == "weak" and risk_score < 15:
+        return "冰点"
+    if breadth_lv == "strong" and momentum_lv == "strong" and risk_lv == "strong":
+        return "高潮"
+    if momentum_lv == "strong" and breadth_lv == "weak":
+        return "抱团"
+    if momentum_lv == "weak" and breadth_lv == "weak":
+        return "退潮"
+    if breadth_lv == "mid" and momentum_lv == "weak":
+        return "修复"
+    return "轮动"
+
+
+def _fetch_market_sentiment(ts_code: str):
+    """大盘情绪面（东财涨停/跌停/炸板/强势股池）。
+
+    注入 get_market_context，不注册为 AI tool（情绪面是公共背景，每只股都要看）。
+    4 个池子都是纯 HTTP JSON（无 V8），不需 _AKSHARE_LOCK。
+    NO_PROXY eastmoney 直连（复用筹码峰的坑）。单日调一次约 1s。fail-soft 返 None。
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return None
+
+    today = datetime.today().strftime("%Y%m%d")
+    symbol = ts_code.split(".")[0]
+
+    _np_orig = (os.environ.get("NO_PROXY"), os.environ.get("no_proxy"))
+    os.environ["NO_PROXY"] = ((_np_orig[0] or "") + ",.eastmoney.com").lstrip(",")
+    os.environ["no_proxy"] = ((_np_orig[1] or "") + ",.eastmoney.com").lstrip(",")
+
+    try:
+        limit_up_df = ak.stock_zt_pool_em(date=today)
+        limit_down_df = ak.stock_zt_pool_dtgc_em(date=today)
+        broken_df = ak.stock_zt_pool_zbgc_em(date=today)
+        strong_df = ak.stock_zt_pool_strong_em(date=today)
+    except Exception:
+        return None
+    finally:
+        for _k, _v in zip(("NO_PROXY", "no_proxy"), _np_orig):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+    # 非交易日 / 盘前：涨停池空 -> 无情绪数据
+    if limit_up_df is None or limit_up_df.empty:
+        return None
+
+    limit_up_count = len(limit_up_df)
+    limit_down_count = len(limit_down_df) if limit_down_df is not None else 0
+    broken_count = len(broken_df) if broken_df is not None else 0
+    strong_count = len(strong_df) if strong_df is not None else 0
+
+    lian_col = [c for c in limit_up_df.columns if "连板" in c]
+    max_consecutive = int(limit_up_df[lian_col[0]].max()) if lian_col else 0
+
+    denom = limit_up_count + broken_count
+    broken_rate = broken_count / denom * 100 if denom else 0.0
+    up_down_ratio = (limit_up_count / limit_down_count) if limit_down_count else None
+
+    # 个股自身今天是否在池中（标的涨停/在强势股池 = 个股情绪强信号，尤其题材/游资）
+    stock_in_pool = {"limit_up": False, "strong_pool": False, "consecutive": None}
+    if "代码" in limit_up_df.columns:
+        codes_up = limit_up_df["代码"].astype(str).values
+        if lian_col and symbol in codes_up:
+            stock_in_pool["limit_up"] = True
+            stock_in_pool["consecutive"] = int(
+                limit_up_df.loc[limit_up_df["代码"].astype(str) == symbol, lian_col[0]].iloc[0])
+    if strong_df is not None and not strong_df.empty and "代码" in strong_df.columns:
+        stock_in_pool["strong_pool"] = symbol in strong_df["代码"].astype(str).values
+
+    breadth = _score_breadth(limit_up_count)
+    momentum = _score_momentum(max_consecutive, strong_count)
+    risk_appetite = _score_risk_appetite(limit_down_count, broken_rate, up_down_ratio)
+
+    total_score = round((breadth["score"] + momentum["score"] + risk_appetite["score"]) / 3)
+    regime = _map_regime(total_score)
+    market_style = _infer_market_style(
+        breadth["level"], momentum["level"], risk_appetite["level"], risk_appetite["score"])
+
+    reasons = [
+        f"涨停{limit_up_count}家/跌停{limit_down_count}家"
+        + (f"，涨停/跌停比{up_down_ratio:.2f}" if up_down_ratio is not None else ""),
+        f"炸板率{broken_rate:.0f}%",
+        f"最高连板{max_consecutive}板，强势股池{strong_count}家",
+        f"广度{breadth['level']}({breadth['score']})/接力{momentum['level']}({momentum['score']})/风险偏好{risk_appetite['level']}({risk_appetite['score']})",
+    ]
+    if stock_in_pool["limit_up"] or stock_in_pool["strong_pool"]:
+        tags = []
+        if stock_in_pool["limit_up"]:
+            tags.append("今日涨停")
+        if stock_in_pool["strong_pool"]:
+            tags.append("在强势股池")
+        reasons.append("标的自身" + "+".join(tags))
+
+    return {
+        "as_of": datetime.today().strftime("%Y-%m-%d"),
+        "limit_up_count": limit_up_count,
+        "limit_down_count": limit_down_count,
+        "broken_limit_count": broken_count,
+        "broken_rate_pct": round(broken_rate, 1),
+        "max_consecutive": max_consecutive,
+        "strong_pool_count": strong_count,
+        "up_down_ratio": round(up_down_ratio, 2) if up_down_ratio is not None else None,
+        "stock_in_pool": stock_in_pool,
+        "breadth": breadth,
+        "momentum": momentum,
+        "risk_appetite": risk_appetite,
+        "total_score": total_score,
+        "regime": regime,
+        "market_style": market_style,
+        "reasons": reasons,
+    }
+
+
 def get_market_context(ts_code: str) -> str:
     """大盘 + 板块 + 资金面 + 个股相对 综合 context。
 
@@ -1589,6 +1800,7 @@ def get_market_context(ts_code: str) -> str:
         "sector": None,
         "north_money": None,
         "stock_relative": None,
+        "market_sentiment": None,  # 市场情绪面（涨停/跌停/炸板/连板 -> 三维度 score + regime + market_style）
     }
 
     # 1. 大盘指数（日级聚合）
@@ -1633,6 +1845,12 @@ def get_market_context(ts_code: str) -> str:
         result["stock_relative"] = _compute_stock_relative(
             ts_code, result["indices"], result["sector"],
         )
+    except Exception:
+        pass
+
+    # 5. 市场情绪面（涨停/跌停/炸板/连板 -> 三维度 score + regime + market_style）
+    try:
+        result["market_sentiment"] = _fetch_market_sentiment(ts_code)
     except Exception:
         pass
 
@@ -1782,6 +2000,181 @@ def get_unlock_schedule(ts_code: str, days_ahead: int = 180,
     }, ensure_ascii=False, default=str)
 
 
+def get_chip_distribution(ts_code: str) -> str:
+    """个股筹码分布（东财源，前复权）。
+
+    返回 latest(原始9字段) + snapshot(预计算标签) + trend(近10天) + trend_summary(方向摘要) + flags。
+    adjust='qfq' 与 get_daily_price 复权口径一致，平均成本可与 K线 close 直接比较。
+
+    依赖 akshare 东财接口 stock_cyq_em（无 token，普通 HTTP JSON，无需 _AKSHARE_LOCK）。
+    失败时返回 {"error": ...}，不抛异常。
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        return json.dumps({"error": "akshare not installed"})
+
+    symbol = ts_code.split(".")[0]
+
+    # akshare stock_cyq_em 内部用 py_mini_racer(V8) 执行 CYQ JS 算筹码，
+    # 多线程并发会 FATAL 崩进程，必须 _AKSHARE_LOCK 序列化（见模块顶部说明）。
+    # 且其 requests 读系统代理，东财 push2his 常被本地代理(如 7890)拦截，
+    # 临时 NO_PROXY 追加 eastmoney 直连，finally 恢复，与 _direct_opener 设计一致。
+    _np_orig = (os.environ.get("NO_PROXY"), os.environ.get("no_proxy"))
+    os.environ["NO_PROXY"] = ((_np_orig[0] or "") + ",.eastmoney.com").lstrip(",")
+    os.environ["no_proxy"] = ((_np_orig[1] or "") + ",.eastmoney.com").lstrip(",")
+    try:
+        with _AKSHARE_LOCK:
+            df = ak.stock_cyq_em(symbol=symbol, adjust="qfq")
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+    finally:
+        for _k, _v in zip(("NO_PROXY", "no_proxy"), _np_orig):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+    if df is None or df.empty:
+        return json.dumps({
+            "ts_code": ts_code,
+            "note": "无筹码数据（可能是次新股或数据源异常）",
+        }, ensure_ascii=False)
+
+    # 列: 日期 / 获利比例 / 平均成本 / 90成本-低 / 90成本-高 / 90集中度 / 70成本-低 / 70成本-高 / 70集中度
+    df = df.sort_values("日期").reset_index(drop=True)
+    latest = df.iloc[-1]
+
+    profit_ratio = float(latest["获利比例"])           # 0-1
+    avg_cost = float(latest["平均成本"])
+    cost_90_low = float(latest["90成本-低"])
+    cost_90_high = float(latest["90成本-高"])
+    conc_90 = float(latest["90集中度"])                # (90高-90低)/平均成本
+    cost_70_low = float(latest["70成本-低"])
+    cost_70_high = float(latest["70成本-高"])
+    conc_70 = float(latest["70集中度"])
+
+    profit_pct = round(profit_ratio * 100, 2)
+    conc_90_pct = round(conc_90 * 100, 2)
+    conc_70_pct = round(conc_70 * 100, 2)
+
+    # ── profit_zone: 7 档（含 45-55% 均衡区）──
+    if profit_pct < 10:
+        profit_zone = "深套区"
+    elif profit_pct < 30:
+        profit_zone = "偏套区"
+    elif profit_pct < 45:
+        profit_zone = "中性偏空"
+    elif profit_pct <= 55:
+        profit_zone = "均衡区"
+    elif profit_pct < 70:
+        profit_zone = "中性偏多"
+    elif profit_pct < 90:
+        profit_zone = "偏获利区"
+    else:
+        profit_zone = "高获利区"
+
+    # ── chip_concentration: 4 档（基于 90集中度）──
+    if conc_90_pct < 8:
+        chip_concentration = "高度集中"
+    elif conc_90_pct < 15:
+        chip_concentration = "较集中"
+    elif conc_90_pct < 25:
+        chip_concentration = "较分散"
+    else:
+        chip_concentration = "分散"
+
+    # ── trend: 近 10 天序列 + 方向摘要 ──
+    recent = df.tail(10)
+    trend = [
+        {
+            "date": str(r["日期"]),
+            "profit_ratio_pct": round(float(r["获利比例"]) * 100, 2),
+            "concentration_90_pct": round(float(r["90集中度"]) * 100, 2),
+            "avg_cost": round(float(r["平均成本"]), 2),
+        }
+        for _, r in recent.iterrows()
+    ]
+
+    def _direction(series, tol: float = 0.02) -> str:
+        """比较近10天首末，相对变化超过 tol 判 up/down，否则 flat。"""
+        first = float(series.iloc[0])
+        last = float(series.iloc[-1])
+        if first == 0:
+            return "flat" if last == 0 else "up"
+        diff_pct = (last - first) / first
+        if diff_pct > tol:
+            return "up"
+        elif diff_pct < -tol:
+            return "down"
+        return "flat"
+
+    trend_summary = {
+        "profit_ratio": _direction(recent["获利比例"]),
+        "concentration_90": _direction(recent["90集中度"]),
+        "avg_cost": _direction(recent["平均成本"]),
+        "note": (
+            "profit_ratio up=获利盘增加(价格上涨或筹码下移); "
+            "concentration_90 down=筹码趋于集中(疑似吸筹), up=趋于分散(疑似派发); "
+            "avg_cost up=成本上移(新资金高位接盘), down=成本下移"
+        ),
+    }
+
+    # ── flags: 仅筹码自身可判断，不依赖实时价格 ──
+    flags: list[str] = []
+    if profit_pct < 10:
+        flags.append(f"获利比例 {profit_pct}% (<10%)：上方套牢盘沉重，反弹压力大")
+    elif profit_pct > 90:
+        flags.append(f"获利比例 {profit_pct}% (>90%)：获利盘堆积，回调抛压风险")
+    if conc_90_pct < 8:
+        flags.append(f"90集中度 {conc_90_pct}% (<8%)：筹码高度集中，疑似主力控盘（配合龙虎榜交叉验证）")
+    elif conc_90_pct > 25:
+        flags.append(f"90集中度 {conc_90_pct}% (>25%)：筹码分散，无主力控盘，趋势性弱")
+    if trend_summary["concentration_90"] == "down" and conc_90_pct < 15:
+        flags.append("近10日 90集中度下行且处集中区：筹码趋于集中，疑似主力吸筹")
+    elif trend_summary["concentration_90"] == "up" and profit_pct > 70:
+        flags.append("近10日 90集中度上行且获利比例>70%：筹码趋于分散+高位，疑似主力派发")
+    if not flags:
+        flags.append(f"获利比例 {profit_pct}% / 90集中度 {conc_90_pct}%：筹码结构中性，无明显信号")
+
+    result = {
+        "ts_code": ts_code,
+        "as_of": str(latest["日期"]),
+        "latest": {
+            "date": str(latest["日期"]),
+            "profit_ratio": round(profit_ratio, 4),
+            "avg_cost": round(avg_cost, 2),
+            "cost_90_low": round(cost_90_low, 2),
+            "cost_90_high": round(cost_90_high, 2),
+            "concentration_90": round(conc_90, 4),
+            "cost_70_low": round(cost_70_low, 2),
+            "cost_70_high": round(cost_70_high, 2),
+            "concentration_70": round(conc_70, 4),
+        },
+        "snapshot": {
+            "profit_ratio_pct": profit_pct,
+            "profit_zone": profit_zone,
+            "concentration_90_pct": conc_90_pct,
+            "concentration_70_pct": conc_70_pct,
+            "chip_concentration": chip_concentration,
+            "chip_band": {
+                "lower_cost": round(cost_90_low, 2),   # 90%筹码价格下沿
+                "upper_cost": round(cost_90_high, 2),  # 90%筹码价格上沿
+            },
+        },
+        "trend": trend,
+        "trend_summary": trend_summary,
+        "flags": flags,
+        "_note": (
+            "chip_band.lower/upper_cost 是 90%筹码的价格区间，不是技术分析支撑/压力线；"
+            "与 get_daily_price(qfq) 最新 close 比较可知现价在筹码带的位置。"
+            "flags 不含实时价格判断，价格相对位置由 AI 用最新 close 自行比对。"
+        ),
+    }
+
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
 # Tool dispatch map used by analyze.py
 TOOL_FUNCTIONS = {
     "get_daily_price": get_daily_price,
@@ -1790,6 +2183,7 @@ TOOL_FUNCTIONS = {
     "web_search": web_search,
     "get_dragon_tiger_list": get_dragon_tiger_list,
     "get_unlock_schedule": get_unlock_schedule,
+    "get_chip_distribution": get_chip_distribution,
     # 妙想 MX API tools
     "mx_data_query": _mx.mx_data_query,
     "mx_news_search": _mx.mx_news_search,

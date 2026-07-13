@@ -13,6 +13,8 @@ import {
 } from "@/components/base";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 import { CompactCandidateCard } from "@/components/a-share/CompactCandidateCard";
+import { EditPositionDialog } from "@/components/a-share/EditPositionDialog";
+import { EditCandidateDialog } from "@/components/a-share/EditCandidateDialog";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { getLatestJournal } from "@/api/analyze";
 import {
@@ -115,6 +117,12 @@ export function WatchlistPage() {
 
   // 交易流水弹窗(原底部平铺 Card, 改弹窗省版面)
   const [showTrades, setShowTrades] = useState(false);
+
+  // 编辑持仓/候选交易参数(人工干预: 调止损止盈 / 重挂触发 / 改过期 等)
+  const [editPositionTarget, setEditPositionTarget] = useState<ActivePosition | null>(null);
+  const [editCandidateTarget, setEditCandidateTarget] = useState<Candidate | null>(null);
+  const openEditPositionForm = (p: ActivePosition) => setEditPositionTarget(p);
+  const openEditCandidateForm = (c: Candidate) => setEditCandidateTarget(c);
 
   const submitAdd = (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -604,6 +612,7 @@ export function WatchlistPage() {
                         onAdd={(pos) => openTradeForm(pos, "buy")}
                         onReduce={(pos) => openTradeForm(pos, "sell")}
                         onClose={openCloseForm}
+                        onEdit={openEditPositionForm}
                         onSyncAi={handleSyncAi}
                         syncing={syncingCode === p.ts_code}
                       />
@@ -636,6 +645,7 @@ export function WatchlistPage() {
                       <CompactCandidateCard
                         key={c.ts_code}
                         candidate={c}
+                        onEdit={openEditCandidateForm}
                         onArchive={handleArchive}
                         onPromote={openPromoteForm}
                         onReanalyze={handleReanalyze}
@@ -957,6 +967,20 @@ export function WatchlistPage() {
           </form>
         )}
       </Dialog>
+
+      {/* 编辑持仓交易参数(人工干预) */}
+      <EditPositionDialog
+        open={editPositionTarget !== null}
+        onClose={() => setEditPositionTarget(null)}
+        position={editPositionTarget}
+      />
+
+      {/* 编辑候选交易参数(人工干预) */}
+      <EditCandidateDialog
+        open={editCandidateTarget !== null}
+        onClose={() => setEditCandidateTarget(null)}
+        candidate={editCandidateTarget}
+      />
     </div>
   );
 }

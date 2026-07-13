@@ -299,6 +299,62 @@ def update_advice(ts_code: str,
     raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
 
 
+def update_position(ts_code: str,
+                    name: Optional[str] = None,
+                    stop_loss: Optional[float] = None,
+                    target: Optional[float] = None,
+                    trigger_price: Optional[float] = None,
+                    trigger_direction: Optional[str] = None,
+                    trigger_low: Optional[float] = None,
+                    trigger_high: Optional[float] = None,
+                    expires_at: Optional[str] = None,
+                    calibrated_confidence: Optional[float] = None,
+                    strategy: Optional[str] = None,
+                    setup: Optional[str] = None) -> dict:
+    """更新已存在持仓的交易参数(部分覆盖, None/未传不动)。
+
+    人工干预修改: 调止损止盈 / 重挂触发价或区间 / 改过期 / strategy / setup / 名称。
+    不含 entry_price/avg_cost/shares/entry_date -- 录错走 buy/sell 补录, 保 trades.jsonl 口径。
+
+    Raises:
+      PositionNotFoundError: ts_code 不在 active_positions。
+      ValueError: trigger_direction 非 below/above。
+    """
+    if trigger_direction is not None and trigger_direction not in ("below", "above"):
+        raise ValueError(f"trigger_direction 必须 below/above, got {trigger_direction}")
+    data = _load()
+    for pos in data["active_positions"]:
+        if pos.get("ts_code") == ts_code:
+            before = dict(pos)
+            if name is not None:
+                pos["name"] = str(name)
+            if stop_loss is not None:
+                pos["stop_loss"] = float(stop_loss)
+            if target is not None:
+                pos["target"] = float(target)
+            if trigger_price is not None:
+                pos["trigger_price"] = float(trigger_price)
+            if trigger_direction is not None:
+                pos["trigger_direction"] = trigger_direction
+            if trigger_low is not None:
+                pos["trigger_low"] = float(trigger_low)
+            if trigger_high is not None:
+                pos["trigger_high"] = float(trigger_high)
+            if expires_at is not None:
+                pos["expires_at"] = str(expires_at)
+            if calibrated_confidence is not None:
+                pos["calibrated_confidence"] = float(calibrated_confidence)
+            if strategy is not None:
+                pos["strategy"] = str(strategy)
+            if setup is not None:
+                pos["setup"] = str(setup)
+            _save(data)
+            _notify("position_edited", ts_code=ts_code,
+                    name=pos.get("name", ""), before=before, after=pos)
+            return pos
+    raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
+
+
 def replace_position(ts_code: str, name: str, entry_price: float,
                      stop_loss: float, target: float,
                      trigger_price: Optional[float] = None,
@@ -1344,6 +1400,58 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
     data["candidates"].append(entry)
     _save(data)
     return {"expires_days": resolved, **meta}
+
+
+def update_candidate(ts_code: str,
+                     name: Optional[str] = None,
+                     trigger_price: Optional[float] = None,
+                     trigger_direction: Optional[str] = None,
+                     trigger_low: Optional[float] = None,
+                     trigger_high: Optional[float] = None,
+                     stop_advice: Optional[float] = None,
+                     target_advice: Optional[float] = None,
+                     note: Optional[str] = None,
+                     expires_at: Optional[str] = None,
+                     strategy: Optional[str] = None,
+                     setup: Optional[str] = None) -> dict:
+    """更新已存在候选的交易参数(部分覆盖, None/未传不动)。不调 AI, 不推送。
+
+    人工干预修改: 调触发价/区间/方向 / 止损建议 / 目标建议 / 备注 / 过期 / strategy / setup / 名称。
+    改 trigger_price 不自动重算 expires_at(手动编辑=精确控制; 续期用 renew, 跟AI用 sync-ai)。
+
+    Raises:
+      ValueError: 候选不存在 / trigger_direction 非 below/above。
+    """
+    if trigger_direction is not None and trigger_direction not in ("below", "above"):
+        raise ValueError(f"trigger_direction 必须 below/above, got {trigger_direction}")
+    data = _load()
+    for item in data["candidates"]:
+        if item.get("ts_code") == ts_code:
+            if name is not None:
+                item["name"] = str(name)
+            if trigger_price is not None:
+                item["trigger_price"] = float(trigger_price)
+            if trigger_direction is not None:
+                item["trigger_direction"] = trigger_direction
+            if trigger_low is not None:
+                item["trigger_low"] = float(trigger_low)
+            if trigger_high is not None:
+                item["trigger_high"] = float(trigger_high)
+            if stop_advice is not None:
+                item["stop_advice"] = float(stop_advice)
+            if target_advice is not None:
+                item["target_advice"] = float(target_advice)
+            if note is not None:
+                item["note"] = str(note)
+            if expires_at is not None:
+                item["expires_at"] = str(expires_at)
+            if strategy is not None:
+                item["strategy"] = str(strategy)
+            if setup is not None:
+                item["setup"] = str(setup)
+            _save(data)
+            return item
+    raise ValueError(f"候选 {ts_code} 不存在")
 
 
 def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:

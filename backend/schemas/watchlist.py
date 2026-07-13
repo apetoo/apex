@@ -109,3 +109,38 @@ class UpdateAdviceRequest(BaseModel):
     stop_loss: Optional[float] = None
     target: Optional[float] = None
     calibrated_confidence: Optional[float] = None
+
+
+class UpdatePositionRequest(BaseModel):
+    """更新持仓交易参数(PATCH 部分覆盖, 未传/None 不动)。
+
+    人工干预: 调止损止盈 / 重挂触发价或区间 / 改过期 / strategy / setup / 名称。
+    不含 entry_price/avg_cost/shares/entry_date(录错走 buy/sell 补录, 保 trades.jsonl 口径)。
+    路径 ts_code 已 normalize; body 不带 ts_code。exclude_unset 透传: 显式 null 才进入覆盖。
+    """
+    name: Optional[str] = None
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    trigger_price: Optional[float] = None
+    trigger_direction: Optional[str] = Field(None, pattern="^(below|above)$")
+    trigger_low: Optional[float] = None
+    trigger_high: Optional[float] = None
+    expires_at: Optional[str] = None
+    calibrated_confidence: Optional[float] = None
+    strategy: Optional[str] = None
+    setup: Optional[str] = None
+
+
+class UpdateCandidateRequest(BaseModel):
+    """更新候选交易参数(PATCH 部分覆盖, 未传/None 不动)。body 不带 ts_code。"""
+    name: Optional[str] = None
+    trigger_price: Optional[float] = None
+    trigger_direction: Optional[str] = Field(None, pattern="^(below|above)$")
+    trigger_low: Optional[float] = None
+    trigger_high: Optional[float] = None
+    stop_advice: Optional[float] = None
+    target_advice: Optional[float] = None
+    note: Optional[str] = None
+    expires_at: Optional[str] = None
+    strategy: Optional[str] = None
+    setup: Optional[str] = None

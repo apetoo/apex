@@ -11,6 +11,8 @@ import {
   buy,
   sell,
   updateAdvice,
+  updateCandidate,
+  updatePosition,
   type AddCandidatePayload,
   type AddPositionPayload,
   type PromotePayload,
@@ -21,6 +23,10 @@ import {
   type BuyResponse,
   type SellResponse,
   type UpdateAdvicePayload,
+  type UpdateCandidatePayload,
+  type UpdatePositionPayload,
+  type ActivePosition,
+  type Candidate,
   type ExpiresMeta,
 } from "./watchlist";
 import { qk } from "./query-keys";
@@ -78,6 +84,10 @@ const INVALIDATE: Record<string, string[][]> = {
   syncCandidateAi: [[...qk.watchlist], [...qk.triggers]],
   // 更新止损/目标(advice) → 只影响 watchlist(持仓卡显示)
   updateAdvice: [[...qk.watchlist]],
+  // 编辑持仓交易参数(止损/止盈/触发/过期/strategy 等) -> watchlist(卡片) + triggers(trigger 变)
+  updatePosition: [[...qk.watchlist], [...qk.triggers]],
+  // 编辑候选交易参数 -> watchlist + triggers
+  updateCandidate: [[...qk.watchlist], [...qk.triggers]],
 };
 
 function invalidateAll(
@@ -229,5 +239,35 @@ export function useUpdateAdvice(): UseMutationResult<
   return useMutation({
     mutationFn: (vars) => updateAdvice(vars.ts_code, vars),
     onSuccess: () => invalidateAll(qc, "updateAdvice"),
+  });
+}
+
+/**
+ * 编辑持仓交易参数(PATCH 部分覆盖, 未传字段不动)。
+ * 变量 {ts_code, ...payload} 适配 react-query 单参 mutationFn。
+ * 不含成本/股数/入场日(走 buy/sell 补录)。
+ */
+export function useUpdatePosition(): UseMutationResult<
+  { message: string; position: ActivePosition },
+  Error,
+  { ts_code: string } & UpdatePositionPayload
+> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars) => updatePosition(vars.ts_code, vars),
+    onSuccess: () => invalidateAll(qc, "updatePosition"),
+  });
+}
+
+/** 编辑候选交易参数(PATCH 部分覆盖, 未传字段不动)。变量 {ts_code, ...payload} 适配单参 mutationFn。 */
+export function useUpdateCandidate(): UseMutationResult<
+  { message: string; candidate: Candidate },
+  Error,
+  { ts_code: string } & UpdateCandidatePayload
+> {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars) => updateCandidate(vars.ts_code, vars),
+    onSuccess: () => invalidateAll(qc, "updateCandidate"),
   });
 }

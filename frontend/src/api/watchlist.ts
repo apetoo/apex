@@ -539,6 +539,52 @@ export async function updateAdvice(
   );
 }
 
+/** PATCH /api/watchlist/positions/{ts_code} - 交易参数部分覆盖(未传/空字段不动) */
+export interface UpdatePositionPayload {
+  name?: string;
+  stop_loss?: number;
+  target?: number;
+  trigger_price?: number;
+  trigger_direction?: "below" | "above";
+  trigger_low?: number;
+  trigger_high?: number;
+  expires_at?: string; // YYYY-MM-DD
+  calibrated_confidence?: number;
+  strategy?: string;
+  setup?: string;
+}
+
+/** PATCH /api/watchlist/candidates/{ts_code} - 交易参数部分覆盖(未传/空字段不动) */
+export interface UpdateCandidatePayload {
+  name?: string;
+  trigger_price?: number;
+  trigger_direction?: "below" | "above";
+  trigger_low?: number;
+  trigger_high?: number;
+  stop_advice?: number;
+  target_advice?: number;
+  note?: string;
+  expires_at?: string; // YYYY-MM-DD
+  strategy?: string;
+  setup?: string;
+}
+
+/** PATCH /api/watchlist/positions/{ts_code} - 编辑持仓交易参数(部分覆盖) */
+export async function updatePosition(
+  ts_code: string,
+  payload: UpdatePositionPayload,
+): Promise<{ message: string; position: ActivePosition }> {
+  return api.patch(`/watchlist/positions/${encodeURIComponent(ts_code)}`, payload);
+}
+
+/** PATCH /api/watchlist/candidates/{ts_code} - 编辑候选交易参数(部分覆盖) */
+export async function updateCandidate(
+  ts_code: string,
+  payload: UpdateCandidatePayload,
+): Promise<{ message: string; candidate: Candidate }> {
+  return api.patch(`/watchlist/candidates/${encodeURIComponent(ts_code)}`, payload);
+}
+
 /** GET /api/watchlist/trades — 交易流水(倒序) */
 export async function getTrades(params?: {
   ts_code?: string;

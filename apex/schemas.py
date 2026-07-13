@@ -4,6 +4,15 @@ VERDICT_ENUM = ["看多", "偏多", "观望偏多", "中性", "观望偏空", "�
 BULLISH_VERDICTS = {"看多", "偏多", "观望偏多"}
 BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}
 
+# 步骤 0 AI 声明的标的类型（与 analyze.py 类型表对齐）。成长股触发静态 PE 偏空硬门控。
+STOCK_TYPE_ENUM = ["蓝筹白马", "题材游资", "周期股", "成长股", "均衡型"]
+
+# 偏空类空头结论中「估值」是不是主要依据的分类（防成长股静态 PE 误杀）：
+#   forward_valuation = 基于 Forward PE / PEG / 一致预期等前瞻估值（成长股偏空唯一允许的估值依据）
+#   static_pe_only    = 仅静态 PE_TTM（成长股偏空会被系统拒绝）
+#   non_valuation     = 估值非主要依据
+VALUATION_BASIS_ENUM = ["forward_valuation", "static_pe_only", "non_valuation"]
+
 REQUIRED_FEATURE_KEYS = ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"]
 
 SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept", "limit_up_history", "moneyflow"]
@@ -118,3 +127,5 @@ class JournalEntry(TypedDict, total=False):
     analysis_text: str
     repeat_analysis: RepeatAnalysisSchema
     setup_tag: Optional[str]   # ADR-0001: AI 预填的交易原型（SETUP_SEED 之一或自定义），供 candidate/promote 继承
+    stock_type: Optional[str]  # 步骤 0 声明的标的类型（STOCK_TYPE_ENUM 之一），驱动成长股静态 PE 偏空门控
+    valuation_basis: Optional[str]  # 偏空类空头估值依据分类（VALUATION_BASIS_ENUM 之一），审计用

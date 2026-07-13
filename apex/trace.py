@@ -256,6 +256,30 @@ def summarize_mx_stock_screen(raw) -> dict:
     return {"source": "mx:screener", "query": data.get("query"), "count": data.get("count"), "sample": rows[:3]}
 
 
+def summarize_get_chip_distribution(raw) -> dict:
+    data = _safe_parse(raw)
+    if not isinstance(data, dict):
+        return {"note": "返回不可解析"}
+    if data.get("error"):
+        return {"error": data["error"]}
+    snap = data.get("snapshot") or {}
+    ts = data.get("trend_summary") or {}
+    return {
+        "as_of": data.get("as_of"),
+        "profit_ratio_pct": snap.get("profit_ratio_pct"),
+        "profit_zone": snap.get("profit_zone"),
+        "chip_concentration": snap.get("chip_concentration"),
+        "concentration_90_pct": snap.get("concentration_90_pct"),
+        "chip_band": snap.get("chip_band"),
+        "trend": {
+            "profit_ratio": ts.get("profit_ratio"),
+            "concentration_90": ts.get("concentration_90"),
+            "avg_cost": ts.get("avg_cost"),
+        },
+        "flags": data.get("flags", []),
+    }
+
+
 _SUMMARIZERS = {
     "get_daily_price": summarize_get_daily_price,
     "get_fundamentals": summarize_get_fundamentals,
@@ -263,6 +287,7 @@ _SUMMARIZERS = {
     "web_search": summarize_web_search,
     "get_dragon_tiger_list": summarize_get_dragon_tiger_list,
     "get_unlock_schedule": summarize_get_unlock_schedule,
+    "get_chip_distribution": summarize_get_chip_distribution,
     "mx_data_query": summarize_mx_data_query,
     "mx_news_search": summarize_mx_news_search,
     "mx_stock_screen": summarize_mx_stock_screen,

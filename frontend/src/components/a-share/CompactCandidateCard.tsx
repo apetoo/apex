@@ -1,4 +1,4 @@
-import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle, Clock, RefreshCw, Sparkles, ChevronDown } from "lucide-react";
+import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle, Clock, RefreshCw, Sparkles, ChevronDown, Pencil } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PriceTag } from "@/components/a-share";
@@ -32,14 +32,16 @@ function metaTooltip(meta?: Candidate["expires_meta"]): string | null {
 }
 
 /**
- * <CompactCandidateCard> — 竖向紧凑候选卡(网格用)
+ * <CompactCandidateCard> - 竖向紧凑候选卡(网格用)
  *
  * 替代旧行式 CandidateCard。无加仓/减仓按钮(候选未持仓)。
  * 距触发距离配色: 未触发灰 / 接近触发(|pct|<2)黄 / 已触发红字+浅红底。
- * 红涨绿跌铁律: 触发=利好 → 用 up(红) 表达已触发。
+ * 红涨绿跌铁律: 触发=利好 -> 用 up(红) 表达已触发。
+ * 编辑按钮放右上角(icon-only Pencil), 不挤占操作行。
  */
 export function CompactCandidateCard({
   candidate,
+  onEdit,
   onArchive,
   onPromote,
   onReanalyze,
@@ -47,6 +49,8 @@ export function CompactCandidateCard({
   syncing,
 }: {
   candidate: Candidate;
+  /** 人工编辑交易参数(触发价/止损建议/目标建议/过期/strategy 等)。PATCH 部分覆盖。右上角入口。 */
+  onEdit?: (c: Candidate) => void;
   onArchive?: (c: Candidate) => void;
   onPromote?: (c: Candidate) => void;
   /** 跳分析页重跑 AI(写新 journal)。过期三选一之一。 */
@@ -107,7 +111,7 @@ export function CompactCandidateCard({
         ? currentPrice <= trigger_price
         : currentPrice >= trigger_price);
 
-  // 距触发: 带状→到带边的最近距离; 单向→到 trigger_price 的距离
+  // 距触发: 带状->到带边的最近距离; 单向->到 trigger_price 的距离
   const anchor =
     currentPrice != null
       ? hasZone
@@ -133,13 +137,23 @@ export function CompactCandidateCard({
         isTriggered && "bg-up/5",
       )}
     >
-      {/* 名称 + 已触发 tag */}
+      {/* 名称 + 已触发 tag + 编辑(右上角 icon-only) */}
       <div className="flex items-center gap-2">
         <p className="truncate font-medium">{name}</p>
         {isTriggered && (
           <span className="inline-flex items-center gap-0.5 rounded bg-up/10 px-1.5 py-0.5 text-[10px] font-medium text-up">
             <Bell className="h-2.5 w-2.5" /> 已触发
           </span>
+        )}
+        {onEdit && (
+          <button
+            type="button"
+            onClick={() => onEdit(candidate)}
+            className="ml-auto inline-flex items-center justify-center rounded p-1 text-text-secondary hover:bg-bg-base"
+            title="编辑触发价/止损建议/目标建议/过期等"
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
         )}
       </div>
       <p className="mt-0.5 text-xs text-text-secondary">{ts_code}</p>

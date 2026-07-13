@@ -26,6 +26,8 @@ from backend.schemas.watchlist import (
     ReplacePositionRequest,
     SellRequest,
     UpdateAdviceRequest,
+    UpdateCandidateRequest,
+    UpdatePositionRequest,
 )
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
@@ -108,6 +110,19 @@ def update_advice(ts_code: str, req: UpdateAdviceRequest):
         calibrated_confidence=req.calibrated_confidence,
     )
     return {"message": "Advice updated", "position": pos}
+
+
+@router.patch("/positions/{ts_code}")
+def update_position(ts_code: str, req: UpdatePositionRequest):
+    """更新持仓交易参数(PATCH 部分覆盖, 未传字段不动)。
+
+    人工干预: 调止损止盈 / 重挂触发价或区间 / 改过期 / strategy / setup / 名称。
+    不含成本/股数/入场日(走 buy/sell 补录)。exclude_unset 透传: 显式 null 才进入覆盖,
+    service 层 `if v is not None` 再挡一层 -> null 等同未传(v1 不支持清空字段)。
+    """
+    code = data_mod.normalize_ts_code(ts_code)
+    pos = wl.update_position(ts_code=code, **req.model_dump(exclude_unset=True))
+    return {"message": "Position updated", "position": pos}
 
 
 @router.post("/candidates")
@@ -208,6 +223,14 @@ def sync_candidate_ai(ts_code: str):
     if result is None:
         raise ValueError(f"候选 {code} 不存在, 或 journal 无有效 price_advice.entry")
     return {"message": "Candidate synced from latest AI", "ts_code": code, **result}
+
+
+@router.patch("/candidates/{ts_code}")
+def update_candidate(ts_code: str, req: UpdateCandidateRequest):
+    """更新候选交易参数(PATCH 部分覆盖, 未传字段不动)。不调 AI, 不推送。"""
+    code = data_mod.normalize_ts_code(ts_code)
+    item = wl.update_candidate(ts_code=code, **req.model_dump(exclude_unset=True))
+    return {"message": "Candidate updated", "candidate": item}
 
 
 @router.post("/buy")

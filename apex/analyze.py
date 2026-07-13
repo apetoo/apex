@@ -13,7 +13,10 @@ _TZ_CN = timezone(timedelta(hours=8))
 
 from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod
 from apex.journal_views import history_digest
-from apex.schemas import VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS
+from apex.schemas import (
+    VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
+    STOCK_TYPE_ENUM, VALUATION_BASIS_ENUM,
+)
 
 
 class AnalysisError(Exception):
@@ -200,6 +203,40 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_chip_distribution",
+            "description": (
+                "查个股筹码分布（东财源，前复权）。返回获利比例/平均成本/90%与70%筹码价格区间及集中度，"
+                "附 Python 预计算的 profit_zone(7档含45-55%均衡区)、chip_concentration(4档)、"
+                "近10日趋势方向摘要(up/down/flat)、flags 风险/机会标记。\n"
+                "\n"
+                "**何时调用**：\n"
+                "  · 题材/游资股、成长股必查 -- 判断主力控盘程度、上方套牢盘压力、下方筹码支撑\n"
+                "  · 蓝筹/白马可选 -- 筹码结构意义弱于基本面\n"
+                "  · 配合 get_dragon_tiger_list 交叉验证「高度集中 + 龙虎榜常客 = 主力控盘」\n"
+                "\n"
+                "**关键指标解读**：\n"
+                "  · 获利比例 <10% = 上方套牢盘沉重(反弹压力); >90% = 获利盘堆积(回调抛压)\n"
+                "  · 90集中度 <8% = 高度集中(疑似主力控盘); >25% = 分散(无主力,趋势性弱)\n"
+                "  · snapshot.chip_band.lower/upper_cost = 90%筹码价格区间(非技术分析支撑/压力线)，"
+                "与 get_daily_price 最新 close 比较可知现价在筹码带的位置\n"
+                "  · trend_summary.concentration_90 down=趋于集中(吸筹), up=趋于分散(派发)\n"
+                "\n"
+                "**flags 是 Python 预计算标记，必须逐条引用，不要自己重算获利比例/集中度阈值**"
+                "（与 get_fundamentals.summary.flags 同款）。flags 不含实时价格判断，"
+                "现价相对筹码带的位置由 AI 用 get_daily_price 最新 close 自行比对。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
+                },
+                "required": ["ts_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "mx_data_query",
             "description": (
                 "妙想金融数据查询（东方财富官方数据源）。支持自然语言查询行情、财务、"
@@ -361,8 +398,26 @@ TOOLS = [
                             "都不贴切则填「其他:<自定义>」。基于本次分析最核心的驱动逻辑判断，非看多方向也填（描述若入场的话是什么 setup）。"
                         ),
                     },
+                    "stock_type": {
+                        "type": "string",
+                        "enum": STOCK_TYPE_ENUM,
+                        "description": (
+                            "步骤 0 声明的标的类型（蓝筹白马/题材游资/周期股/成长股/均衡型）。必填。"
+                            "成长股 + 偏空 + valuation_basis=static_pe_only（或缺填）会被系统拒绝，逼你补前瞻估值后重调。"
+                        ),
+                    },
+                    "valuation_basis": {
+                        "type": "string",
+                        "enum": VALUATION_BASIS_ENUM,
+                        "description": (
+                            "仅偏空类（看空/偏空/观望偏空）必填，其他方向不填。本次空头结论中「估值」是不是主要依据："
+                            "forward_valuation=基于 Forward PE/PEG/一致预期等前瞻估值（成长股偏空唯一允许的估值依据）；"
+                            "static_pe_only=仅静态 PE_TTM（成长股偏空会被拒）；"
+                            "non_valuation=估值非主要依据。"
+                        ),
+                    },
                 },
-                "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence"],
+                "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
             },
         },
     },
@@ -1197,6 +1252,44 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
             lines.append(f"- {' / '.join(parts)}")
 
     # 综合 regime 标签 —— 把判断写死在 Python 里，AI 直接读结论
+    # 市场情绪面（涨停/跌停/炸板/连板 -> 三维度 score + regime + market_style）
+    ms = ctx.get("market_sentiment")
+    if ms:
+        lines.append(f"\n### 市场情绪面（截至 {ms.get('as_of', '?')}）")
+        lines.append(
+            f"- 涨停 {ms.get('limit_up_count', '?')} 家 / 跌停 {ms.get('limit_down_count', '?')} 家"
+            f" / 炸板 {ms.get('broken_limit_count', '?')} 家（炸板率 {ms.get('broken_rate_pct', '?')}%）"
+        )
+        up_down = ms.get("up_down_ratio")
+        lines.append(
+            f"- 最高连板 {ms.get('max_consecutive', '?')} 板 / 强势股池 {ms.get('strong_pool_count', '?')} 家"
+            + (f" / 涨停跌停比 {up_down}" if up_down is not None else "")
+        )
+        sip = ms.get("stock_in_pool") or {}
+        if sip.get("limit_up") or sip.get("strong_pool"):
+            tags = []
+            if sip.get("limit_up"):
+                tags.append(f"今日涨停({sip.get('consecutive')}板)" if sip.get("consecutive") else "今日涨停")
+            if sip.get("strong_pool"):
+                tags.append("在强势股池")
+            lines.append(f"- 标的自身：{'+'.join(tags)}（个股情绪强信号）")
+        else:
+            lines.append("- 标的自身：未在涨停池/强势股池")
+        b = ms.get("breadth") or {}
+        m = ms.get("momentum") or {}
+        r = ms.get("risk_appetite") or {}
+        lines.append(
+            f"- 三维度：广度 {b.get('level', '?')}({b.get('score', '?')})"
+            f" / 接力 {m.get('level', '?')}({m.get('score', '?')})"
+            f" / 风险偏好 {r.get('level', '?')}({r.get('score', '?')})"
+            f" -> 总分 {ms.get('total_score', '?')}"
+        )
+        lines.append(
+            f"- **情绪 regime：{ms.get('regime', '?')}** / **市场风格：{ms.get('market_style', '?')}**"
+        )
+        if ms.get("reasons"):
+            lines.append(f"- 依据：{'；'.join(ms['reasons'])}")
+
     lines.append("\n### 综合 regime 判断（Python 预计算，直接引用）")
     regime: list[str] = []
 
@@ -1316,11 +1409,13 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   根据 industry + 龙虎榜频次 + 上市时间做最佳推断，并在声明中注明「数据缺失，推断分类」。\n"
                 "   **必须引用 summary.flags 中的 Python 预计算风险标记**，不要自己重新判断 ROE 趋势或负债率阈值。\n"
                 "   分类完成后，后续所有步骤的分析深度和证据选择必须按上表权重分配精力。\n"
+                "   **成长股特别提示**：成长股估值看「未来增长能否消化当前估值」，禁止仅凭静态 PE_TTM 偏高就偏空（详见步骤 3 成长股估值约束）。\n"
                 "\n"
                 "1) 数据：调用 get_daily_price（在步骤 0 之外补充 K 线数据）\n"
                 "\n"
                 "   **结构化补充工具（推荐使用，但非强制）**：\n"
                 "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
+                "   · get_chip_distribution - 筹码分布（获利比例/集中度/筹码区间+预计算flags）；题材/游资、成长股必查，判断主力控盘/套牢盘压力/筹码支撑；与龙虎榜交叉验证\n"
                 "   · mx_data_query — 妙想金融数据查询（东方财富）。**蓝筹/白马和成长股必须至少调用 1 次**，\n"
                 "     查营收/净利润/ROE/毛利率/经营现金流等深度财务数据，否则基本面权重是空壳。\n"
                 "     题材/游资股可选，但建议查一下排除业绩暴雷风险。\n"
@@ -1345,6 +1440,16 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   独立反方证据；至少 1 条直接反驳多头第 N 条；必须考虑估值/解禁减持/行业景气/技术背离/历史回撤。\n"
                 "   **股票类型约束**：蓝筹/白马的空头论点必须包含估值分析（PE 历史分位 / 与行业均值对比）；\n"
                 "   周期股的空头论点必须考虑周期位置（产品价格趋势 / 产能周期 / 库存水平）。\n"
+                "   **成长股估值约束（禁止静态 PE 偏空）**：成长股估值的核心是「未来增长能否消化当前估值」，\n"
+                "   静态 PE_TTM 不得单独作为偏空结论的主要依据。估值分析必须优先采用：Future EPS / Forward PE / PEG / 利润增速 / 行业增速\n"
+                "   （前瞻数据用 mx_data_query 查一致预期/业绩预告；get_fundamentals 已给 trailing PEG = pe_ttm/净利润同比增速 供参考）。\n"
+                "   判定树：\n"
+                "     成长股 -> 利润未来三年是否高速增长？\n"
+                "       是 -> Forward PE 是否快速下降？ 是 -> PE 高不是问题（高 PE 合理）\n"
+                "       否 -> PEG 是否 > 2？ 是 -> 估值开始危险\n"
+                "   即：不是「PE=190 -> 危险」，而是「PE=190 -> 利润未来还能翻倍吗？-> 能 -> PE 不是核心问题」。\n"
+                "   **只有当三者同时成立--利润增长明显放缓、且 Forward PE 仍极高、且 PEG 明显失衡--才能把估值作为主要空头证据；\n"
+                "   否则高 PE 只能作为风险提示写入 evidence，不得据此偏空。**\n"
                 "   ### 三、裁判结论\n"
                 "   多空各自最硬的 1 条；互斥矛盾点 → 倾向哪边？为什么？\n"
                 "   **必须包含加权四维评分**（按步骤 0 声明的权重）：\n"
@@ -1369,6 +1474,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | 多头判断 + 个股跑输板块（5日 差 < −1.5%） | **−1** |\n"
                 "   | 多头判断 + 板块强于大盘（5日 差 ≥ +1.5%） | **+1** |\n"
                 "   | 多头判断 + 业绩超预期（最近季度净利润 yoy ≥ +30%）且 PE_TTM ≤ 30 | **+1** |\n"
+"   | 成长股 + 偏空 + 估值作为主要依据但未引用 Forward PE / PEG / 一致预期数字 | **−2**（静态 PE 偏空误杀高成长标的） |\n"
                 "   | 空头判断 + ST/退市风险 或 监管立案/处罚 | **+1** |\n"
                 "   | 空头判断 + regime 弱势（任一 regime 利空命中） | 顺势，不扣不加 |\n"
                 "   | **24h 内重复分析** | 系统自动限幅：方向 ±1 档 / conf ±2（防 LLM 随机漂移）。AI 如实给判断、不要自行压分；在 record_verdict 的 new_info 列出本次新增信息，系统据此判断是否豁免限幅 |\n"
@@ -1376,13 +1482,18 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
                 "\n"
                 "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。setup_tag 从种子词表（打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转）选最贴切本次驱动逻辑的一个，都不贴切填「其他:<自定义>」。\n"
+                "   **stock_type 必填**：填步骤 0 声明的标的类型（蓝筹白马/题材游资/周期股/成长股/均衡型）。\n"
+                "   **valuation_basis**（仅偏空类必填）：本次空头结论中「估值」是不是主要依据--\n"
+                "   forward_valuation=基于 Forward PE/PEG/一致预期等前瞻估值（成长股偏空唯一允许的估值依据）/ static_pe_only=仅静态 PE_TTM / non_valuation=估值非主要依据。\n"
+                "   **成长股 + 偏空 + valuation_basis=static_pe_only（或缺填）会被系统拒绝**，逼你补前瞻估值后重调。\n"
                 "\n"
                 "6) **自我检查（在调用 record_verdict 前完成，写在 message content 末尾）**：\n"
                 "   - [ ] 我的四维权重与声明的股票类型是否一致？\n"
                 "   - [ ] 蓝筹/成长股：基本面证据是否 ≥ 2 条且来自 mx_data_query 或博查 earnings？\n"
                 "   - [ ] 题材/游资股：我是否错误地把\"基本面\"当成了主要判断依据？\n"
                 "   - [ ] 周期股：我是否在 PE 很低时说\"估值便宜\"（这是周期股陷阱）？\n"
-                "   - [ ] 我的 K 线分析深度是否与股票类型匹配（蓝筹股不需要逐根 K 线数浪）？\n"
+                "   - [ ] 成长股：我是否仅凭静态 PE_TTM 偏高就偏空？是否用 mx_data_query 查了一致预期/Forward PE/PEG？只有「增长放缓 + Forward PE 极高 + PEG 失衡」三者同时成立，估值才能作为主要空头依据，否则高 PE 只能是风险提示。\n"
+"   - [ ] 我的 K 线分析深度是否与股票类型匹配（蓝筹股不需要逐根 K 线数浪）？\n"
                 "   - [ ] setup_tag 是否反映了本次最核心的驱动逻辑（而非随便选一个）？\n"
                 "   如果任一条不通过，回到对应步骤修正后再调 record_verdict。"
             ),
@@ -1462,7 +1573,16 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         )
                     ]
 
-                if missing or bad_prices:
+                # 校验 3: 成长股偏空不得仅凭静态 PE（防误杀高成长标的）
+                # 成长股 + 偏空 + valuation_basis 为 static_pe_only 或缺填 -> 拒绝，逼 AI 补前瞻估值后重调
+                static_pe_bearish = False
+                if (not missing and not bad_prices
+                        and tool_input.get("stock_type") == "成长股"
+                        and tool_input.get("verdict") in BEARISH_VERDICTS
+                        and tool_input.get("valuation_basis") in (None, "static_pe_only")):
+                    static_pe_bearish = True
+
+                if missing or bad_prices or static_pe_bearish:
                     # 拒绝记录结论, 把错误喂回 AI 逼其修正后重调 record_verdict
                     reasons = []
                     if missing:
@@ -1475,10 +1595,21 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                             f"方向为「{tool_input.get('verdict')}」属看多类, "
                             f"价位 {bad_prices} 必须填大于 0 的具体数字, 不能填 0"
                         )
+                    if static_pe_bearish:
+                        reasons.append(
+                            f"标的类型为「成长股」且方向偏空，但 valuation_basis="
+                            f"{tool_input.get('valuation_basis')!r}（仅静态 PE_TTM 或未填）。"
+                            "成长股估值的核心是「未来增长能否消化当前估值」，静态 PE 不得单独作为偏空主要依据。"
+                            "请用 mx_data_query 查一致预期/业绩预告，算 Forward PE / PEG 后重判："
+                            "若「利润增长明显放缓 + Forward PE 仍极高 + PEG 明显失衡」三者同时成立，"
+                            "改填 valuation_basis=forward_valuation 并在 evidence 引用前瞻数字；"
+                            "若估值非主要空头依据，改填 valuation_basis=non_valuation。"
+                        )
                     result = json.dumps({
                         "error": "；".join(reasons) + "。请修正后重新调用 record_verdict。",
                         "missing_categories": missing,
                         "bad_prices": bad_prices,
+                        "static_pe_bearish": static_pe_bearish,
                         "performed": searches_performed,
                     }, ensure_ascii=False)
                     _emit({
@@ -1487,6 +1618,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         "tool_call_id": tool_call.id,
                         "missing": missing,
                         "bad_prices": bad_prices,
+                        "static_pe_bearish": static_pe_bearish,
                         "performed": list(searches_performed),
                     })
                 else:
@@ -1646,9 +1778,11 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "market_context": market_ctx,
         "analysis_text": analysis_text.strip(),
         "repeat_analysis": repeat_info,
-        "prompt_version": "2.5.0",
+        "prompt_version": "2.6.0",
         "source": "standalone",
         "setup_tag": verdict_data.get("setup_tag"),
+        "stock_type": verdict_data.get("stock_type"),
+        "valuation_basis": verdict_data.get("valuation_basis"),
     }
 
     if save:

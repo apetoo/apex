@@ -1,4 +1,4 @@
-import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert, X, Sparkles } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert, X, Sparkles, Pencil } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { PriceTag } from "@/components/a-share";
 import { getPrices, getDailyPrices } from "@/api/market";
@@ -7,17 +7,19 @@ import { cn, formatPrice } from "@/lib/utils";
 import type { ActivePosition } from "@/api/watchlist";
 
 /**
- * <CompactPositionCard> — 竖向紧凑持仓卡(网格用)
+ * <CompactPositionCard> - 竖向紧凑持仓卡(网格用)
  *
  * 替代旧行式 PositionCard。一行 2-3 张排列。
- * 信息层次: 当前价(黑色加粗, PriceTag) → 涨跌(红/绿) → 持仓盈亏(红/绿)
- *          → 参数行(股数@成本 / 止损/目标 灰小字) → [加仓][减仓](可选)
+ * 信息层次: 当前价(黑色加粗, PriceTag) -> 涨跌(红/绿) -> 持仓盈亏(红/绿)
+ *          -> 参数行(股数@成本 / 止损/目标 灰小字) -> [加仓][减仓](可选)
  *
- * onAdd/onReduce 任一存在才渲染按钮行;都不传 = 只读(概览页用)。
+ * 编辑按钮放右上角(icon-only Pencil), 不挤占操作行。
+ * onEdit/onAdd/onReduce 任一存在才渲染操作行;都不传 = 只读(概览页用)。
  * 红涨绿跌铁律: 盈亏 = (当前价 - avg_cost) * 股数。
  */
 export function CompactPositionCard({
   position,
+  onEdit,
   onAdd,
   onReduce,
   onClose,
@@ -25,6 +27,8 @@ export function CompactPositionCard({
   syncing,
 }: {
   position: ActivePosition;
+  /** 人工编辑交易参数(止损/止盈/触发/过期/strategy 等)。PATCH 部分覆盖。右上角入口。 */
+  onEdit?: (p: ActivePosition) => void;
   onAdd?: (p: ActivePosition) => void;
   onReduce?: (p: ActivePosition) => void;
   onClose?: (p: ActivePosition) => void;
@@ -58,13 +62,23 @@ export function CompactPositionCard({
 
   return (
     <div className="rounded-lg border border-border bg-bg-card p-3">
-      {/* 名称 + 策略 tag */}
+      {/* 名称 + 策略 tag + 编辑(右上角 icon-only) */}
       <div className="flex items-center gap-2">
         <p className="truncate font-medium">{name}</p>
         {strategy && (
           <span className="rounded bg-bg-base px-1.5 py-0.5 text-[10px] text-text-secondary">
             {strategy}
           </span>
+        )}
+        {onEdit && (
+          <button
+            type="button"
+            onClick={() => onEdit(position)}
+            className="ml-auto inline-flex items-center justify-center rounded p-1 text-text-secondary hover:bg-bg-base"
+            title="编辑止损/止盈/触发/过期等交易参数"
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
         )}
       </div>
       <p className="mt-0.5 text-xs text-text-secondary">{ts_code}</p>
@@ -99,7 +113,7 @@ export function CompactPositionCard({
             {pnl.toFixed(0)} 元
           </span>
           <span className="ml-1 opacity-80">
-            ({pnlDelta != null ? ((pnlDelta / cost) * 100).toFixed(2) : "—"}%)
+            ({pnlDelta != null ? ((pnlDelta / cost) * 100).toFixed(2) : "-"}%)
           </span>
         </div>
       )}
@@ -111,7 +125,7 @@ export function CompactPositionCard({
         <div className="num">
           {position_size_shares != null && <span>{position_size_shares} 股</span>}
           {avg_cost != null && <span> @ {formatPrice(avg_cost)}</span>}
-          {position_size_shares == null && avg_cost == null && <span>—</span>}
+          {position_size_shares == null && avg_cost == null && <span>-</span>}
         </div>
         {(stop_loss != null || target != null) && (
           <div className="num flex items-center gap-3">
@@ -131,7 +145,7 @@ export function CompactPositionCard({
         )}
       </div>
 
-      {/* 操作按钮(可选) */}
+      {/* 操作按钮(可选): 加仓/减仓/同步AI/平仓 */}
       {(onAdd || onReduce || onClose || onSyncAi) && (
         <div className="mt-2 flex items-center gap-1.5">
           {onAdd && (
