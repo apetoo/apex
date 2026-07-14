@@ -11,7 +11,7 @@ from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills
 from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
@@ -445,6 +445,9 @@ def _load_system_prompt() -> str:
             base += "\n\n## 回测复盘提醒（基于历史模拟回测派生，注意样本局限，非定论）\n" + inj
     except Exception:
         pass
+    # 领域 skill（成长股/...方法论）。applies_to 含 analyze 的全量拼接。
+    # phase 1 只加不删，与现有 expert-persona.md / 注入条款暂存冗余，验证后再去重。
+    base += skills.load_skills_for("analyze")
     return base
 
 

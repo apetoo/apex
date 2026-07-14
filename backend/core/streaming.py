@@ -97,7 +97,13 @@ def _next_or_sentinel(gen):
 
 
 async def stream_generator(gen_factory: Callable[..., Any]) -> AsyncIterator[dict]:
-    """跑一个同步生成器，逐块 yield ``chunk`` 事件，结束 yield ``done``。"""
+    """跑一个同步生成器，逐块 yield ``chunk`` 事件，结束 yield ``done``。
+
+    生成器可 yield 两种值：
+    - **字符串** -> 包成 ``chunk`` 事件（``{content}``），向后兼容（如 ``llm.chat_stream``）。
+    - **dict** ``{"event": "...", "data": {...}}`` -> 透传为该 typed 事件
+      （如 chat 的 ``tool_call`` / ``tool_result``）。data 经 ``_sse`` json.dumps。
+    """
     loop = asyncio.get_running_loop()
     gen = gen_factory()
     while True:
@@ -108,5 +114,8 @@ async def stream_generator(gen_factory: Callable[..., Any]) -> AsyncIterator[dic
             return
         if val is _SENTINEL:
             break
-        yield _sse("chunk", {"content": val})
+        if isinstance(val, dict) and "event" in val:
+            yield _sse(val["event"], val.get("data", {}))
+        else:
+            yield _sse("chunk", {"content": val})
     yield _sse("done", {})

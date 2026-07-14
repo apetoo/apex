@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { MessageCircle, X, Send, Square, AlertCircle, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { MessageCircle, X, Send, Square, AlertCircle, RefreshCw, Trash2, Wrench, Loader2, Check } from "lucide-react";
 import { useSSE } from "@/hooks/useSSE";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useChatContext } from "@/hooks/useChatContext";
@@ -25,16 +25,57 @@ interface ChatMsg {
 
 type ChunkEvent = { content: string } | Record<string, never>;
 
+/** 工具调用事件派生状态(由 tool_call/tool_result 事件按 id 配对) */
+type ToolCall = {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  status: "calling" | "done" | "error";
+  result?: string;
+  chars?: number;
+};
+
+type ToolCallData = { id: string; name: string; args: Record<string, unknown> };
+type ToolResultData = { id: string; name: string; result: string; ok: boolean; chars: number };
+
+function formatArgs(args: Record<string, unknown>): string {
+  const entries = Object.entries(args);
+  if (entries.length === 0) return "";
+  return entries.map(([k, v]) => `${k}=${String(v)}`).join(" · ");
+}
+
 export function ChatPanel() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   // 历史持久化到 localStorage: 刷新/重开浏览器仍保留(streamingReply 临时态不持久化)
   const [history, setHistory] = useLocalStorage<ChatMsg[]>("apex.chat.history", []);
   const [streamingReply, setStreamingReply] = useState("");
+  // 工具结果展开状态(按 tool_call id)。新轮发送时重置。
+  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const { buildMessage } = useChatContext();
   const { events, status, error, connect, abort, reset } = useSSE<ChunkEvent>();
+
+  // 从 tool_call/tool_result 事件派生工具调用列表(按 id 配对)
+  const toolCalls: ToolCall[] = useMemo(() => {
+    const map = new Map<string, ToolCall>();
+    for (const e of events) {
+      if (e.event === "tool_call") {
+        const d = e.data as ToolCallData;
+        map.set(d.id, { id: d.id, name: d.name, args: d.args ?? {}, status: "calling" });
+      } else if (e.event === "tool_result") {
+        const d = e.data as ToolResultData;
+        const ex = map.get(d.id);
+        if (ex) {
+          ex.status = d.ok ? "done" : "error";
+          ex.result = d.result;
+          ex.chars = d.chars;
+        }
+      }
+    }
+    return Array.from(map.values());
+  }, [events]);
 
   // 累积 chunk 事件 → streaming reply
   // 全量派生(不增量 append): useSSE 一次 reader.read() 可能批量追加多个 chunk,
@@ -84,6 +125,7 @@ export function ChatPanel() {
     if (!input.trim() || running) return;
     const userText = input.trim();
     setInput("");
+    setExpandedTools({}); // 新轮重置工具展开态
 
     // ED2: 单次注入上下文(若变化)
     const finalMessage = buildMessage(userText);
@@ -183,8 +225,9 @@ export function ChatPanel() {
               </div>
             ))}
 
-              {/* 思考中: running 但还没出 chunk(两阶段里 phase1 工具决策/phase2 首字前) */}
-              {running && !streamingReply && (
+              {/* 思考中: running 但还没出 chunk 且没工具调用(stage1 工具决策期间 / stage2 首字前)。
+                  一旦 tool_call 事件到达, 切换为下方工具卡片显示。 */}
+              {running && !streamingReply && toolCalls.length === 0 && (
                 <div className="mb-3 flex justify-start">
                   <div className="rounded-lg bg-bg-base px-3 py-2.5 text-sm text-text-secondary">
                     <span className="inline-flex items-center gap-1.5">
@@ -195,6 +238,58 @@ export function ChatPanel() {
                         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
                       </span>
                     </span>
+                  </div>
+                </div>
+              )}
+
+              {/* 工具调用卡片: stage1 的 tool_call/tool_result live 显示, 在回复上方 */}
+              {toolCalls.length > 0 && (running || streamingReply) && (
+                <div className="mb-3 flex justify-start">
+                  <div className="w-full max-w-[90%] rounded-lg border border-border bg-bg-base px-3 py-2">
+                    <div className="mb-1.5 flex items-center gap-1.5 text-xs text-text-secondary">
+                      <Wrench className="h-3 w-3" />
+                      <span>调用 {toolCalls.length} 个工具</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {toolCalls.map((tc) => (
+                        <div key={tc.id} className="text-xs">
+                          <div className="flex items-center gap-1.5">
+                            {tc.status === "calling" ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-text-secondary" />
+                            ) : tc.status === "error" ? (
+                              // text-up=#e14b4b 红(错误); token 是价格语义但颜色符合状态常规
+                              <AlertCircle className="h-3 w-3 text-up" />
+                            ) : (
+                              // text-down=#2ba84a 绿(完成)
+                              <Check className="h-3 w-3 text-down" />
+                            )}
+                            <span className="font-mono text-text-primary">{tc.name}</span>
+                            {formatArgs(tc.args) && (
+                              <span className="font-mono text-text-secondary">{formatArgs(tc.args)}</span>
+                            )}
+                            {tc.status !== "calling" && tc.chars != null && (
+                              <span className="text-flat">↳ {tc.chars} 字</span>
+                            )}
+                            {tc.result && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedTools((s) => ({ ...s, [tc.id]: !s[tc.id] }))
+                                }
+                                className="ml-auto text-text-secondary hover:text-text-primary"
+                              >
+                                {expandedTools[tc.id] ? "收起" : "展开"}
+                              </button>
+                            )}
+                          </div>
+                          {expandedTools[tc.id] && tc.result && (
+                            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-bg-card p-2 font-mono text-[11px] leading-relaxed text-text-secondary">
+                              {tc.result}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

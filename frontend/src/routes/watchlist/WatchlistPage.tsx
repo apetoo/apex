@@ -10,6 +10,7 @@ import {
   CardDescription,
   Button,
   Dialog,
+  Markdown,
 } from "@/components/base";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 import { CompactCandidateCard } from "@/components/a-share/CompactCandidateCard";
@@ -22,6 +23,7 @@ import {
   getTrades,
   type ActivePosition,
   type Candidate,
+  type PostmortemDiagnosis,
 } from "@/api/watchlist";
 import {
   useAddCandidate,
@@ -101,7 +103,11 @@ export function WatchlistPage() {
   const [closePrice, setClosePrice] = useState("");
   const [closeDate, setCloseDate] = useState("");
   const [closeNote, setCloseNote] = useState("");
-  const [closeDiag, setCloseDiag] = useState<string | null>(null);
+  const [closeDiag, setCloseDiag] = useState<{
+    diagnosis: PostmortemDiagnosis | string | null;
+    ts_code: string;
+    name?: string;
+  } | null>(null);
 
   // promote(候选→持仓)弹窗
   const [promoteTarget, setPromoteTarget] = useState<Candidate | null>(null);
@@ -233,9 +239,14 @@ export function WatchlistPage() {
       },
       {
         onSuccess: (resp) => {
-          setCloseDiag(resp.diagnosis ?? null);
+          // 真后端 diagnosis 是对象(PostmortemDiagnosis), dev mock 是字符串 -- 都接住。
           // 保留弹窗展示 diagnosis, 但清掉 target 防止重复提交;
-          // 用户看完 diagnosis 点关闭清场
+          // 用户看完 diagnosis 点关闭清场。closeTarget 此刻是闭包里被平仓的那只。
+          setCloseDiag({
+            diagnosis: resp.diagnosis ?? null,
+            ts_code: closeTarget?.ts_code ?? "",
+            name: closeTarget?.name,
+          });
           setCloseTarget(null);
         },
       },
@@ -742,21 +753,18 @@ export function WatchlistPage() {
         busy={closeMut.isPending}
         title={
           <span>
-            平仓 <span className="num text-text-secondary">{closeTarget?.ts_code}</span>
+            平仓 <span className="num text-text-secondary">{closeTarget?.ts_code ?? closeDiag?.ts_code}</span>
           </span>
         }
       >
         {closeDiag !== null ? (
-          // 提交成功 → 展示 AI 复盘, 关闭清场
-          <div className="space-y-3">
-            <p className="text-sm text-up">✓ 已平仓, AI 复盘如下:</p>
-            <p className="whitespace-pre-wrap text-sm text-text-primary">{closeDiag}</p>
-            <div className="flex justify-end">
-              <Button variant="primary" size="sm" onClick={() => setCloseDiag(null)}>
-                知道了
-              </Button>
-            </div>
-          </div>
+          // 提交成功 -> 展示 AI 复盘, 关闭清场
+          <CloseDiagnosisView
+            ts_code={closeDiag.ts_code}
+            name={closeDiag.name}
+            diagnosis={closeDiag.diagnosis}
+            onClose={() => setCloseDiag(null)}
+          />
         ) : closeTarget ? (
           <form onSubmit={submitClose} className="space-y-3">
             <p className="text-xs text-flat">
@@ -982,5 +990,113 @@ export function WatchlistPage() {
         candidate={editCandidateTarget}
       />
     </div>
+  );
+}
+
+/**
+ * 平仓弹窗的 AI 复盘展示。
+ *
+ * 真后端 diagnosis 是 PostmortemDiagnosis 对象（postmortem.run_and_patch 返回 dict），
+ * dev mock 是字符串 -- 本组件兼容两者：对象走「徽章 + 机械标志 + Markdown + Lesson」，
+ * 字符串直接走 Markdown。
+ *
+ * 机械标志（接近止盈 / 止损过紧）仅在亏损时展示——win 时 nearly_hit_target 恒 false，
+ * 展示反而误导。outcome 徽章按 A 股红涨绿跌：盈=红、亏=绿。
+ */
+function CloseDiagnosisView({
+  ts_code,
+  name,
+  diagnosis,
+  onClose,
+}: {
+  ts_code: string;
+  name?: string;
+  diagnosis: PostmortemDiagnosis | string | null;
+  onClose: () => void;
+}) {
+  const isObj = typeof diagnosis === "object" && diagnosis !== null;
+  const diag = isObj ? (diagnosis as PostmortemDiagnosis) : null;
+  const text =
+    typeof diagnosis === "string"
+      ? diagnosis
+      : (diag?.ai_diagnosis_text ?? "");
+  const label = name || ts_code;
+  const outcome = diag?.outcome_class;
+  const isWin = outcome === "win";
+  const isLoss = outcome === "loss";
+  const showFlags = isLoss; // 接近止盈/止损过紧 是亏损复盘标志，win 下无意义
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-sm text-up">✓ 已平仓</p>
+        <span className="text-sm font-medium">{label}</span>
+        {ts_code && (
+          <span className="num text-xs text-text-secondary">{ts_code}</span>
+        )}
+      </div>
+
+      {diag && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {isWin && <Flag tone="up">盈</Flag>}
+          {isLoss && <Flag tone="down">亏</Flag>}
+          {showFlags && (
+            <>
+              <Flag tone={diag.nearly_hit_target ? "up" : "flat"}>
+                接近止盈 {diag.nearly_hit_target ? "✓" : "✗"}
+              </Flag>
+              <Flag tone={diag.stop_hit_too_tight ? "down" : "flat"}>
+                止损过紧 {diag.stop_hit_too_tight ? "✓" : "✗"}
+              </Flag>
+            </>
+          )}
+          {diag.target_distance_max_pct != null && (
+            <span className="num text-[11px] text-text-secondary">
+              持仓期最高 +{(diag.target_distance_max_pct * 100).toFixed(1)}%
+            </span>
+          )}
+        </div>
+      )}
+
+      {text ? (
+        <Markdown className="rounded-md bg-bg-base/50 p-3 text-sm">
+          {text}
+        </Markdown>
+      ) : (
+        <p className="text-xs text-flat">（无 AI 复盘文本）</p>
+      )}
+
+      {diag?.lesson && (
+        <p className="rounded-md border border-border bg-bg-base/50 px-3 py-2 text-xs">
+          <span className="text-text-secondary">Lesson · </span>
+          {diag.lesson}
+        </p>
+      )}
+
+      <div className="flex justify-end">
+        <Button variant="primary" size="sm" onClick={onClose}>
+          知道了
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** 小徽标：盈=红(up) / 亏=绿(down) / 中性(flat)。A 股红涨绿跌。 */
+function Flag({
+  tone,
+  children,
+}: {
+  tone: "up" | "down" | "flat";
+  children: React.ReactNode;
+}) {
+  const cls =
+    tone === "up"
+      ? "bg-up/10 text-up"
+      : tone === "down"
+        ? "bg-down/10 text-down"
+        : "bg-bg-base text-text-secondary";
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] ${cls}`}>{children}</span>
   );
 }

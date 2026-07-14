@@ -17,7 +17,7 @@ from datetime import datetime
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
 
-from apex import account, calibration, evidence_attribution, journal, llm, trades, watchlist
+from apex import account, calibration, evidence_attribution, journal, llm, skills, trades, watchlist
 from apex.journal_views import chat_full, chat_summary, is_today_entry
 from apex.review_views import (
     account_risk_digest,
@@ -80,6 +80,18 @@ chat 不重复跑分析）。
 - 用中文回答
 - 当前时间：{current_time}
 """
+
+def _build_chat_system_prompt(current_time: str) -> str:
+    """格式化 chat system prompt 并拼接领域 skill。
+
+    phase 1 全量注入 applies_to 含 chat 的 skill（暂无 load_skill 按需加载）。
+    """
+    base = _CHAT_SYSTEM_PROMPT.format(current_time=current_time)
+    skills_block = skills.load_skills_for("chat")
+    if skills_block:
+        base += "\n\n# 领域 Skill（按需参考）" + skills_block
+    return base
+
 
 # 上下文预算（DeepSeek 长窗口下保留约 24K tokens 历史）
 _HISTORY_TOKEN_BUDGET = 24000
@@ -367,16 +379,18 @@ def chat_stream(req: ChatStreamRequest):
     """AI 对话，SSE 流式返回回复。
 
     事件：
-      ``chunk`` — ``{content}`` 增量文本
-      ``done``  — 结束
-      ``error`` — 失败
+      ``tool_call``   — ``{id, name, args}`` 工具调用开始(阶段1, live)
+      ``tool_result`` — ``{id, name, result, ok, chars}`` 工具返回
+      ``chunk``       — ``{content}`` 增量文本(阶段2)
+      ``done``        — 结束
+      ``error``       — 失败
 
-    两阶段：阶段1 非流式带工具(tool_choice=auto)让模型自己决定查不查用户数据;
-    阶段2 流式生成最终回复(无工具)。模型决定不查工具时, 阶段1 已拿到的 content
-    作为"假流式"前缀先吐, 再续写。
+    两阶段(都在生成器内, 以便 live emit 工具事件): 阶段1 非流式带工具(tool_choice=auto)
+    让模型自己决定查不查用户数据, 每个工具调用 emit tool_call/tool_result; 阶段2 流式
+    生成最终回复(无工具)。不调工具时阶段1 仅用于决策, 直接走阶段2 从头流式。
     """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S 北京时间")
-    system = _CHAT_SYSTEM_PROMPT.format(current_time=now_str)
+    system = _build_chat_system_prompt(now_str)
 
     messages: list[dict] = [{"role": "system", "content": system}]
     for m in _trim_history(req.history, _HISTORY_TOKEN_BUDGET):
@@ -385,43 +399,53 @@ def chat_stream(req: ChatStreamRequest):
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": req.message})
 
-    # 阶段1: 工具决策轮(总是跑)。tool_choice=auto 让模型自己决定查不查。
-    try:
-        tool_resp = llm.chat(
-            messages, tools=_CHAT_TOOLS, tool_choice="auto",
-            temperature=0.3, max_tokens=512,
-        )
-    except Exception:  # noqa: BLE001 — 阶段1失败降级为纯流式
-        tool_resp = {"content": None, "tool_calls": None}
-
-    tool_calls = tool_resp.get("tool_calls")
-    if tool_calls:
-        # 执行工具, 把调用链 + 结果 append 进 messages, 阶段2流式生成最终回复
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for tc in tool_calls
-            ],
-        })
-        for tc in tool_calls:
-            try:
-                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-            except json.JSONDecodeError:
-                args = {}
-            result = _dispatch_chat_tool(tc["name"], args)
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-    # 注: 不调工具时不缓存 seed_content。阶段1 的 content 是用 max_tokens=512 截断的
-    # 不完整回复, 若当"假流式前缀"先吐、阶段2 又用同一 messages 重生成 → 内容重复乱序。
-    # 所以不调工具时直接走阶段2 流式(从头完整生成), 阶段1 仅用于工具决策。
-
-    # 阶段2: 流式生成最终回复(无工具)
+    # 阶段1+2 都在生成器内: 阶段1 工具决策/派发 live emit tool_call/tool_result,
+    # 阶段2 流式生成回复。stage1 放生成器内才能 yield 工具事件(否则跑在流开启前, 静默)。
+    # 注: 不调工具时阶段1 仅用于决策, 直接走阶段2 从头流式 -- 不缓存 stage1 的 512 截断
+    # content 作假流式前缀(会和阶段2 重生成内容重复乱序)。
     def gen_factory():
+        # 阶段1: 工具决策轮(总是跑)。tool_choice=auto 让模型自己决定查不查。
+        try:
+            tool_resp = llm.chat(
+                messages, tools=_CHAT_TOOLS, tool_choice="auto",
+                temperature=0.3, max_tokens=512,
+            )
+        except Exception:  # noqa: BLE001 - 阶段1失败降级为纯流式
+            tool_resp = {"content": None, "tool_calls": None}
+
+        tool_calls = tool_resp.get("tool_calls")
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls
+                ],
+            })
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                yield {"event": "tool_call", "data": {"id": tc["id"], "name": tc["name"], "args": args}}
+                result = _dispatch_chat_tool(tc["name"], args)
+                # _dispatch_chat_tool 错误返回统一是 {"error": ...} JSON 串; 正常 digest 是人读文本
+                ok = not result.lstrip().startswith('{"error"')
+                yield {
+                    "event": "tool_result",
+                    "data": {
+                        "id": tc["id"], "name": tc["name"],
+                        "result": result, "ok": ok, "chars": len(result),
+                    },
+                }
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+        # 阶段2: 流式生成最终回复(无工具)
         yield from llm.chat_stream(messages, temperature=0.3, max_tokens=8192)
 
     return EventSourceResponse(stream_generator(gen_factory))

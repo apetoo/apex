@@ -135,10 +135,44 @@ export interface SellResponsePartial {
 export interface SellResponseClosed {
   trade: Trade;
   closed_record: Record<string, unknown>;
-  diagnosis: unknown;
+  diagnosis: PostmortemDiagnosis | null;
 }
 
 export type SellResponse = SellResponsePartial | SellResponseClosed;
+
+/**
+ * 平仓复盘 diagnosis（apex/postmortem.py:run_and_patch 返回的 dict，非字符串）。
+ * 机械字段由代码算好（outcome_class / nearly_hit_target / stop_hit_too_tight /
+ * calibration_bucket / target_distance_max_pct），AI 只填因果解释。
+ * **注意**: dev mock 的 closePosition 返回字符串 diagnosis，真后端返回此对象 --
+ * 渲染端必须兼容两者（见 WatchlistPage 平仓弹窗）。
+ */
+export interface PostmortemDiagnosis {
+  /** "win" | "loss"（机械判定：realized_pnl >= 0） */
+  outcome_class: "win" | "loss" | string;
+  /** 持仓期间最高价到 entry 的距离（小数），衡量「涨了多少」 */
+  target_distance_max_pct?: number | null;
+  /** 亏损但高点曾 >= 目标*95%（差一点到目标） */
+  nearly_hit_target?: boolean;
+  /** 低点跌破止损但高点又回升过进场价（止损挂太紧） */
+  stop_hit_too_tight?: boolean;
+  /** verdict@bucket 校准桶标签，如 "bullish@mid" */
+  calibration_bucket?: string;
+  /** AI 点出它判断对的因素 */
+  ai_correctly_identified?: string[];
+  /** AI 点出它漏掉的因素 */
+  ai_missed?: string[];
+  /** 一句话教训 */
+  lesson?: string;
+  /** AI 复盘正文（含 markdown，走 <Markdown> 渲染） */
+  ai_diagnosis_text?: string;
+  /** 出场后回看 K 线天数 */
+  post_exit_kline_used?: number;
+  /** 用的 LLM model id */
+  model?: string;
+  /** 诊断时间（ISO，CN 时区） */
+  diagnosed_at?: string;
+}
 
 /**
  * 已平仓记录（GET /api/watchlist/closed）。
@@ -166,7 +200,7 @@ export interface ClosedPosition {
     closed_at: string;
     [k: string]: unknown;
   };
-  diagnosis: unknown;
+  diagnosis: PostmortemDiagnosis | null;
   [k: string]: unknown;
 }
 
@@ -413,7 +447,7 @@ export async function promoteCandidate(
 /** POST /api/watchlist/close — 平仓 + 触发 postmortem diagnosis */
 export async function closePosition(
   payload: ClosePositionPayload,
-): Promise<{ message: string; record: unknown; diagnosis: string }> {
+): Promise<{ message: string; record: unknown; diagnosis: PostmortemDiagnosis | string | null }> {
   if (USE_MOCK) {
     const i = MOCK_DATA.active_positions.findIndex(
       (p) => p.ts_code === payload.ts_code,

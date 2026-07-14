@@ -169,6 +169,11 @@ def migrate_and_backfill() -> dict:
     except Exception:
         pass
 
+    try:
+        stats["candidates_deduped"] = dedup_candidates()
+    except Exception:
+        pass
+
     # PR4: closed_positions 回填（regime 从缓存 / sector 走 tushare）+ trades 重建
     try:
         bf = _backfill_closed_open_fields()
@@ -730,6 +735,42 @@ def dedup_active_positions() -> int:
         archived_count += 1
     if archived_count:
         wl["active_positions"] = no_code + list(seen.values())
+        _save(wl)
+    return archived_count
+
+
+def dedup_candidates() -> int:
+    """
+    Collapse duplicate ts_codes in candidates: keep the one with the latest
+    expires_at (tiebreak: keep last in list), archive the rest with
+    reason='dedup'. Returns count archived. 对齐 dedup_active_positions 语义。
+    """
+    wl = _load()
+    today = date.today().isoformat()
+    seen: dict[str, dict] = {}
+    no_code: list[dict] = []
+    archived_count = 0
+    for item in wl["candidates"]:
+        code = item.get("ts_code")
+        if not code:
+            no_code.append(item)
+            continue
+        if code not in seen:
+            seen[code] = item
+            continue
+        prev = seen[code]
+        if (item.get("expires_at") or "") >= (prev.get("expires_at") or ""):
+            loser, winner = prev, item
+        else:
+            loser, winner = item, prev
+        wl["archived"].append({
+            **loser, "status": "archived_dedup",
+            "archived_date": today, "archived_from": "candidates",
+        })
+        seen[code] = winner
+        archived_count += 1
+    if archived_count:
+        wl["candidates"] = no_code + list(seen.values())
         _save(wl)
     return archived_count
 
@@ -1397,7 +1438,21 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["trigger_low"] = float(trigger_low)
     if trigger_high is not None:
         entry["trigger_high"] = float(trigger_high)
-    data["candidates"].append(entry)
+    # upsert: 同 ts_code 已有候选则原地替换（保留 renew_count 不丢手动续期历史），
+    # 否则 append。避免 candidates 出现重复 ts_code -> 前端 key 冲突 + 触发歧义。
+    renew_count = None
+    existing_idx = None
+    for i, c in enumerate(data["candidates"]):
+        if c.get("ts_code") == ts_code:
+            existing_idx = i
+            renew_count = c.get("renew_count")
+            break
+    if renew_count is not None:
+        entry["renew_count"] = renew_count
+    if existing_idx is not None:
+        data["candidates"][existing_idx] = entry
+    else:
+        data["candidates"].append(entry)
     _save(data)
     return {"expires_days": resolved, **meta}
 

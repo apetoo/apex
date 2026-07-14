@@ -28,6 +28,7 @@ import {
   type ActivePosition,
   type Candidate,
   type ExpiresMeta,
+  type PostmortemDiagnosis,
 } from "./watchlist";
 import { qk } from "./query-keys";
 
@@ -153,7 +154,7 @@ export function usePromoteCandidate(): UseMutationResult<
 }
 
 export function useClosePosition(): UseMutationResult<
-  { message: string; record: unknown; diagnosis: string },
+  { message: string; record: unknown; diagnosis: PostmortemDiagnosis | string | null },
   Error,
   ClosePositionPayload
 > {
