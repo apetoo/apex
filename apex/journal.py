@@ -34,6 +34,18 @@ def validate_entry(entry: dict) -> dict:
         if key not in features:
             features[key] = None
     entry["features"] = features
+    _fill_playstyle_fields(entry)
+    return entry
+
+
+# Playstyle Engine v1 字段（pre-v9 entry 无这些键，读/写时 lazy-fill None，append-only 不迁移 jsonl）
+_PLAYSTYLE_FIELDS = ("playstyle", "playstyle_fit", "playstyle_features", "risk_level")
+
+
+def _fill_playstyle_fields(entry: dict) -> dict:
+    """为 pre-v9 历史 entry 补 Playstyle Engine v1 字段为 None（读时 lazy fill）。"""
+    for k in _PLAYSTYLE_FIELDS:
+        entry.setdefault(k, None)
     return entry
 
 
@@ -70,9 +82,11 @@ def load_entries(ts_code: Optional[str] = None) -> list[dict]:
                 line = line.strip()
                 if line:
                     try:
-                        entries.append(json.loads(line))
+                        entry = json.loads(line)
                     except json.JSONDecodeError:
-                        pass
+                        continue
+                    _fill_playstyle_fields(entry)  # pre-v9 entry 补 playstyle 字段
+                    entries.append(entry)
 
     return entries
 

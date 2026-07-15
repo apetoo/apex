@@ -18,6 +18,7 @@ from typing import Optional
 import pandas as pd
 
 from apex import data
+from apex.per_day_cache import per_day_cache
 from apex.schemas import SignalRecord
 
 _WINDOW = 5            # 回看交易日数
@@ -100,6 +101,7 @@ def _consec_days(group: pd.DataFrame, latest_date: str) -> int:
     return count
 
 
+@per_day_cache("moneyflow")
 def fetch(trade_date: str) -> list[SignalRecord]:
     trade_date = (trade_date or "").replace("-", "")
     df = _load_window(trade_date)

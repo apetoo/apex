@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Sparkles, Target, ShieldAlert, Flag, ListChecks } from "lucide-react";
+import { Sparkles, Target, ShieldAlert, Flag, ListChecks, Gauge, Trophy } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, Markdown, Button } from "@/components/base";
 import { VerdictTag } from "./VerdictTag";
 import { AddCandidateDialog } from "./AddCandidateDialog";
@@ -36,6 +36,14 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
   const limitTooltip = limited
     ? `AI 原始 ${String(ra.raw_confidence ?? "-")}(${String(ra.raw_verdict ?? "-")}) -> 限幅 ${String(verdict.confidence ?? "-")}(${String(verdict.verdict ?? "-")})${ra.limit_rule ? ` · ${String(ra.limit_rule)}` : ""}`
     : "";
+
+  // Playstyle Engine v1（玩法星级 / risk_level / 契合度徽章）。老 entry 全 null -> 不渲染。
+  // skill 分支：playstyle = {ratings, primary, secondary, reasons, method, low_confidence}。
+  const playstyle = verdict.playstyle as
+    | { ratings?: Record<string, number>; primary?: string; secondary?: string; reasons?: string[]; low_confidence?: boolean }
+    | null;
+  const playstyleFit = verdict.playstyle_fit as { state?: string; note?: string } | null;
+  const riskLevel = typeof verdict.risk_level === "string" ? (verdict.risk_level as string) : null;
 
   return (
     <Card>
@@ -86,6 +94,13 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
           <PriceCell icon={ShieldAlert} label="止损" value={fmtPrice(pa.stop_loss)} tone="text-down" />
           <PriceCell icon={Flag} label="目标" value={fmtPrice(pa.target)} tone="text-up" />
         </div>
+
+        {/* 玩法判定 (Playstyle Engine v1)：星级条 + risk_level + 契合度徽章。老 entry 不渲染。 */}
+        <PlaystyleSection
+          playstyle={playstyle}
+          playstyleFit={playstyleFit}
+          riskLevel={riskLevel}
+        />
 
         {/* 证据链 */}
         {evidence.length > 0 && (
@@ -153,6 +168,128 @@ function PriceCell({
         {label}
       </div>
       <p className={cn("num mt-1 text-lg font-semibold", tone)}>{value}</p>
+    </div>
+  );
+}
+
+// ── Playstyle Engine v1 ──────────────────────────────────────────────────────
+// 玩法星级(打野/波段/中线/长线 0-5) + risk_level(low/medium/high) + 契合度徽章。
+// v1 prototype-first(D9)：ratings 由 Python 规则 post-hoc 给出；契合度恒 insufficient_data(D10)。
+// 雪球风克制：星级用文字星(不整块染色)，top 仅加粗+Trophy 标，risk high 用 amber(沿用续期警示色)。
+const PLAYSTYLES = ["打野", "波段", "中线", "长线"] as const;
+
+function StarBar({ rating }: { rating: number }) {
+  const r = Math.max(0, Math.min(5, Math.round(Number(rating) || 0)));
+  return (
+    <span className="num tracking-tight text-text-primary">
+      {"★".repeat(r)}
+      <span className="text-flat">{"☆".repeat(5 - r)}</span>
+    </span>
+  );
+}
+
+function RiskBadge({ level }: { level: string }) {
+  const isHigh = level === "high";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-0.5 rounded border px-1.5 py-0.5",
+        isHigh
+          ? "text-amber-600 border-amber-600/30 bg-amber-600/10"
+          : "text-flat border-flat/20 bg-flat/8",
+      )}
+    >
+      {isHigh && <ShieldAlert className="h-3 w-3" />}
+      风险{level === "high" ? "高" : level === "low" ? "低" : "中"}
+    </span>
+  );
+}
+
+function FitBadge({ fit }: { fit: { state?: string; note?: string } }) {
+  // v1 恒 insufficient_data（D10：画像 n<20 即死，规则 v1.1）
+  const label = fit.state === "insufficient_data" ? (fit.note ?? "画像累积中") : (fit.note ?? fit.state ?? "-");
+  return (
+    <span className="inline-flex items-center rounded border border-flat/20 bg-flat/8 px-1.5 py-0.5 text-flat">
+      契合 {label}
+    </span>
+  );
+}
+
+function PlaystyleSection({
+  playstyle,
+  playstyleFit,
+  riskLevel,
+}: {
+  playstyle: { ratings?: Record<string, number>; top?: string; reasons?: string[]; low_confidence?: boolean } | null;
+  playstyleFit: { state?: string; note?: string } | null;
+  riskLevel: string | null;
+}) {
+  // 老 entry(playstyle/fit/risk 全 null) -> 不渲染
+  if (!playstyle && !playstyleFit && !riskLevel) return null;
+
+  const ratings = playstyle?.ratings;
+  const primary = playstyle?.primary;
+  const secondary = playstyle?.secondary;
+  const reasons = Array.isArray(playstyle?.reasons) ? (playstyle!.reasons as string[]) : [];
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-text-secondary">
+          <Gauge className="h-3.5 w-3.5" />
+          玩法判定
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px]">
+          {riskLevel && <RiskBadge level={riskLevel} />}
+          {playstyleFit && <FitBadge fit={playstyleFit} />}
+        </div>
+      </div>
+
+      {ratings ? (
+        <>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+            {PLAYSTYLES.map((name) => {
+              const isPrimary = name === primary;
+              const isSecondary = name === secondary;
+              return (
+                <div key={name} className="flex items-center gap-2 text-sm">
+                  <span
+                    className={cn(
+                      "w-8 shrink-0",
+                      isPrimary ? "font-semibold text-text-primary" : "text-text-secondary",
+                    )}
+                  >
+                    {name}
+                  </span>
+                  <StarBar rating={ratings[name] ?? 0} />
+                  {isPrimary && (
+                    <span className="inline-flex items-center gap-0.5 text-[10px] text-text-primary">
+                      <Trophy className="h-3 w-3" />
+                      主玩法
+                    </span>
+                  )}
+                  {!isPrimary && isSecondary && (
+                    <span className="text-[10px] text-text-secondary">兼容</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {reasons.length > 0 && (
+            <p className="mt-2 text-[11px] text-text-secondary">
+              <span className="text-flat">原因 · </span>
+              {reasons.join(" / ")}
+            </p>
+          )}
+          {playstyle?.low_confidence && (
+            <p className="mt-1 text-[10px] text-flat">各玩法特征命中弱，判定仅供参考</p>
+          )}
+        </>
+      ) : (
+        <p className="text-sm text-flat">
+          玩法特征不足，未判定{playstyleFit?.note ? `（${playstyleFit.note}）` : ""}
+        </p>
+      )}
     </div>
   );
 }

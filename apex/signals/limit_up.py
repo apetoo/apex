@@ -8,6 +8,7 @@ from typing import Optional
 import pandas as pd
 
 from apex import data
+from apex.per_day_cache import per_day_cache
 from apex.schemas import SignalRecord
 
 
@@ -55,6 +56,7 @@ def _from_akshare(trade_date: str) -> Optional[pd.DataFrame]:
     return df
 
 
+@per_day_cache("limit_up")
 def fetch(trade_date: str) -> list[SignalRecord]:
     df = None
     try:

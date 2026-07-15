@@ -11,11 +11,11 @@ from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle
 from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
-    STOCK_TYPE_ENUM, VALUATION_BASIS_ENUM,
+    STOCK_TYPE_ENUM, VALUATION_BASIS_ENUM, PLAYSTYLE_ENUM,
 )
 
 
@@ -415,6 +415,31 @@ TOOLS = [
                             "static_pe_only=仅静态 PE_TTM（成长股偏空会被拒）；"
                             "non_valuation=估值非主要依据。"
                         ),
+                    },
+                    "playstyle": {
+                        "type": "object",
+                        "description": (
+                            "标的玩法判定（打野/波段/中线/长线）。基于注入的 ## 玩法特征(Playstyle FE) + web_search 定性判断。"
+                            "FE 完整度 ≥50% 时必填，<50% 允许 null。玩法=股票客观属性，非当前趋势（见 Skill: playstyle）。"
+                            "primary 必须 = ratings 的并列最高（ratings[primary]==max）；secondary=次优或兼容玩法，无则留空。"
+                            "reasons 每条必须引用 FE 特征数字 或 web_search 结果，禁凭空编。"
+                        ),
+                        "properties": {
+                            "ratings": {
+                                "type": "object",
+                                "description": "4 档玩法 0-5 星级",
+                                "properties": {
+                                    "打野": {"type": "integer"},
+                                    "波段": {"type": "integer"},
+                                    "中线": {"type": "integer"},
+                                    "长线": {"type": "integer"},
+                                },
+                            },
+                            "primary": {"type": "string", "enum": PLAYSTYLE_ENUM, "description": "主玩法 = ratings 并列最高"},
+                            "secondary": {"type": "string", "enum": PLAYSTYLE_ENUM, "description": "兼容玩法（次优/可替代），无则不填"},
+                            "reasons": {"type": "array", "items": {"type": "string"}, "description": "原因，引用 FE 数字或 web_search 结果"},
+                        },
+                        "required": ["ratings", "primary", "reasons"],
                     },
                 },
                 "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
@@ -1343,6 +1368,98 @@ def _format_market_context(ts_code: str) -> tuple[str, dict]:
     return "\n".join(lines), ctx
 
 
+def _format_playstyle_block(ts_code: str) -> tuple[str, dict]:
+    """标的玩法特征（Playstyle FE）快照，注入 prompt。返回 (formatted_str, raw_features)。
+
+    仿 _format_market_context / _format_intraday_block：Python 算特征 -> 翻译成结论性标签
+    塞 prompt，raw dict 存 journal（T5 落 entry.playstyle_features）。原始行情/信号 bars 不
+    进 prompt、不落 trace（与分时一致）。fail-soft：extract_features 绝不抛异常。
+
+    ⚠ v1 prototype-first（D9）：本函数已就绪但**暂未在 run() 注入**--是否注入 prompt 取决于
+    T4 prototype hit-rate 分支：≥70% 走 Python 规则星级（post-hoc，不注入）；<70% 才上 skill
+    rubric 并在此注入。提前注入会每条 analyze 付 token/延迟（OV#11），故 D9 先验证再接。
+    """
+    feats = playstyle.extract_features(ts_code)
+    f = feats["features"]
+    completeness = feats["completeness"]
+    risk_level = feats["risk_level"]
+
+    lines = [f"## 玩法特征（Playstyle FE，截至 {feats.get('as_of', '?')}）"]
+
+    if completeness < 0.5:
+        lines.append(
+            f"- ⚠ 特征完整度 {completeness:.0%} < 50%（数据源失败/停牌），玩法判定降级为 null，"
+            "本次不输出 playstyle 星级（系统允许，不卡流程）。"
+        )
+        if feats.get("notes"):
+            lines.append(f"- 降级说明：{'；'.join(feats['notes'])}")
+        return "\n".join(lines), feats
+
+    lines.append(f"- 特征完整度 {completeness:.0%} / 风险等级 **{risk_level}**")
+
+    vol = f.get("volatility") or {}
+    if vol.get("present"):
+        lines.append(
+            f"- 波动率：20日 {vol.get('vol_20d_pct', '?')}% / 60日 {vol.get('vol_60d_pct', '?')}%（年化）"
+        )
+
+    tr = f.get("turnover") or {}
+    if tr.get("present"):
+        lines.append(f"- 换手率：20日均值 {tr.get('avg_20d_pct', '?')}%（D11 自推，latest {tr.get('latest_pct', '?')}%）")
+
+    mf = f.get("moneyflow") or {}
+    if mf.get("present"):
+        sign = {"1": "净流入", "-1": "净流出", "0": "持平"}.get(str(mf.get("sign", 0)), "?")
+        lines.append(
+            f"- 主力净流入：近5日{sign} {abs(mf.get('sum_yuan', 0) or 0):.0f}元 / 连续正 {mf.get('consec_positive', 0)} 日"
+            + ("（部分日缺失）" if mf.get("partial") else "")
+        )
+
+    nb = f.get("northbound") or {}
+    if nb.get("present"):
+        if nb.get("listed_today"):
+            lines.append(f"- 北向：今日上榜，净买入 {nb.get('today_inflow_yuan', 0):.0f}元（v1 当日代理）")
+        else:
+            lines.append("- 北向：今日未上榜（v1 当日代理，5日历史未支持）")
+
+    lu = f.get("limit_up") or {}
+    if lu.get("present"):
+        lines.append(
+            f"- 连板：近10日涨停 {lu.get('count_10d', 0)} 次 / 最高 {lu.get('max_consecutive_10d', 0)} 连板"
+        )
+
+    ory = f.get("or_yoy") or {}
+    if ory.get("present"):
+        sus = "（持续高≥15%）" if ory.get("sustained_high") else ""
+        lines.append(
+            f"- 业绩：or_yoy 最新 {ory.get('latest', '?')}% / 中位 {ory.get('median', '?')}%"
+            f" / 趋势 {ory.get('trend', '?')}{sus}（D12 多季）"
+        )
+
+    mv = f.get("circ_mv") or {}
+    if mv.get("present"):
+        lines.append(f"- 流通市值：{mv.get('yi', '?')} 亿")
+
+    val = f.get("valuation") or {}
+    if val.get("present"):
+        lines.append(f"- 估值：PE_TTM {val.get('pe_ttm', '?')} / PB {val.get('pb', '?')}")
+
+    roe = f.get("roe") or {}
+    if roe.get("present"):
+        lines.append(f"- ROE：最新 {roe.get('latest', '?')}%（{'近4季全正' if roe.get('all_positive_4q') else '有季为负或不足4季'}）")
+
+    ma = f.get("ma_alignment") or {}
+    if ma.get("present"):
+        pb_label = "完整多头排列" if ma.get("perfect_bullish") else "非完整多头"
+        lines.append(f"- MA 排列：{ma.get('score', 0)}/3（{pb_label}）")
+
+    lines.append(
+        "\n**玩法判定（打野/波段/中线/长线）由星级 prototype 给出，每条原因必须引用以上特征数字"
+        "或 web_search 结果，禁凭空编。**"
+    )
+    return "\n".join(lines), feats
+
+
 def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     """
     Run full agent analysis for ts_code via DeepSeek API.
@@ -1377,10 +1494,24 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     # 把盘中走势快照并入 market_context，事后复盘一处看全
     if intraday_ctx:
         market_ctx["intraday"] = intraday_ctx
+
+    # ── Playstyle Engine v1（skill 分支，D9 <70% 后启用）──
+    # FE 特征注入 prompt 供 AI 判定玩法（record_verdict 填 playstyle）；playstyle 由 AI 填，
+    # finalize_playstyle 规整 + 软门控（gate#1 auto-fix primary / gate#2 flag，OV#6 不 reject）。
+    # FE<0.5 -> block 标降级，AI 可不填 playstyle（entry=null）。try/except 防数据源失败卡死 loop。
+    playstyle_block = ""
+    playstyle_feats: dict = {}
+    try:
+        playstyle_block, playstyle_feats = _format_playstyle_block(ts_code)
+    except Exception as e:
+        playstyle_block = f"## 玩法特征\n（加载失败: {type(e).__name__}: {e}）"
+        playstyle_feats = {"completeness": 0.0, "risk_level": None, "features": {}, "notes": [f"FE 异常: {e}"]}
+
     _emit({"type": "context", "name": "history", "content": history_block})
     _emit({"type": "context", "name": "portfolio", "content": portfolio_block})
     _emit({"type": "context", "name": "intraday", "content": intraday_block})
     _emit({"type": "context", "name": "market", "content": market_block})
+    _emit({"type": "context", "name": "playstyle", "content": playstyle_block})
 
     messages = [
         {"role": "system", "content": system},
@@ -1392,6 +1523,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"{portfolio_block}\n\n"
                 f"{intraday_block}\n\n"
                 f"{market_block}\n\n"
+                f"{playstyle_block}\n\n"
                 "步骤：\n"
                 "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"
                 "   先调 get_fundamentals + get_stock_info + get_dragon_tiger_list，\n"
@@ -1758,6 +1890,15 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     now_cn = datetime.now(_TZ_CN)
     # 中文名: 优先 name map(一次拉全量), 兜底 None。写入 journal 供历史列表直接展示。
     stock_name = data.get_name_map().get(ts_code)
+
+    # playstyle: AI 经 record_verdict 填 -> finalize 规整 + 软门控（gate#1 auto-fix / gate#2 flag）。
+    # FE<0.5 -> None；AI 未填但 FE>=0.5 -> Python fallback。compute_playstyle_fit v1 恒 insufficient_data。
+    try:
+        playstyle_value = playstyle.finalize_playstyle(verdict_data.get("playstyle"), playstyle_feats)
+    except Exception:
+        playstyle_value = None
+    playstyle_fit = playstyle.compute_playstyle_fit(playstyle_value)
+
     entry = {
         "ts_code": ts_code,
         "name": stock_name,
@@ -1786,6 +1927,11 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "setup_tag": verdict_data.get("setup_tag"),
         "stock_type": verdict_data.get("stock_type"),
         "valuation_basis": verdict_data.get("valuation_basis"),
+        # ── Playstyle Engine v1（A2 持久化 FE 特征 / D13 risk_level / skill 分支 AI 填 playstyle / T6 契合度脚手架）──
+        "playstyle": playstyle_value,                       # {ratings,primary,secondary,reasons,method,low_confidence} 或 null(FE<0.5)
+        "playstyle_fit": playstyle_fit,                     # v1 恒 insufficient_data（D10，规则 v1.1）
+        "playstyle_features": playstyle_feats,              # FE 10 特征 + completeness + risk_level（A2 可复现/可解释）
+        "risk_level": playstyle_feats.get("risk_level"),    # low/medium/high，与 playstyle 正交（D13）
     }
 
     if save:

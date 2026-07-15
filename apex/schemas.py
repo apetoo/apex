@@ -13,6 +13,10 @@ STOCK_TYPE_ENUM = ["蓝筹白马", "题材游资", "周期股", "成长股", "�
 #   non_valuation     = 估值非主要依据
 VALUATION_BASIS_ENUM = ["forward_valuation", "static_pe_only", "non_valuation"]
 
+# Playstyle Engine v1 玩法 4 档（D9 prototype -> skill 分支：AI 填 ratings/primary/secondary）。
+# schema 是 list，可折叠（Open Q #1）。同步自 apex/playstyle.py PLAYSTYLES。
+PLAYSTYLE_ENUM = ["打野", "波段", "中线", "长线"]
+
 REQUIRED_FEATURE_KEYS = ["ma5_position", "ma20_position", "volume_ratio", "rsi_14"]
 
 SIGNAL_TYPES = ["dragon_tiger", "limit_up", "industry", "northbound", "concept", "limit_up_history", "moneyflow"]

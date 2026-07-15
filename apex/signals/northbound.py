@@ -9,6 +9,7 @@ from typing import Optional
 import pandas as pd
 
 from apex import data
+from apex.per_day_cache import per_day_cache
 from apex.schemas import SignalRecord
 
 
@@ -41,6 +42,7 @@ def _fetch_hk_hold_today() -> Optional[pd.DataFrame]:
     return df
 
 
+@per_day_cache("northbound")
 def fetch(trade_date: str) -> list[SignalRecord]:
     df = _fetch_hk_hold_today()
     if df is None or df.empty or "ts_code" not in df.columns:

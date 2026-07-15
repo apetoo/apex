@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from apex import mx_client as _mx
+from apex.per_day_cache import per_day_cache
 
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
 
@@ -131,6 +132,7 @@ _MF_AMOUNT_COLS = [
 ]
 
 
+@per_day_cache("moneyflow_raw")
 def get_moneyflow(trade_date: str) -> str:
     """全市场个股资金流（大/中/小/超大单净额），返回 JSON 字符串。
 
