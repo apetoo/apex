@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 安全漏洞上报
+    url: https://github.com/apetoo/apex/security/advisories/new
+    about: 发现安全漏洞请走 Security Advisory 私密上报，请勿开公开 Issue。
+  - name: 💬 讨论 / 提问
+    url: https://github.com/apetoo/apex/discussions
+    about: 使用问题或想法讨论请到 Discussions。

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend:
+    name: Frontend (build + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Typecheck & build
+        run: npm run build
+      - name: Unit tests (vitest)
+        run: npm test
+
+  backend:
+    name: Backend (deps + syntax check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax check (apex/ + backend/)
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          errs = []
+          files = [p for p in pathlib.Path('.').rglob('*.py')
+                   if '.venv' not in p.parts and 'node_modules' not in p.parts]
+          for p in files:
+              try:
+                  ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
+              except SyntaxError as e:
+                  errs.append(f"{p}: {e}")
+          if errs:
+              print('\n'.join(errs))
+              sys.exit(1)
+          print(f"OK: parsed {len(files)} Python files")
+          PY
+      # 后端单测部分依赖 tushare token / 网络，暂不进 CI。
+      # 本地请用 `pytest -q` 验证；待测试离线化后再启用此步骤。

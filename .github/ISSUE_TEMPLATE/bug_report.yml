@@ -1,0 +1,61 @@
+name: Bug 报告
+description: 报告一个可复现的 bug
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请先搜索是否已有相同 Issue。
+        ⚠️ 请勿在 Issue 中粘贴真实 API token 或 `config.yaml` 内容。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？预期行为是什么？
+    validations:
+      required: true
+  - type: input
+    id: ts_code
+    attributes:
+      label: 涉及的 ts_code（如适用）
+      placeholder: "002050.SZ"
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: 模块
+      options:
+        - 后端 apex/ 服务层
+        - 后端 backend/ 路由
+        - 前端 frontend/
+        - CLI (main.py)
+        - 自动化 (apex.automation)
+        - 回测 (apex.backtest)
+        - 粗筛 (apex.screener)
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 报错（脱敏后）
+      render: shell
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      placeholder: |
+        - OS:
+        - Python:
+        - Node:
+        - 是否走 mock:
+    validations:
+      required: true
