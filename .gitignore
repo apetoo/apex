@@ -102,3 +102,5 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 .gstack/
+.codegraph/
+.cursor/
