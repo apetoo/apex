@@ -41,6 +41,8 @@ env/
 .env.*.local
 
 # Config files with sensitive data
+# config.yaml 含真实 token，本地用、不提交；首次使用请复制 config.example.yaml
+config.yaml
 config.local.yaml
 *.secret.yaml
 

@@ -1,0 +1,108 @@
+# apex 配置模板 —— 复制本文件为 config.yaml 后填入你自己的 token。
+#   cp config.example.yaml config.yaml
+# config.yaml 已被 .gitignore 忽略，不会进版本库。
+#
+# 取值优先级：YAML 里的值 > 环境变量 > 留空。
+# 即：YAML 留空时回退到环境变量 TUSHARE_TOKEN / DEEPSEEK_API_KEY / BOCHA_API_KEY / MX_APIKEY。
+
+tushare:
+  token: ""                     # tushare.pro 注册获取（或 env TUSHARE_TOKEN）
+
+deepseek:
+  api_key: ""                   # platform.deepseek.com 获取（或 env DEEPSEEK_API_KEY）
+  base_url: "https://api.deepseek.com"   # OpenAI 兼容端点；火山方舟等亦可
+  model: "deepseek-chat"        # deepseek-chat=V3, deepseek-reasoner=R1
+  max_tool_iterations: 12       # AI 工具调用循环上限
+  history_limit: 8              # 分析时注入 prompt 的历史判断条数（降序取最新 N 条）
+
+bocha:
+  api_key: ""                   # web 搜索（或 env BOCHA_API_KEY）
+
+mx:
+  api_key: ""                   # 妙想金融数据 API（或 env MX_APIKEY）
+
+paths:
+  journal_dir: "~/.stock-journal"
+  watchlist_file: "~/.stock-watchlist/watchlist.json"
+  prompt_file: "apex/prompts/expert-persona.md"
+  screener_dir: "~/.stock-journal/screener"
+  screener_prompt_file: "apex/prompts/screener_quick.md"
+
+backtest:
+  lookforward_days: 10
+  min_entries_for_analysis: 5
+  min_review_samples: 8        # AI 复盘最小可成交信号数，不足则不跑(无统计意义) + 不反哺
+  max_inject_age_days: 30      # 复盘 prompt_injection 反哺 analyze 的最大时效(天)，过期不注入
+  oos_test_days: 30            # #7 OOS 验证：最近 N 天信号作 test 集，更早的作 train 派生 weight_hint
+  costs:
+    commission_rate: 0.00025   # 佣金 万2.5（双向）
+    stamp_duty_rate: 0.001     # 印花税 千1（卖出）
+    slippage: 0.001            # 单边滑点 10bp（小盘流动性差，双边 20bp）；vbt from_signals 的 slippage 参数
+
+notify:
+  enabled: true
+  channel: "console"           # console（终端打印）| bark（iOS 推送）
+  bark:
+    base_url: ""               # 例: https://api.day.app/<your-key>/
+
+# 全局 HTTP 代理（影响 DeepSeek/tushare/bocha 等所有出站请求）。
+# 留空则不走代理。新浪行情接口为国内服务，代码中显式 bypass，不受此配置影响。
+# 也可用环境变量 HTTPS_PROXY / HTTP_PROXY 覆盖此值。
+proxy:
+  http_proxy: ""               # 例: http://127.0.0.1:7890
+  https_proxy: ""
+  no_proxy: ""                 # 例: localhost,127.0.0.1,.cn
+
+screener:
+  enabled: true
+  ai_enabled: true             # 关掉则只跑规则层不调 AI
+  ai_model: "deepseek-chat"    # 复用现有 DeepSeek client
+  top_n_for_ai: 15
+  rule_weights:
+    dragon_tiger: 2.0
+    limit_up: 1.8
+    concept: 1.5
+    northbound: 1.2
+    industry: 1.0
+  multi_signal_bonus:          # 命中信号类型数 -> 额外加分
+    "1": 0.0
+    "2": 0.5
+    "3": 1.0
+    "4": 1.5
+    "5": 2.0
+  filters:
+    min_float_mv_yi: 30          # 排除流通市值 < 30 亿（单位：亿元）
+    exclude_st: true              # 排除 ST 股
+    exclude_new_listings_days: 60 # 排除上市 60 天内的新股
+  concurrency: 8
+
+# 持仓推送：apex 主动调用消费方 webhook，把持仓变更推出去。
+# 接口文档见 docs/integration/positions-push-api.md
+# 不设应用层鉴权（明文 JSON）；如需接入控制在消费方网关层做。
+push:
+  enabled: false                                    # 默认关；填好 base_url 后改 true
+  base_url: "http://127.0.0.1:8899/api/apex"        # 消费方 webhook base
+  path: "/positions/push"                           # 拼到 base_url 后；默认 /positions/push
+  timeout_seconds: 10
+  retry:
+    max_attempts: 5                                 # 含首次共 5 次
+    base_seconds: 1                                 # 指数退避基数
+    max_seconds: 60
+  full:
+    cron: "0 16 * * 1-5"                            # 每交易日 16:00 全量对账（占位，cron 调度未实现）
+    on_startup: false                               # apex 启动时先推一次全量
+  incremental:
+    enabled: true                                   # 持仓变更实时推（总开关 push.enabled=false 时仍不发）
+  log_file: "~/.stock-journal/push_log.jsonl"       # 推送审计日志（落盘，供 replay/排障）
+
+# 自动撮合（模拟实盘）：apex.automation --auto-trade 模式用。
+# enabled=false 时 task_auto_trade/task_screener_and_promote 跳过（本地人工环境保持 false）；
+# 服务器部署改 true + cron 每交易日 ~18:30 跑 `python -m apex.automation --auto-trade`
+# （tushare 当日日线 ~17:00 后才更新，故晚于收盘跑）。
+# 成交价=trigger_price（写死保口径一致）；T+1；单只失败不中断；幂等靠状态机。
+# 已知简化：涨跌停/除权未还原，首版接受。
+auto_trade:
+  enabled: false
+  top_n_picks: 5               # 粗筛后分析几只（按 ai_score 降序）
+  holding_period_days: 10      # 持有期满强制平仓（exit_reason=expired）
+  bullish_verdicts: ["看多", "偏多"]   # 哪些 verdict 入候选（不含"观望偏多"--历史胜率 12.5% 太低）
