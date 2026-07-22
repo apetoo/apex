@@ -1,11 +1,63 @@
+<div align="center">
+
 # apex - A股 AI 交易闭环系统
 
-个人 A 股量化工具：DeepSeek AI 分析 + 持仓追踪 + vectorbt 回测 + 盘后粗筛 + 模拟实盘自动化。单用户工具，文件存储。
+个人 A 股量化工具：DeepSeek AI 分析 + 持仓追踪 + vectorbt 回测 + 盘后粗筛 + 模拟实盘自动化。
+
+![license](https://img.shields.io/badge/license-MIT-blue.svg)
+![python](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)
+![node](https://img.shields.io/badge/node-18%2B-339933.svg)
+![react](https://img.shields.io/badge/React-19-61DAFB.svg)
+![fastapi](https://img.shields.io/badge/FastAPI-backend-009688.svg)
+![status](https://img.shields.io/badge/status-personal%20project-orange.svg)
+
+</div>
+
+> ⚠️ **免责声明**：本项目仅供学习研究与技术交流，**不构成任何投资建议**。A 股投资有风险，使用者需独立判断并自行承担一切交易后果。本项目按「现状」提供，不提供任何明示或暗示的担保。详见文末[完整免责声明](#完整免责声明)。
+
+---
+
+## 简介
+
+apex 是一套面向个人投资者的 A 股交易闭环系统，把「AI 分析 → 候选追踪 → 实盘建仓 → 收盘复盘 → 校准反哺」串成一条可回测、可审计的链路。单用户工具，文件存储，无数据库。
 
 解耦三层架构：
-- **`apex/`** — 服务层（数据 / 分析 / 回测 / 筛选 / 自动化），无框架、无 DB
+
+- **`apex/`** — 服务层（数据 / 分析 / 回测 / 筛选 / 自动化 / 情绪面 / 散户画像 / 玩法判定），无框架、无 DB
 - **`backend/`** — FastAPI 薄路由层，挂在 `apex.*` 之上，统一 `/api` 前缀
 - **`frontend/`** — Vite + React UI（雪球风，红涨绿跌），走 `/api` 调后端
+
+## 特性
+
+- 🤖 **AI 分析闭环**：DeepSeek（OpenAI 兼容）函数调用，强制 4 类网搜（财报 / 股东 / 监管 / 资金面）打底，verdict + 嵌套价格建议 + 证据链，写入 append-only journal
+- 📡 **流式分析**：SSE 实时回放工具调用 trace，前端自写 `useSSE`（避免自动重连导致重复分析 / 重复写盘）
+- 📊 **vectorbt 回测**：每个看多信号一个 `Portfolio.from_signals`，真实佣金 / 印花税 / 滑点扣减，含生存者偏差 / 基准错配 / OOS 反过拟合等可信度修复
+- 🧹 **盘后粗筛**：龙虎榜 / 涨停 / 概念 / 北向 / 行业多策略规则层 + 可选 AI 二次综合，权重滑块本地保存
+- 🤖 **模拟实盘自动化**：盘后 OHLC 回放撮合（T+1、成交价=触发价、状态机幂等），cron 友好
+- 📈 **分时看板**：腾讯分时源（7 只 0.19s），明文不限流；个股分时特征预注入 prompt（不让 AI 决定调不调）
+- 🌡️ **市场情绪面**：东财 4 池子 → 三维度 score + regime + market_style，注入式（非 AI 工具）
+- 🧑‍🤝‍🧑 **散户画像 / 玩法判定**：千股千评先验层 + 标的玩法（打野/波段/中线/长线）+ 玩家契合度三态
+- 📋 **持仓 / 候选 / 归档**：candidate → position 流程（分析不直接建仓），软删除，收盘触发 AI 复盘 + 重新校准
+- 🛡️ **守规与样本门控**：双层守规（ADR-0001）+ 样本门控披露（ADR-0002），`/system` 页可视化「我的交易系统」
+
+## 快速开始
+
+```bash
+# 1. 克隆 + 配置
+git clone https://github.com/apetoo/apex.git
+cd apex
+cp config.example.yaml config.yaml   # 填入你的 tushare / deepseek / bocha token
+
+# 2. 后端
+uv venv && source .venv/bin/activate
+uv pip install -r requirements.txt
+uvicorn backend.main:app --reload --port 8000
+
+# 3. 前端（另开终端）
+cd frontend && npm install && VITE_USE_MOCK=0 npm run dev
+```
+
+> 需要自备 [tushare](https://tushare.pro/) token 与 [DeepSeek](https://platform.deepseek.com/) API Key。详见[配置](#三配置)。
 
 ---
 
@@ -61,7 +113,11 @@ npm install
 
 ## 三、配置
 
-编辑仓库根目录的 **`config.yaml`**（启动时由 `apex.config.load()` 读一次，缓存为模块单例）。
+复制模板并编辑 **`config.yaml`**（已被 `.gitignore` 忽略，不会进版本库；启动时由 `apex.config.load()` 读一次，缓存为模块单例）：
+
+```bash
+cp config.example.yaml config.yaml
+```
 
 ### Token / API Key
 
@@ -118,7 +174,7 @@ notify:
   enabled: true
   channel: "console"          # console（终端打印）| bark（iOS 推送）
   bark:
-    base_url: "https://api.day.app/<your-key>/"
+    base_url: ""              # 例: https://api.day.app/<your-key>/
 ```
 
 ### 代理（可选）
@@ -159,7 +215,7 @@ apex 主动调消费方 webhook，把持仓变更推出去（接口文档见 `do
 
 ```yaml
 push:
-  enabled: true
+  enabled: false                       # 默认关；填好 base_url 后改 true
   base_url: "http://127.0.0.1:8899/api/apex"
   path: "/positions/push"
   incremental:
@@ -252,7 +308,7 @@ python main.py screener
 python main.py screener --rule-only --top-n 20
 ```
 
-> **ts_code 规范**：系统内部一律用带交易所后缀的形式（首 digit 决定：6→SH、0/3→SZ、4/8→BJ）。所有 API 入口都会先过 `data.normalize_ts_code()`；CLI 手输时最好直接带后缀。
+> **ts_code 规范**：系统内部一律用带交易所后缀的形式（首 digit 决定：6->SH、0/3->SZ、4/8->BJ）。所有 API 入口都会先过 `data.normalize_ts_code()`；CLI 手输时最好直接带后缀。
 
 ---
 
@@ -291,9 +347,9 @@ python -m apex.automation --status
 
 需 `config.auto_trade.enabled=true`，否则跳过。流程：
 
-1. **先平仓**：`entry_date < 今日` 的持仓，用今日 OHLC 判止损 / 止盈 / 到期（同日同时触及止损止盈 → 保守按先止损）。今日新 promote 的不判（T+1）。
+1. **先平仓**：`entry_date < 今日` 的持仓，用今日 OHLC 判止损 / 止盈 / 到期（同日同时触及止损止盈 -> 保守按先止损）。今日新 promote 的不判（T+1）。
 2. **再 promote**：候选用今日 OHLC 判触发，命中则按 `trigger_price` 成交，止损 / 目标缺省用 `entry×0.93 / ×1.10` 兜底。
-3. **粗筛入候选**：screener 取 top N → 逐个 analyze → verdict ∈ bullish_verdicts 且不重复 → `add_candidate`。
+3. **粗筛入候选**：screener 取 top N -> 逐个 analyze -> verdict ∈ bullish_verdicts 且不重复 -> `add_candidate`。
 
 > tushare 当日日线约 17:00 后才更新，故撮合走 **cron 不走 loop**（loop 的 15:30 postmarket 会跑空）。
 
@@ -361,7 +417,7 @@ apex/
 │   ├── integration/      # 持仓推送 API 文档
 │   └── adr/              # 架构决策记录
 ├── tests/                # pytest 单测
-├── config.yaml           # 配置（token / 路径 / 回测 / 通知 / 代理 / 粗筛 / 推送 / 自动撮合）
+├── config.example.yaml   # 配置模板（复制为 config.yaml 后填 token）
 ├── requirements.txt      # Python 依赖清单
 ├── pyproject.toml        # uv 项目元信息（requires-python >=3.12）
 └── main.py               # CLI 入口（click）
@@ -369,7 +425,47 @@ apex/
 
 ## 十、关键约定
 
-- **交易流程：candidate → position**，不是 analysis → position。AI verdict 常建议尚未触及的进场价，故分析不直接建仓：`add_candidate(trigger_price=AI建议进场价)` → 实际成交后 `promote_candidate(entry_price=实际成交价)`。
+- **交易流程：candidate -> position**，不是 analysis -> position。AI verdict 常建议尚未触及的进场价，故分析不直接建仓：`add_candidate(trigger_price=AI建议进场价)` -> 实际成交后 `promote_candidate(entry_price=实际成交价)`。
 - **软删除**：watchlist 不做硬删，归档项的 `status` 字段记录原因（`archived_manual` / `archived_replaced` / `archived_promoted` / `archived_dedup` / `expired`）。
 - **收盘触发复盘 + 重新校准**：`close_position` 写平仓记录后，后端跑 `postmortem.run_and_patch`（AI 诊断）+ `calibration.compute()`。
 - **实时 vs 日线**：`get_realtime_price`（新浪，盘中）为主，`get_latest_price`（tushare 日线收盘）为停牌 / 失败回退。
+
+更多架构细节与设计取舍见 [`CLAUDE.md`](CLAUDE.md)（贡献者必读）与 [`docs/adr/`](docs/adr/)。
+
+---
+
+## 致谢与数据来源
+
+本项目站在以下服务 / 开源项目的肩膀上：
+
+- [tushare](https://tushare.pro/) — 日线 / 龙虎榜 / 北向等结构化数据
+- [akshare](https://github.com/akfamily/akshare) — 日线 fallback
+- 新浪财经 / 腾讯财经 — 实时与分时行情
+- [博查 Bocha](https://open.bochaai.com/) — AI 强制网搜
+- [DeepSeek](https://www.deepseek.com/) — 分析 / 复盘 / 粗筛 LLM
+- [vectorbt](https://github.com/polakowo/vectorbt) — 回测引擎
+- [FastAPI](https://fastapi.tiangolo.com/) / [Vite](https://vitejs.dev/) / [React](https://react.dev/) / [TanStack Query](https://tanstack.com/query) / [lightweight-charts](https://github.com/tradingview/lightweight-charts)
+
+## 路线图
+
+进行中与推迟的事项见 [`TODOS.md`](TODOS.md)。
+
+## 贡献
+
+欢迎提 Issue / PR。开发环境搭建、提交规范、PR 流程见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。请先阅读[行为准则](CODE_OF_CONDUCT.md)。
+
+发现安全漏洞请按 [`SECURITY.md`](SECURITY.md) 私下上报，请勿直接开公开 Issue。
+
+## 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源。Copyright (c) 2026 wanmingyu。
+
+---
+
+## 完整免责声明
+
+1. 本项目（apex）仅供学习研究、技术交流与量化方法验证，**不构成任何形式的投资建议、理财建议或交易指令**。
+2. 证券投资有风险，过往回测表现不代表未来收益。本项目中的 AI 判断、回测结果、粗筛信号均可能存在错误或偏差，使用者须独立判断并自行承担一切交易后果与损失。
+3. 本项目按「现状」（AS IS）提供，作者不提供任何明示或暗示的担保，不对因使用本项目而产生的任何直接或间接损失负责。
+4. 使用本项目接入的任何第三方数据源 / API（tushare、akshare、新浪、腾讯、博查、DeepSeek 等）时，需自行遵守其服务条款与配额限制；因密钥泄露或违规使用造成的后果由使用者自行承担。
+5. 请遵守所在地法律法规。使用者应自行判断相关行为（如自动化交易、数据爬取）的合规性。
