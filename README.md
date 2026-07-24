@@ -19,13 +19,13 @@
 
 ## 简介
 
-apex 是一套面向个人投资者的 A 股交易闭环系统，把「AI 分析 → 候选追踪 → 实盘建仓 → 收盘复盘 → 校准反哺」串成一条可回测、可审计的链路。单用户工具，文件存储，无数据库。
+apex 是一套面向个人投资者的 A 股交易闭环系统，把「AI 分析 -> 候选追踪 -> 实盘建仓 -> 收盘复盘 -> 校准反哺」串成一条可回测、可审计的链路。单用户工具，文件存储，无数据库。
 
 解耦三层架构：
 
-- **`apex/`** — 服务层（数据 / 分析 / 回测 / 筛选 / 自动化 / 情绪面 / 散户画像 / 玩法判定），无框架、无 DB
-- **`backend/`** — FastAPI 薄路由层，挂在 `apex.*` 之上，统一 `/api` 前缀
-- **`frontend/`** — Vite + React UI（雪球风，红涨绿跌），走 `/api` 调后端
+- **`apex/`** - 服务层（数据 / 分析 / 回测 / 筛选 / 自动化 / 情绪面 / 散户画像 / 玩法判定），无框架、无 DB
+- **`backend/`** - FastAPI 薄路由层，挂在 `apex.*` 之上，统一 `/api` 前缀
+- **`frontend/`** - Vite + React UI（雪球风，红涨绿跌），走 `/api` 调后端
 
 ## 特性
 
@@ -35,10 +35,11 @@ apex 是一套面向个人投资者的 A 股交易闭环系统，把「AI 分析
 - 🧹 **盘后粗筛**：龙虎榜 / 涨停 / 概念 / 北向 / 行业多策略规则层 + 可选 AI 二次综合，权重滑块本地保存
 - 🤖 **模拟实盘自动化**：盘后 OHLC 回放撮合（T+1、成交价=触发价、状态机幂等），cron 友好
 - 📈 **分时看板**：腾讯分时源（7 只 0.19s），明文不限流；个股分时特征预注入 prompt（不让 AI 决定调不调）
-- 🌡️ **市场情绪面**：东财 4 池子 → 三维度 score + regime + market_style，注入式（非 AI 工具）
+- 🌡️ **市场情绪面**：东财 4 池子 -> 三维度 score + regime + market_style，注入式（非 AI 工具）
 - 🧑‍🤝‍🧑 **散户画像 / 玩法判定**：千股千评先验层 + 标的玩法（打野/波段/中线/长线）+ 玩家契合度三态
-- 📋 **持仓 / 候选 / 归档**：candidate → position 流程（分析不直接建仓），软删除，收盘触发 AI 复盘 + 重新校准
+- 📋 **持仓 / 候选 / 归档**：candidate -> position 流程（分析不直接建仓），软删除，收盘触发 AI 复盘 + 重新校准
 - 🛡️ **守规与样本门控**：双层守规（ADR-0001）+ 样本门控披露（ADR-0002），`/system` 页可视化「我的交易系统」
+- 🔌 **MCP 接入**：内置 MCP server（stdio），让 Claude Code / Codex / Cursor 等外部 agent 远程读 watchlist / journal / 行情，执行加候选 / 转持仓 / 平仓 / 分析 / 粗筛 / 回测
 
 ## 快速开始
 
@@ -65,7 +66,7 @@ cd frontend && npm install && VITE_USE_MOCK=0 npm run dev
 
 - **Python ≥ 3.12**
 - **Node.js ≥ 18**（前端）
-- **[uv](https://docs.astral.sh/uv/)** — 推荐的 Python 环境与依赖管理工具
+- **[uv](https://docs.astral.sh/uv/)** - 推荐的 Python 环境与依赖管理工具
 
 安装 uv（已装可跳过）：
 
@@ -364,7 +365,42 @@ python -m apex.automation --status
 
 ---
 
-## 七、数据存储
+## 七、MCP 接入（让外部 Agent 指挥 apex）
+
+apex 内置 MCP server（`apex/mcp_server.py`，stdio），让 Claude Code / Codex / Cursor 等外部 agent 远程读 watchlist / journal / 行情并执行交易动作。
+
+```bash
+uv pip install -e .
+```
+
+在 MCP 客户端配置中加入（`command` 必须是**绝对路径**--Claude Code 不按项目根解析相对路径，相对路径会 `ENOENT`）：
+
+```json
+{
+  "mcpServers": {
+    "apex-trader": {
+      "command": "/Users/<you>/path/to/apex/.venv/bin/python",
+      "args": ["-m", "apex.mcp_server"]
+    }
+  }
+}
+```
+
+### 工具列表
+
+| Tool | 说明 |
+|---|---|
+| `add_candidate` | 加候选（等触发买入），`trigger_price` = AI 建议入场价；同 ts_code 已有则 upsert |
+| `promote_candidate` | 候选转持仓（用**实际成交价**），先验重再 archive 候选，失败不留半截状态 |
+| `close_position` | 平仓，`postmortem=true` 默认串联 AI 复盘 + 校准重算 |
+| `archive_entry` | 软删除（写 `status=archived_<reason>`） |
+| `analyze_stock` | 跑一次 DeepSeek 个股分析（**阻塞，可能数分钟**），verdict 写 journal |
+| `run_screener` | 跑今日盘后粗筛（**阻塞，开 AI 时数分钟**） |
+| `run_backtest` | 信号模拟回测（看多 verdict -> T+1 开盘入场，逐笔 P&L） |
+
+---
+
+## 八、数据存储
 
 全部在 `$HOME` 下（仓库内无数据），便于备份 / 迁移：
 
@@ -385,7 +421,7 @@ tar -czf apex-data-$(date +%Y%m%d).tar.gz ~/.stock-watchlist ~/.stock-journal
 
 ---
 
-## 八、生产部署
+## 九、生产部署
 
 前端 build + nginx 反代 + systemd 管 uvicorn，详见 **[`docs/deploy/README.md`](docs/deploy/README.md)**。要点：
 
@@ -405,7 +441,7 @@ sudo systemctl restart apex-backend
 
 ---
 
-## 九、目录结构
+## 十、目录结构
 
 ```
 apex/
@@ -419,11 +455,12 @@ apex/
 ├── tests/                # pytest 单测
 ├── config.example.yaml   # 配置模板（复制为 config.yaml 后填 token）
 ├── requirements.txt      # Python 依赖清单
-├── pyproject.toml        # uv 项目元信息（requires-python >=3.12）
+├── pyproject.toml        # uv 项目元信息 + 包发现（editable 安装用）
+├── .mcp.json             # Claude Code 的 MCP server 配置（项目级，随仓库走）
 └── main.py               # CLI 入口（click）
 ```
 
-## 十、关键约定
+## 十一、关键约定
 
 - **交易流程：candidate -> position**，不是 analysis -> position。AI verdict 常建议尚未触及的进场价，故分析不直接建仓：`add_candidate(trigger_price=AI建议进场价)` -> 实际成交后 `promote_candidate(entry_price=实际成交价)`。
 - **软删除**：watchlist 不做硬删，归档项的 `status` 字段记录原因（`archived_manual` / `archived_replaced` / `archived_promoted` / `archived_dedup` / `expired`）。
@@ -438,12 +475,12 @@ apex/
 
 本项目站在以下服务 / 开源项目的肩膀上：
 
-- [tushare](https://tushare.pro/) — 日线 / 龙虎榜 / 北向等结构化数据
-- [akshare](https://github.com/akfamily/akshare) — 日线 fallback
-- 新浪财经 / 腾讯财经 — 实时与分时行情
-- [博查 Bocha](https://open.bochaai.com/) — AI 强制网搜
-- [DeepSeek](https://www.deepseek.com/) — 分析 / 复盘 / 粗筛 LLM
-- [vectorbt](https://github.com/polakowo/vectorbt) — 回测引擎
+- [tushare](https://tushare.pro/) - 日线 / 龙虎榜 / 北向等结构化数据
+- [akshare](https://github.com/akfamily/akshare) - 日线 fallback
+- 新浪财经 / 腾讯财经 - 实时与分时行情
+- [博查 Bocha](https://open.bochaai.com/) - AI 强制网搜
+- [DeepSeek](https://www.deepseek.com/) - 分析 / 复盘 / 粗筛 LLM
+- [vectorbt](https://github.com/polakowo/vectorbt) - 回测引擎
 - [FastAPI](https://fastapi.tiangolo.com/) / [Vite](https://vitejs.dev/) / [React](https://react.dev/) / [TanStack Query](https://tanstack.com/query) / [lightweight-charts](https://github.com/tradingview/lightweight-charts)
 
 ## 路线图

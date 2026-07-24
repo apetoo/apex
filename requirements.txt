@@ -13,6 +13,10 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 sse-starlette>=2.0
 
+# ── Agent Skill / MCP ─────────────────────────────────────────────────────
+# apex MCP server（让 Codex/Claude/OpenClaw 远程指挥 apex）。跑法见 README「七、MCP 接入」。
+fastmcp>=3.0.0
+
 # ── 测试 ──────────────────────────────────────────────────────────────────
 pytest>=8.0.0
 
