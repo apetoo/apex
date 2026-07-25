@@ -47,7 +47,7 @@ def _send_bark(title: str, body: str, url: str, cfg: dict) -> bool:
     safe_body = urllib.parse.quote(body, safe="")
     api_url = f"{base}/{safe_title}/{safe_body}"
 
-    params = {"group": "apex"}
+    params = {"group": cfg.get("group") or "apex"}
     if url:
         params["url"] = url
     api_url += "?" + urllib.parse.urlencode(params)

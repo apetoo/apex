@@ -176,6 +176,7 @@ notify:
   channel: "console"          # console（终端打印）| bark（iOS 推送）
   bark:
     base_url: ""              # 例: https://api.day.app/<your-key>/
+    group: "apex"            # bark 通知分组名,同组通知在通知中心折叠
 ```
 
 ### 代理（可选）

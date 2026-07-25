@@ -44,6 +44,7 @@ notify:
   channel: "console"           # console（终端打印）| bark（iOS 推送）
   bark:
     base_url: ""               # 例: https://api.day.app/<your-key>/
+    group: "apex"              # bark 通知分组名,同组通知在通知中心折叠
 
 # 全局 HTTP 代理（影响 DeepSeek/tushare/bocha 等所有出站请求）。
 # 留空则不走代理。新浪行情接口为国内服务，代码中显式 bypass，不受此配置影响。
