@@ -1,7 +1,9 @@
 export { PriceTag } from "./PriceTag";
 export { VerdictTag } from "./VerdictTag";
+export { PositionActionTag } from "./PositionActionTag";
 export { MarketIndexBar } from "./MarketIndexBar";
 export { CompactPositionCard } from "./CompactPositionCard";
+export { ScalePlanLadder } from "./ScalePlanLadder";
 export { CompactCandidateCard } from "./CompactCandidateCard";
 export { AnalyzeTraceStream } from "./AnalyzeTraceStream";
 export { TraceEventList } from "./TraceEventList";

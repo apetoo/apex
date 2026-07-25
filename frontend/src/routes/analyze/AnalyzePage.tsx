@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { History, Search, ChevronRight, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/base";
-import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PriceTag, TraceEventList } from "@/components/a-share";
+import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PositionActionTag, PriceTag, TraceEventList } from "@/components/a-share";
 import { getJournal, getTrace } from "@/api/analyze";
 import { getPrices, getDailyPrices, getStockInfo } from "@/api/market";
 import { qk } from "@/api/query-keys";
@@ -114,12 +114,20 @@ export function AnalyzePage() {
   // 把当前分析的 verdict 摘要注入 chat 上下文(ED2)
   useEffect(() => {
     if (latestVerdict && committedCode) {
+      const isPa = latestVerdict.source === "position_action";
+      const paAction = (latestVerdict.position_action ?? {}) as Record<string, unknown>;
       const pa = (latestVerdict.price_advice ?? {}) as Record<string, unknown>;
-      const summary = [
-        `标的: ${committedCode}`,
-        `最新 verdict: ${latestVerdict.verdict ?? "—"} (置信度 ${latestVerdict.confidence ?? "—"})`,
-        `入场: ${pa.entry ?? "—"} / 止损: ${pa.stop_loss ?? "—"} / 目标: ${pa.target ?? "—"}`,
-      ].join("\n");
+      const summary = isPa
+        ? [
+            `标的: ${committedCode}`,
+            `最新持仓建议: ${paAction.action ?? "-"} (新止损 ${paAction.new_stop ?? "维持"})`,
+            String(paAction.rationale ?? latestVerdict.analysis_text ?? ""),
+          ].join("\n")
+        : [
+            `标的: ${committedCode}`,
+            `最新 verdict: ${latestVerdict.verdict ?? "-"} (置信度 ${latestVerdict.confidence ?? "-"})`,
+            `入场: ${pa.entry ?? "-"} / 止损: ${pa.stop_loss ?? "-"} / 目标: ${pa.target ?? "-"}`,
+          ].join("\n");
       setContext(summary);
     }
   }, [latestVerdict, committedCode, setContext]);
@@ -230,6 +238,8 @@ export function AnalyzePage() {
                 {journal.data.map((entry: unknown, i: number) => {
                   const e = entry as Record<string, unknown>;
                   const pa = (e.price_advice ?? {}) as Record<string, unknown>;
+                  const isPa = e.source === "position_action";
+                  const paAction = (e.position_action ?? {}) as Record<string, unknown>;
                   const at = String(e.analyzed_at ?? "");
                   const isOpen = expandedAt === at;
                   return (
@@ -254,14 +264,27 @@ export function AnalyzePage() {
                           </div>
                         </div>
                         <div className="ml-3 flex-shrink-0 text-right">
-                          <VerdictTag verdict={String(e.verdict ?? "")} />
-                          <p className="num mt-0.5 text-xs text-text-secondary">
-                            置信度 {String(e.confidence ?? "—")}
-                          </p>
-                          {pa.entry !== undefined && (
-                            <p className="num text-[11px] text-flat">
-                              入 {String(pa.entry)} · 止 {String(pa.stop_loss)} · 目 {String(pa.target)}
-                            </p>
+                          {isPa ? (
+                            <>
+                              <PositionActionTag action={String(paAction.action ?? "")} />
+                              {paAction.new_stop != null && (
+                                <p className="num mt-0.5 text-xs text-text-secondary">
+                                  止损 {String(paAction.new_stop)}
+                                </p>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              <VerdictTag verdict={String(e.verdict ?? "")} />
+                              <p className="num mt-0.5 text-xs text-text-secondary">
+                                置信度 {String(e.confidence ?? "-")}
+                              </p>
+                              {pa.entry !== undefined && (
+                                <p className="num text-[11px] text-flat">
+                                  入 {String(pa.entry)} · 止 {String(pa.stop_loss)} · 目 {String(pa.target)}
+                                </p>
+                              )}
+                            </>
                           )}
                         </div>
                       </button>

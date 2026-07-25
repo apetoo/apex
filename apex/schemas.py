@@ -118,6 +118,52 @@ class RepeatAnalysisSchema(TypedDict, total=False):
     raw_confidence: int              # AI 原始置信度（限幅前）
 
 
+# 持仓生命周期建议层（v1.1.0 B1）：已持仓票重新分析时, AI 产出加减仓建议而非重入场 verdict。
+# position_action 是独立 journal record kind（source=POSITION_ACTION_SOURCE）, 不污染 calibration/backtest
+# （calibration 评分入场方向 call、backtest 吃 bullish 入场信号, "加 300 股"既非方向 call 也非入场信号）。
+POSITION_ACTION_SOURCE = "position_action"
+
+# ladder 单档：加仓/减仓触发计划的一级。B3 sim 在每日 OHLC 上撮合, executed 标记防同档每 bar 重触发。
+# 一根 bar 最多执行一个动作（优先级 stop_loss exit > trim > add）, 执行价 = trigger_price（对齐 auto-loop fill_price=trigger）。
+class ScalePlanItemSchema(TypedDict, total=False):
+    level: int                    # 1=首加/首减, 2=二加...
+    trigger_price: float          # 触发价; B3 执行价 = 此值
+    action: Literal["add", "trim"]
+    shares: Optional[int]         # 加仓/减仓股数
+    pct: Optional[float]          # 减仓比例 0-1（trim 时 shares/pct 二选一）
+    new_stop: Optional[float]     # 触发后止损上移到（advisory, B1 只建议）
+    reason: str
+    executed: Optional[bool]      # B3 触发后标记 True; 缺省视为 False（未触发）
+
+
+class PositionActionSchema(TypedDict, total=False):
+    """已持仓票的加减仓建议（source=POSITION_ACTION_SOURCE 的 journal record）。
+
+    action=add 必填 add_shares>0; action=trim 二选一 trim_shares/trim_pct;
+    action=exit/hold 可只给 new_stop。scale_plan 给完整 ladder; rationale 是机器可读摘要,
+    AI 推理全文进 analysis_text。B1 不含 rule_guards（无规则引擎, 字段恒空是死 schema, B2 规则引擎落地时加回）。
+    """
+    action: Literal["hold", "add", "trim", "exit"]
+    add_shares: Optional[int]     # action=add 必填, >0
+    trim_shares: Optional[int]    # action=trim 二选一
+    trim_pct: Optional[float]     # action=trim 二选一（0-1）
+    new_stop: Optional[float]     # 止损上移建议（add/hold 常带）
+    scale_plan: list              # ScalePlanItemSchema[], 完整 ladder 计划
+    rationale: str                # 机器可读摘要
+
+
+class PositionPlanSchema(TypedDict, total=False):
+    """持仓 ladder 快照（存于 active_positions.plan）。生于开仓（空 ladder, 锚定当前 stop/target）,
+    每次重新分析 AI 演进（非替换）, 死于平仓（close_position null 掉防同 ts_code 重开读陈旧）。B3 sim 消费执行。"""
+    scale_plan: list              # ScalePlanItemSchema[]
+    doctrine: str                 # B1 单一默认 'single_v1'; B2 按 playstyle 分桶
+    updated_at: Optional[str]     # 最后一次 position_action 刷新时间
+    # B1 增强：最近一次 position_action 快照（供持仓卡显示"现在 vs 未来"，区分当前决策与条件触发计划）
+    last_action: Optional[str]        # hold/add/trim/exit
+    last_new_stop: Optional[float]    # AI 建议新止损（None=不动）
+    last_stop_before: Optional[float] # position_action 时的旧止损（update_plan 从持仓 stop_lock 补, race-free）
+
+
 class JournalEntry(TypedDict, total=False):
     ts_code: str
     date: str
@@ -133,3 +179,4 @@ class JournalEntry(TypedDict, total=False):
     setup_tag: Optional[str]   # ADR-0001: AI 预填的交易原型（SETUP_SEED 之一或自定义），供 candidate/promote 继承
     stock_type: Optional[str]  # 步骤 0 声明的标的类型（STOCK_TYPE_ENUM 之一），驱动成长股静态 PE 偏空门控
     valuation_basis: Optional[str]  # 偏空类空头估值依据分类（VALUATION_BASIS_ENUM 之一），审计用
+    position_action: Optional[PositionActionSchema]  # v1.1.0: 已持仓票加减仓建议（source=POSITION_ACTION_SOURCE kind; verdict/price_advice/features 全 None）

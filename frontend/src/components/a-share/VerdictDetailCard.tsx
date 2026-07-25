@@ -3,6 +3,8 @@ import { Sparkles, Target, ShieldAlert, Flag, ListChecks, Gauge, Trophy } from "
 import { Card, CardContent, CardHeader, CardTitle, Markdown, Button } from "@/components/base";
 import { VerdictTag } from "./VerdictTag";
 import { AddCandidateDialog } from "./AddCandidateDialog";
+import { ScalePlanLadder } from "./ScalePlanLadder";
+import type { ScalePlanItem } from "@/api/watchlist";
 import { cn, formatPrice } from "@/lib/utils";
 
 /**
@@ -23,6 +25,11 @@ export function fmtPrice(v: unknown): string {
 
 export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown> }) {
   const [addOpen, setAddOpen] = useState(false);
+  // v1.1.0: position_action 走专属持仓建议卡（当前决策 + 条件触发计划），不渲染 verdict 三宫格。
+  // useState 提前无条件调用，避免 held/unheld 切换时 hooks 数量变化（同组件实例跨分支）。
+  if (verdict.source === "position_action") {
+    return <PositionActionDetailCard verdict={verdict} />;
+  }
   const pa = (verdict.price_advice ?? {}) as Record<string, unknown>;
   const evidence = Array.isArray(verdict.evidence) ? (verdict.evidence as unknown[]) : [];
   const analysisText = typeof verdict.analysis_text === "string" ? verdict.analysis_text : "";
@@ -291,5 +298,99 @@ function PlaystyleSection({
         </p>
       )}
     </div>
+  );
+}
+
+// ── v1.1.0: 持仓建议卡（source=position_action 的 journal entry 专用） ──────────
+// 与 VerdictDetailCard 区别：当前决策(action) + 条件触发计划(scale_plan) + 判断理由(rationale)，
+// 无入场/目标/证据链（verdict 字段全 None）。playstyle 仍渲染（股票客观属性，从最近 verdict 继承）。
+// "现在 vs 未来"：当前建议=现在做什么；条件触发计划=价格触及才执行的 ladder。
+const ACTION_META: Record<string, { label: string; tone: string; sub: string }> = {
+  hold: { label: "持有", tone: "text-text-primary", sub: "不加不减" },
+  add: { label: "加仓", tone: "text-up", sub: "" },
+  trim: { label: "减仓", tone: "text-down", sub: "" },
+  exit: { label: "清仓", tone: "text-down", sub: "全部离场" },
+};
+
+function PositionActionDetailCard({ verdict }: { verdict: Record<string, unknown> }) {
+  const pa = (verdict.position_action ?? {}) as {
+    action?: string;
+    add_shares?: number | null;
+    trim_shares?: number | null;
+    trim_pct?: number | null;
+    new_stop?: number | null;
+    scale_plan?: ScalePlanItem[];
+    rationale?: string;
+  };
+  const analysisText = typeof verdict.analysis_text === "string" ? verdict.analysis_text : "";
+  const playstyle = verdict.playstyle as
+    | { ratings?: Record<string, number>; primary?: string; secondary?: string; reasons?: string[]; low_confidence?: boolean }
+    | null;
+  const playstyleFit = verdict.playstyle_fit as { state?: string; note?: string } | null;
+  const riskLevel = typeof verdict.risk_level === "string" ? (verdict.risk_level as string) : null;
+
+  const action = pa.action ?? "hold";
+  const meta = ACTION_META[action] ?? ACTION_META.hold;
+  let sub = meta.sub;
+  if (!sub) {
+    if (action === "add" && pa.add_shares != null) sub = `+${pa.add_shares}股`;
+    else if (action === "trim" && pa.trim_shares != null) sub = `-${pa.trim_shares}股`;
+    else if (action === "trim" && pa.trim_pct != null) sub = `-${Math.round(pa.trim_pct * 100)}%`;
+  }
+  const analyzedAt = typeof verdict.analyzed_at === "string" ? (verdict.analyzed_at as string).slice(5, 16) : "";
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-up" />
+          <CardTitle>持仓建议</CardTitle>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={cn("rounded px-1.5 py-0.5 text-xs font-medium", meta.tone)}>{meta.label}</span>
+          {analyzedAt && <span className="num text-xs text-text-secondary">{analyzedAt}</span>}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4 pt-0">
+        {/* 当前决策（现在）：action + 新止损 */}
+        <div className="grid grid-cols-2 gap-3">
+          <div className="rounded-md border border-border p-3">
+            <div className="text-xs text-text-secondary">当前建议（现在）</div>
+            <p className={cn("num mt-1 text-lg font-semibold", meta.tone)}>{meta.label}</p>
+            {sub && <p className="text-[10px] text-flat">{sub}</p>}
+          </div>
+          <div className="rounded-md border border-border p-3">
+            <div className="text-xs text-text-secondary">新止损</div>
+            <p className={cn("num mt-1 text-lg font-semibold", pa.new_stop != null ? "text-down" : "text-flat")}>
+              {pa.new_stop != null ? fmtPrice(pa.new_stop) : "维持"}
+            </p>
+          </div>
+        </div>
+
+        {/* 玩法判定（从最近 verdict 继承的股票客观属性，持仓期稳定） */}
+        <PlaystyleSection playstyle={playstyle} playstyleFit={playstyleFit} riskLevel={riskLevel} />
+
+        {/* 条件触发计划（未来）：价格触及才执行，非现役指令 */}
+        {pa.scale_plan && pa.scale_plan.length > 0 ? (
+          <ScalePlanLadder items={pa.scale_plan} title="条件触发计划（价格触及才执行）" showReason />
+        ) : null}
+
+        {/* 判断理由（机器可读摘要） */}
+        {pa.rationale && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">判断理由</div>
+            <Markdown>{pa.rationale}</Markdown>
+          </div>
+        )}
+
+        {/* AI 叙述全文 */}
+        {analysisText && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">AI 分析</div>
+            <Markdown>{analysisText}</Markdown>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

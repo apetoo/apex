@@ -190,6 +190,20 @@ def migrate_and_backfill() -> dict:
     return stats
 
 
+def _empty_plan() -> dict:
+    """空 ladder 快照（开仓时初始化）。AI 首次重新分析时填充 scale_plan，演进而非替换。
+    B1 单一默认 doctrine（不分桶）；B2 playstyle 分桶后 doctrine 值变化。
+    last_action/last_new_stop/last_stop_before 开仓时全 None（尚无 position_action）。"""
+    return {
+        "scale_plan": [],
+        "doctrine": "single_v1",
+        "updated_at": None,
+        "last_action": None,
+        "last_new_stop": None,
+        "last_stop_before": None,
+    }
+
+
 def add_position(ts_code: str, name: str, entry_price: float,
                  stop_loss: Optional[float], target: Optional[float],
                  trigger_price: Optional[float] = None,
@@ -233,6 +247,7 @@ def add_position(ts_code: str, name: str, entry_price: float,
         "expires_at": expires,
         "status": "active",
     }
+    record["plan"] = _empty_plan()  # v1.1.0: 持仓 ladder 快照（空，AI 重新分析时演进）
     if stop_loss is not None:
         record["stop_loss"] = float(stop_loss)
     if target is not None:
@@ -275,14 +290,37 @@ def add_position(ts_code: str, name: str, entry_price: float,
     return record
 
 
+def update_plan(ts_code: str, plan: dict) -> Optional[dict]:
+    """刷新持仓 ladder（active_positions.plan）。AI 重新分析产出 position_action 后调用，
+    把新 scale_plan 落到持仓上（B3 sim 消费执行）。
+
+    若 plan 带 last_action（position_action 快照），从持仓当前 stop_loss 补 last_stop_before
+    （race-free：单次 load 内读，避免 get-then-set 间隙平仓/改止损）。不原地改入参 dict。
+
+    持仓不存在返回 None（竞态：分析期间已平仓，plan 无处可写--journal position_action 已落，
+    下次重新分析若仍持仓会重建 ladder）。返回更新后的 position。
+    """
+    data = _load()
+    for p in data["active_positions"]:
+        if p.get("ts_code") == ts_code:
+            plan_to_write = plan
+            if plan.get("last_action") is not None and "last_stop_before" not in plan:
+                plan_to_write = {**plan, "last_stop_before": p.get("stop_loss")}
+            p["plan"] = plan_to_write
+            _save(data)
+            return p
+    return None
+
+
 def update_advice(ts_code: str,
                   stop_loss: Optional[float] = None,
                   target: Optional[float] = None,
-                  calibrated_confidence: Optional[float] = None) -> dict:
+                  calibrated_confidence: Optional[float] = None,
+                  emit_notify: bool = True) -> dict:
     """更新已存在持仓的止损/目标/校准确信度(覆盖写)。
 
-    用于手动持仓从最近一次 AI 分析同步 advice。总是覆盖传入的字段;
-    传 None 的字段保持原值不动。
+    用于手动持仓从最近一次 AI 分析同步 advice，或 position_action 的 new_stop 自动覆盖 stop_loss
+    （emit_notify=False，避免每次重新分析都推消息）。总是覆盖传入的字段; 传 None 的字段保持原值不动。
 
     Raises:
       PositionNotFoundError: ts_code 不在 active_positions。
@@ -298,8 +336,9 @@ def update_advice(ts_code: str,
             if calibrated_confidence is not None:
                 pos["calibrated_confidence"] = float(calibrated_confidence)
             _save(data)
-            _notify("position_advice_updated", ts_code=ts_code,
-                    name=pos.get("name", ""), before=before, after=pos)
+            if emit_notify:
+                _notify("position_advice_updated", ts_code=ts_code,
+                        name=pos.get("name", ""), before=before, after=pos)
             return pos
     raise PositionNotFoundError(f"持仓 {ts_code} 不存在于 active_positions")
 
@@ -474,10 +513,9 @@ def _journal_ref_for(ts_code: str) -> Optional[dict]:
     """下单时该股最近一条 journal entry(无则 None)。供 AI 诊断关联开仓上下文。"""
     try:
         from apex import journal as _journal
-        entries = _journal.load_entries(ts_code=ts_code)
-        if not entries:
+        latest = _journal.load_latest_verdict(ts_code)
+        if not latest:
             return None
-        latest = sorted(entries, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
         return {
             "verdict": latest.get("verdict"),
             "confidence": latest.get("confidence"),
@@ -499,7 +537,7 @@ def _estimate_shares_from_journal(ts_code: str, entry_price: float) -> tuple[Opt
     """
     try:
         from apex import journal as _journal, account as _account
-        latest = _journal.load_latest(ts_code)
+        latest = _journal.load_latest_verdict(ts_code)
         if not latest:
             return None, "missing"
         atr_pct = (latest.get("features") or {}).get("atr_14_pct")
@@ -584,6 +622,7 @@ def buy(ts_code: str, fill_price: float, shares: int,
             "expires_at": (date.today() + timedelta(days=10)).isoformat(),
             "status": "active",
         }
+        record["plan"] = _empty_plan()  # v1.1.0: 持仓 ladder 快照（空，AI 重新分析时演进）
         if stop_loss is not None:
             record["stop_loss"] = float(stop_loss)
         if target is not None:
@@ -838,7 +877,7 @@ def _latest_journal_for(ts_code: str, before: Optional[str] = None) -> Optional[
     """取该股最近一条 journal 记录（可选限定 before 日期之前），用于反向关联开仓时 AI 上下文。"""
     try:
         from apex import journal as _journal
-        entries = _journal.load_entries(ts_code=ts_code)
+        entries = _journal.load_verdicts(ts_code=ts_code)
         if before:
             # 用 analyzed_at（canonical）比对；before 是日期则补到当天 23:59:59 以纳入同日分析
             cutoff = before if "T" in before else before + "T23:59:59"
@@ -1304,6 +1343,7 @@ def close_position(ts_code: str,
     wl["active_positions"] = [p for p in wl["active_positions"] if p.get("ts_code") != ts_code]
     pos_breadcrumb = dict(pos)
     pos_breadcrumb["status"] = f"closed_{exit_reason}"
+    pos_breadcrumb["plan"] = None  # v1.1.0: ladder 随平仓退役，防同 ts_code 重开读陈旧
     pos_breadcrumb["archived_date"] = today_str
     pos_breadcrumb["archived_from"] = "active_positions"
     pos_breadcrumb["closed_record_ref"] = record["close"]["closed_at"]
@@ -1519,7 +1559,7 @@ def sync_candidate_from_journal(ts_code: str) -> Optional[dict]:
     缩短不计数。返回带 renewed 标记本次是否触发续期。
     """
     from apex import journal
-    latest = journal.load_latest(ts_code)
+    latest = journal.load_latest_verdict(ts_code)
     if not latest:
         return None
     pa = latest.get("price_advice") or {}

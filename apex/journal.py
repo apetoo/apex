@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from apex import config
-from apex.schemas import VERDICT_ENUM, REQUIRED_FEATURE_KEYS, JournalEntry
+from apex.schemas import VERDICT_ENUM, REQUIRED_FEATURE_KEYS, JournalEntry, POSITION_ACTION_SOURCE
 
 
 def _journal_dir() -> Path:
@@ -29,7 +29,8 @@ def validate_entry(entry: dict) -> dict:
     verdict = entry.get("verdict")
     if verdict and verdict not in VERDICT_ENUM:
         raise ValueError(f"Invalid verdict '{verdict}'. Must be one of: {VERDICT_ENUM}")
-    features = entry.get("features", {})
+    # features 可能为 None（position_action entry，P1 verdict 类字段全 None）-> 视作空 dict 填充
+    features = entry.get("features") or {}
     for key in REQUIRED_FEATURE_KEYS:
         if key not in features:
             features[key] = None
@@ -97,6 +98,38 @@ def load_latest(ts_code: str) -> Optional[dict]:
     if not entries:
         return None
     return sorted(entries, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
+
+
+def load_verdicts(ts_code: Optional[str] = None) -> list[dict]:
+    """入场 verdict 记录（source != position_action）。
+
+    供方向 call 语义消费点：calibration/backtest/repeat-analysis/下单上下文反查/
+    ATR 估算手数/候选同步。position_action 记录 verdict=None，混入会让这些消费点静默断
+    （None verdict 不命中 BULLISH/BEARISH、_verdict_index 返回 -1、price_advice 缺失）。
+    **历史展示（/journal、/analyze 历史列表）用 load_entries（含 position_action），不用本函数。**
+    """
+    return [e for e in load_entries(ts_code) if e.get("source") != POSITION_ACTION_SOURCE]
+
+
+def load_position_actions(ts_code: Optional[str] = None) -> list[dict]:
+    """持仓加减仓建议记录（source == position_action），按 analyzed_at 正序。
+
+    供 position_action 路径反查（4h 反 churn 基线 / PositionCard 展示 / B3 sim 消费）。
+    """
+    return [e for e in load_entries(ts_code) if e.get("source") == POSITION_ACTION_SOURCE]
+
+
+def load_latest_verdict(ts_code: str) -> Optional[dict]:
+    """最近一条入场 verdict（排除 position_action）。
+
+    "latest journal = latest AI direction view" 场景专用：下单上下文反查、ATR 估算手数、
+    候选价位同步、24h 限幅基线。持仓后最新一条可能是 position_action（无 verdict），
+    这些场景必须取最近 verdict 而非最近 entry。
+    """
+    verdicts = load_verdicts(ts_code)
+    if not verdicts:
+        return None
+    return sorted(verdicts, key=lambda e: e.get("analyzed_at") or e.get("date", ""))[-1]
 
 
 _LEGACY_NAME = re.compile(r"^(\d{6})\.jsonl$")

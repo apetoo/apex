@@ -234,7 +234,7 @@ def _journal_entry(entry, stop, target, analyzed_at="2026-07-01T09:53:52+08:00")
 
 
 @patch("apex.data.get_daily_price")
-@patch("apex.journal.load_latest")
+@patch("apex.journal.load_latest_verdict")
 def test_sync_candidate_overwrites_three_fields(mock_journal, mock_get, wl_file):
     mock_get.return_value = json.dumps(_zigzag(24, 0.05))
     # 先加候选 trigger=101, stop=21, target=25(老值)
@@ -258,7 +258,7 @@ def test_sync_candidate_overwrites_three_fields(mock_journal, mock_get, wl_file)
 
 
 @patch("apex.data.get_daily_price")
-@patch("apex.journal.load_latest")
+@patch("apex.journal.load_latest_verdict")
 def test_sync_candidate_returns_none_when_no_journal(mock_journal, mock_get, wl_file):
     mock_get.return_value = json.dumps(_zigzag(24, 0.05))
     wl.add_candidate("601012.SH", "隆基绿能", trigger_price=101.0)
@@ -267,7 +267,7 @@ def test_sync_candidate_returns_none_when_no_journal(mock_journal, mock_get, wl_
 
 
 @patch("apex.data.get_daily_price")
-@patch("apex.journal.load_latest")
+@patch("apex.journal.load_latest_verdict")
 def test_sync_candidate_returns_none_when_entry_missing(mock_journal, mock_get, wl_file):
     mock_get.return_value = json.dumps(_zigzag(24, 0.05))
     wl.add_candidate("601012.SH", "隆基绿能", trigger_price=101.0)
@@ -276,7 +276,7 @@ def test_sync_candidate_returns_none_when_entry_missing(mock_journal, mock_get, 
 
 
 @patch("apex.data.get_daily_price")
-@patch("apex.journal.load_latest")
+@patch("apex.journal.load_latest_verdict")
 def test_sync_candidate_returns_none_when_candidate_not_found(mock_journal, mock_get, wl_file):
     mock_get.return_value = json.dumps(_zigzag(24, 0.05))
     mock_journal.return_value = _journal_entry(68.7, 65.5, 76)

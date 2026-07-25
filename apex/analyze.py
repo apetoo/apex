@@ -16,6 +16,7 @@ from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
     STOCK_TYPE_ENUM, VALUATION_BASIS_ENUM, PLAYSTYLE_ENUM,
+    POSITION_ACTION_SOURCE,
 )
 
 
@@ -443,6 +444,53 @@ TOOLS = [
                     },
                 },
                 "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_position_action",
+            "description": (
+                "记录已持仓票的加减仓建议。重新分析一只**你已持有**的票时调此工具；未持仓的票调 record_verdict（调错会被系统拒绝）。"
+                "action=add 必填 add_shares(>0)；action=trim 二选一 trim_shares 或 trim_pct(0-1]；action=exit/hold 可只给 new_stop。"
+                "scale_plan 给完整 ladder（演进当前 ladder，非替换：未触发 level 保留，可新增/调整 level/trigger/new_stop）。"
+                "rationale 是机器可读摘要，完整推理写进分析文本。"
+                "action=trim/exit 涉及实质风险决策，调用前必须已调 web_search 的 regulatory+shareholders+money_flow 三类（缺则被拒）。"
+                "4h 内重复调此工具会被反 churn 速率限制拒绝，除非 new_info 列出本次新增信息。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["hold", "add", "trim", "exit"], "description": "加减仓动作"},
+                    "add_shares": {"type": "integer", "description": "action=add 必填，加仓股数(>0)"},
+                    "trim_shares": {"type": "integer", "description": "action=trim 二选一，减仓股数(>0)"},
+                    "trim_pct": {"type": "number", "description": "action=trim 二选一，减仓比例 0-1（如 0.33=减1/3）"},
+                    "new_stop": {"type": "number", "description": "止损上移建议（add/hold 常带，advisory）"},
+                    "scale_plan": {
+                        "type": "array",
+                        "description": "完整 ladder 计划（演进当前 ladder，非替换）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "level": {"type": "integer", "description": "1=首加/首减, 2=二加..."},
+                                "trigger_price": {"type": "number", "description": "触发价"},
+                                "action": {"type": "string", "enum": ["add", "trim"]},
+                                "shares": {"type": "integer", "description": "加/减仓股数"},
+                                "pct": {"type": "number", "description": "减仓比例 0-1（trim 时 shares/pct 二选一）"},
+                                "new_stop": {"type": "number", "description": "触发后止损上移到"},
+                                "reason": {"type": "string", "description": "该档触发理由"},
+                            },
+                        },
+                    },
+                    "rationale": {"type": "string", "description": "机器可读摘要（why this action + ladder），完整推理写进分析文本"},
+                    "new_info": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "本次相比上次 position_action 的新增信息（4h 内重复时据此豁免反 churn 速率限制）",
+                    },
+                },
+                "required": ["action", "rationale"],
             },
         },
     },
@@ -989,6 +1037,40 @@ def _resolve_industries_batch(ts_codes: list[str]) -> dict[str, str]:
         return {}
 
 
+def _format_held_ladder_block(held: dict, ts_code: str) -> str:
+    """v1.1.0 OV#6: 候选已被持有 -> 注入当前 ladder 快照 + 指示调 record_position_action（非 record_verdict）。
+
+    AI 拿到当前 ladder 才能「演进而非替换」；未触发 level 保留，可新增/调整。
+    """
+    shares = held.get("position_size_shares")
+    avg = held.get("avg_cost") or held.get("entry_price")
+    stop = held.get("stop_loss")
+    target = held.get("target")
+    plan = held.get("plan") or {}
+    scale_plan = plan.get("scale_plan") or []
+    parts = [
+        f"## ⚠ 你已持有 {ts_code}（{held.get('name', '')}）",
+        f"当前持仓：{shares}股 @ {avg}，止损 {stop}，目标 {target}。",
+        "**本次是重新分析已持仓票，必须调 `record_position_action` 给加减仓建议**"
+        "（action=hold/add/trim/exit + 对应股数/比例 + new_stop + 完整 scale_plan ladder），"
+        "调 `record_verdict` 会被系统拒绝。",
+    ]
+    if scale_plan:
+        parts.append("当前 ladder（演进，非替换；未触发 level 保留，可新增/调整）：")
+        for item in scale_plan:
+            tag = "✓已触发" if item.get("executed") else "待触发"
+            parts.append(
+                f"- L{item.get('level', '?')} {item.get('action', '?')} @ {item.get('trigger_price')} "
+                f"-> new_stop {item.get('new_stop')}（{tag}）{item.get('reason', '')}"
+            )
+    else:
+        parts.append(
+            "当前 ladder 为空（首次重新分析）：请在 scale_plan 给出完整加减仓计划"
+            "（首加/首减触发价 + 止损上移节奏 + 减仓比例，锚定当前 stop/target）。"
+        )
+    return "\n".join(parts)
+
+
 def _format_portfolio_context(candidate_ts_code: str) -> str:
     """B7：当前持仓上下文，注入用户 prompt 让 AI 知道行业集中度 / 总风险。"""
     try:
@@ -1033,10 +1115,13 @@ def _format_portfolio_context(candidate_ts_code: str) -> str:
             and candidate_industry and candidate_industry != "未知"
         ]
 
+        held = next((p for p in positions if p.get("ts_code") == candidate_ts_code), None)
         lines = [
             f"## 你的当前持仓上下文（{len(positions)} 只）",
             f"- 行业分布：{ind_dist}",
         ]
+        if held:
+            lines.insert(0, _format_held_ladder_block(held, candidate_ts_code))
         if capital > 0:
             lines.append(
                 f"- 资金占用：{total_capital_used:,.0f} / {capital:,.0f} "
@@ -1375,9 +1460,10 @@ def _format_playstyle_block(ts_code: str) -> tuple[str, dict]:
     塞 prompt，raw dict 存 journal（T5 落 entry.playstyle_features）。原始行情/信号 bars 不
     进 prompt、不落 trace（与分时一致）。fail-soft：extract_features 绝不抛异常。
 
-    ⚠ v1 prototype-first（D9）：本函数已就绪但**暂未在 run() 注入**--是否注入 prompt 取决于
-    T4 prototype hit-rate 分支：≥70% 走 Python 规则星级（post-hoc，不注入）；<70% 才上 skill
-    rubric 并在此注入。提前注入会每条 analyze 付 token/延迟（OV#11），故 D9 先验证再接。
+    D9 已验收（grounded-LLM 可行）→ 走 AI 填 skill 分支：本函数在 run() 注入 FE 特征 prompt，
+    AI 经 record_verdict 填 playstyle ratings，finalize_playstyle 规整 + 软门控（gate#1 auto-fix
+    primary / gate#2 flag，OV#6 不 reject）。AI 未填但 FE>=0.5 → Python compute_rule_ratings
+    兜底（method=python_fallback）；FE<0.5 → 降级 null（不卡流程）。
     """
     feats = playstyle.extract_features(ts_code)
     f = feats["features"]
@@ -1484,7 +1570,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             except Exception:
                 pass
 
-    history_entries = journal.load_entries(ts_code=ts_code)
+    history_entries = journal.load_verdicts(ts_code=ts_code)
     history_block = _format_history(
         history_entries, ts_code=ts_code, limit=history_limit,
     )
@@ -1636,6 +1722,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     ]
 
     verdict_data: dict = {}
+    position_action_data: dict = {}  # v1.1.0: 持仓路径捕获（与 verdict_data 互斥，对称守卫保证）
     analysis_text = ""
     iteration = 0
     searches_performed: list[str] = []  # 累计调用过的 web_search category
@@ -1717,7 +1804,19 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         and tool_input.get("valuation_basis") in (None, "static_pe_only")):
                     static_pe_bearish = True
 
-                if missing or bad_prices or static_pe_bearish:
+                # 校验 4 (v1.1.0 对称守卫): 已持仓票必须走 record_position_action，禁 record_verdict
+                held_conflict = False
+                try:
+                    from apex import watchlist as _wl_guard
+                    _held_now = next(
+                        (p for p in _wl_guard.load().get("active_positions", [])
+                         if p.get("ts_code") == ts_code), None
+                    )
+                    held_conflict = _held_now is not None
+                except Exception:
+                    held_conflict = False  # 读失败不阻断（advisory，宁可放行不误杀）
+
+                if missing or bad_prices or static_pe_bearish or held_conflict:
                     # 拒绝记录结论, 把错误喂回 AI 逼其修正后重调 record_verdict
                     reasons = []
                     if missing:
@@ -1740,11 +1839,17 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                             "改填 valuation_basis=forward_valuation 并在 evidence 引用前瞻数字；"
                             "若估值非主要空头依据，改填 valuation_basis=non_valuation。"
                         )
+                    if held_conflict:
+                        reasons.append(
+                            f"你已持有 {ts_code}，重新分析已持仓票必须调 record_position_action"
+                            "（给 hold/add/trim/exit 加减仓建议），record_verdict 会被拒绝。"
+                        )
                     result = json.dumps({
                         "error": "；".join(reasons) + "。请修正后重新调用 record_verdict。",
                         "missing_categories": missing,
                         "bad_prices": bad_prices,
                         "static_pe_bearish": static_pe_bearish,
+                        "held_conflict": held_conflict,
                         "performed": searches_performed,
                     }, ensure_ascii=False)
                     _emit({
@@ -1754,6 +1859,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         "missing": missing,
                         "bad_prices": bad_prices,
                         "static_pe_bearish": static_pe_bearish,
+                        "held_conflict": held_conflict,
                         "performed": list(searches_performed),
                     })
                 else:
@@ -1765,6 +1871,32 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                         "tool_call_id": tool_call.id,
                         "verdict": verdict_data.get("verdict"),
                         "confidence": verdict_data.get("confidence"),
+                    })
+            elif name == "record_position_action":
+                # v1.1.0 持仓路径：守卫抽离到 _validate_position_action 供单测（T6）
+                pa_reasons, _sizing_warn = _validate_position_action(
+                    tool_input, ts_code, searches_performed
+                )
+                if pa_reasons:
+                    result = json.dumps({
+                        "error": "；".join(pa_reasons) + "。请修正后重新调用 record_position_action。",
+                        "performed": list(searches_performed),
+                    }, ensure_ascii=False)
+                    _emit({
+                        "type": "position_action_rejected",
+                        "iteration": iteration,
+                        "tool_call_id": tool_call.id,
+                        "reasons": pa_reasons,
+                    })
+                else:
+                    position_action_data = tool_input
+                    result = ("position_action recorded" + (f" {_sizing_warn}" if _sizing_warn else "")).strip()
+                    _emit({
+                        "type": "position_action_recorded",
+                        "iteration": iteration,
+                        "tool_call_id": tool_call.id,
+                        "action": position_action_data.get("action"),
+                        "sizing_warn": _sizing_warn or None,
                     })
             else:
                 if name == "web_search":
@@ -1792,9 +1924,10 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
 
         iteration += 1
 
-        # Once verdict captured and no other pending tools, do one final text round
-        if verdict_data:
-            non_verdict = [tc for tc in (msg.tool_calls or []) if tc.function.name != "record_verdict"]
+        # Once a conclusion tool captured and no other pending tools, do one final text round
+        if verdict_data or position_action_data:
+            non_verdict = [tc for tc in (msg.tool_calls or [])
+                           if tc.function.name not in ("record_verdict", "record_position_action")]
             if not non_verdict:
                 final = client.chat.completions.create(
                     model=model,
@@ -1814,14 +1947,15 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                     })
                 break
 
-    if not verdict_data:
-        # 兜底：AI 忘了调 record_verdict，给最后一次机会
+    if not verdict_data and not position_action_data:
+        # 兜底：AI 忘了调任一记录工具，给最后一次机会
         messages.append({
             "role": "user",
             "content": (
                 "⚠️ 系统提醒：你还没有调用 record_verdict 函数来提交最终判断结论。\n"
-                "纯文本分析不会被记录。请立即调用 record_verdict(verdict=..., confidence=..., evidence=[...])，"
-                "并且不要再调任何其他工具。"
+                "纯文本分析不会被记录。请立即调用（二选一，不要再调其他工具）：\n"
+                "- 未持仓票：record_verdict(verdict=..., confidence=..., evidence=[...])\n"
+                "- 已持仓票：record_position_action(action=..., rationale=..., scale_plan=[...])"
             ),
         })
         retry = client.chat.completions.create(
@@ -1836,21 +1970,40 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         retry_msg = retry_choice.message
         if retry_choice.finish_reason == "tool_calls":
             for tool_call in (retry_msg.tool_calls or []):
-                if tool_call.function.name == "record_verdict":
+                _fname = tool_call.function.name
+                if _fname in ("record_verdict", "record_position_action"):
                     try:
-                        verdict_data = json.loads(tool_call.function.arguments)
+                        _captured = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError:
-                        pass
-                    _emit({
-                        "type": "verdict_recorded",
-                        "iteration": iteration,
-                        "tool_call_id": tool_call.id,
-                        "verdict": verdict_data.get("verdict"),
-                        "confidence": verdict_data.get("confidence"),
-                    })
+                        _captured = {}
+                    if _fname == "record_verdict":
+                        verdict_data = _captured
+                        _emit({
+                            "type": "verdict_recorded",
+                            "iteration": iteration,
+                            "tool_call_id": tool_call.id,
+                            "verdict": verdict_data.get("verdict"),
+                            "confidence": verdict_data.get("confidence"),
+                        })
+                    else:
+                        position_action_data = _captured
+                        _emit({
+                            "type": "position_action_recorded",
+                            "iteration": iteration,
+                            "tool_call_id": tool_call.id,
+                            "action": position_action_data.get("action"),
+                            "sizing_warn": None,
+                        })
                     break
-        if not verdict_data:
-            raise AnalysisError("AI did not call record_verdict — no verdict captured")
+        if not verdict_data and not position_action_data:
+            raise AnalysisError("AI did not call record_verdict or record_position_action — no verdict captured")
+
+    # ── v1.1.0 双路径分支：持仓路径直接收尾，不走 calibration/24h 限幅 ──
+    if position_action_data:
+        return _finalize_position_action(
+            ts_code, position_action_data, analysis_text, events,
+            playstyle_feats, market_ctx, save,
+        )
 
     raw_verdict = verdict_data["verdict"]
     raw_confidence = verdict_data.get("confidence")
@@ -1943,4 +2096,203 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         print(f"✓ 已保存到日志: {ts_code} → {entry['verdict']} (置信度 {entry['confidence']})")
 
     entry["_trace_events"] = events  # 当前会话直接用，不序列化到 journal
+    return entry
+
+
+def _validate_position_action(
+    tool_input: dict, ts_code: str, searches_performed: list
+) -> tuple[list[str], str]:
+    """v1.1.0 record_position_action dispatch 守卫：对称守卫 + 字段校验 + trim/exit 强制搜索 + 4h 反 churn + sizing_cap warn。
+
+    返回 (reject_reasons, sizing_warn)。reasons 非空 -> 拒绝回喂 AI；sizing_warn 非空 -> advisory 警告仍接受。
+    抽离自 agent loop 供单测（T6）。
+    """
+    from apex import watchlist as _wl_pa
+    try:
+        _held_pa = next(
+            (p for p in _wl_pa.load().get("active_positions", [])
+             if p.get("ts_code") == ts_code), None
+        )
+    except Exception:
+        _held_pa = None
+    action = tool_input.get("action")
+    reasons: list[str] = []
+
+    # 守卫 1: 持仓必须存在（防 _format_portfolio_context 快照后平仓竞态）
+    if _held_pa is None:
+        reasons.append(f"{ts_code} 已不持仓（可能在分析期间平仓）。未持仓票请调 record_verdict。")
+
+    # 守卫 2: 字段校验（add->add_shares>0; trim->恰好一个 trim_shares/trim_pct）
+    if action == "add":
+        _asz = tool_input.get("add_shares")
+        if not (isinstance(_asz, int) and _asz > 0):
+            reasons.append("action=add 必填 add_shares 且为 > 0 的整数。")
+    elif action == "trim":
+        _ts = tool_input.get("trim_shares")
+        _tp = tool_input.get("trim_pct")
+        _has_ts = isinstance(_ts, int) and _ts > 0
+        _has_tp = isinstance(_tp, (int, float)) and 0 < float(_tp) <= 1
+        if _has_ts == _has_tp:
+            reasons.append("action=trim 必须恰好填一个：trim_shares(>0 整数) 或 trim_pct(0-1]。")
+    elif action not in ("hold", "exit"):
+        reasons.append(f"action 必须是 hold/add/trim/exit，got {action!r}。")
+
+    # 守卫 3 (OV#1): trim/exit 强制 regulatory+shareholders+money_flow 三类实质风险搜索
+    _mandatory_pa = ["regulatory", "shareholders", "money_flow"]
+    if action in ("trim", "exit") and _held_pa is not None:
+        _missing_pa = [c for c in _mandatory_pa if c not in searches_performed]
+        if _missing_pa:
+            reasons.append(
+                f"action={action} 涉及实质风险决策，强制搜索类别未全部调用，缺: {_missing_pa}。"
+                "请先 web_search(category=<上述类别>) 补齐。"
+            )
+
+    # 守卫 4 (OV#7): 4h 反 churn -- 距上次 position_action <4h 且无 new_info -> 拒
+    if _held_pa is not None and not reasons:
+        try:
+            _pas = journal.load_position_actions(ts_code)
+            if _pas:
+                _last_pa = sorted(
+                    _pas, key=lambda e: e.get("analyzed_at") or e.get("date", "")
+                )[-1]
+                _last_at = _last_pa.get("analyzed_at") or _last_pa.get("date")
+                if _last_at:
+                    try:
+                        _last_dt = datetime.fromisoformat(_last_at)
+                        if _last_dt.tzinfo is None:
+                            _last_dt = _last_dt.replace(tzinfo=_TZ_CN)
+                        _hours = (datetime.now(_TZ_CN) - _last_dt).total_seconds() / 3600.0
+                        if 0 <= _hours < 4 and not tool_input.get("new_info"):
+                            reasons.append(
+                                f"距上次加减仓建议仅 {_hours:.1f}h（<4h），频繁更新 ladder 会 churn。"
+                                "如确有新增信息（公告/放量/形态突破），请在 new_info 列出后重调。"
+                            )
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+    # A1 sizing_cap warn（advisory，不拒）：加仓后总风险超上限则警告仍接受
+    sizing_warn = ""
+    if action == "add" and _held_pa is not None and not reasons:
+        try:
+            from apex import account as _acct_pa
+            _asz2 = int(tool_input.get("add_shares") or 0)
+            _sim = [dict(_held_pa)]
+            _sim[0]["position_size_shares"] = int(_held_pa.get("position_size_shares") or 0) + _asz2
+            _risk = _acct_pa.current_total_risk(_sim, account=_acct_pa.load())
+            if _risk.get("over_limit"):
+                sizing_warn = (
+                    f"⚠ 加仓后总风险 {_risk.get('total_risk_pct')}% 超上限 "
+                    f"{_risk.get('max_total_risk_pct')}%（advisory 警告，仍接受建议）。"
+                )
+        except Exception:
+            pass
+
+    return reasons, sizing_warn
+
+
+def _finalize_position_action(
+    ts_code: str,
+    position_action_data: dict,
+    analysis_text: str,
+    events: list,
+    playstyle_feats: dict,
+    market_ctx: dict,
+    save: bool,
+) -> dict:
+    """v1.1.0 持仓路径收尾：写 position_action journal entry + 刷新 active_positions.plan。
+
+    跳过 calibration（position_action 无 confidence）+ 跳过 24h 限幅（OV#7 反 churn 已在 dispatch 拦）。
+    playstyle 从最近 verdict 继承（股票客观属性，持仓期不应翻转），无 prior verdict 则从 FE 派生（OV#3）。
+    verdict/price_advice/features/evidence/confidence 全 None（P1：不污染 calibration/backtest，load_verdicts 已过滤）。
+    """
+    now_cn = datetime.now(_TZ_CN)
+    stock_name = data.get_name_map().get(ts_code)
+
+    # playstyle: 优先继承最近 verdict 的判定（股票客观属性，稳定）；无 prior 则 FE 派生
+    playstyle_value = None
+    try:
+        _prior = journal.load_latest_verdict(ts_code)
+        if _prior and _prior.get("playstyle"):
+            playstyle_value = _prior.get("playstyle")
+        else:
+            playstyle_value = playstyle.finalize_playstyle(None, playstyle_feats)
+    except Exception:
+        playstyle_value = None
+    try:
+        playstyle_fit = playstyle.compute_playstyle_fit(playstyle_value)
+    except Exception:
+        playstyle_fit = None
+
+    entry = {
+        "ts_code": ts_code,
+        "name": stock_name,
+        "date": now_cn.date().isoformat(),
+        "analyzed_at": now_cn.isoformat(timespec="seconds"),
+        "source": POSITION_ACTION_SOURCE,
+        "position_action": {
+            "action": position_action_data.get("action"),
+            "add_shares": position_action_data.get("add_shares"),
+            "trim_shares": position_action_data.get("trim_shares"),
+            "trim_pct": position_action_data.get("trim_pct"),
+            "new_stop": position_action_data.get("new_stop"),
+            "scale_plan": position_action_data.get("scale_plan") or [],
+            "rationale": position_action_data.get("rationale"),
+        },
+        "analysis_text": analysis_text.strip(),
+        "prompt_version": "2.6.0",
+        "market_context": market_ctx,
+        # P1: verdict/price_advice/features/evidence/confidence 全 None（不污染 calibration/backtest）
+        "verdict": None,
+        "confidence": None,
+        "price_advice": None,
+        "features": None,
+        "evidence": None,
+        # OV#3: playstyle 例外（股票属性，非方向 call 字段）
+        "playstyle": playstyle_value,
+        "playstyle_fit": playstyle_fit,
+        "playstyle_features": playstyle_feats,
+        "risk_level": playstyle_feats.get("risk_level"),
+    }
+
+    if save:
+        journal.write_entry(entry)
+        try:
+            trace_mod.write_trace(ts_code, entry["analyzed_at"], events)
+        except Exception as e:
+            print(f"⚠ trace 写入失败（不影响 journal）: {e}")
+        # 刷新持仓 ladder（竞态：分析期间平仓 -> plan 无处可写，journal 已落，下次重建）
+        try:
+            from apex import watchlist as _wl_fin
+            _new_plan = {
+                "scale_plan": entry["position_action"]["scale_plan"],
+                "doctrine": "single_v1",
+                "updated_at": entry["analyzed_at"],
+                # B1 增强：最近 position_action 快照，供持仓卡显示"现在 vs 未来"
+                # last_stop_before 由 update_plan 从持仓当前 stop_loss 补（race-free）
+                "last_action": entry["position_action"]["action"],
+                "last_new_stop": entry["position_action"]["new_stop"],
+            }
+            _updated = _wl_fin.update_plan(ts_code, _new_plan)
+            if _updated is None:
+                print(f"⚠ 持仓 {ts_code} 已不持仓，ladder 未写入（position_action journal 已保存）")
+            else:
+                _n = len(_new_plan["scale_plan"])
+                print(f"✓ 已保存加减仓建议: {ts_code} -> {entry['position_action']['action']} (ladder {_n} 档)")
+                # B1: new_stop 直接覆盖持仓 stop_loss（AI 建议即生效，不等 B3 sim 执行）。
+                # update_plan 已把旧 stop 锁进 plan.last_stop_before，此处改 stop_loss 不影响 delta 展示。
+                _new_stop = entry["position_action"].get("new_stop")
+                if _new_stop is not None:
+                    try:
+                        _wl_fin.update_advice(ts_code, stop_loss=_new_stop, emit_notify=False)
+                        print(f"✓ 已应用新止损: {ts_code} stop_loss -> {_new_stop}")
+                    except _wl_fin.PositionNotFoundError:
+                        print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止损未应用")
+                    except Exception as e:
+                        print(f"⚠ 新止损应用失败（不影响 journal/plan）: {e}")
+        except Exception as e:
+            print(f"⚠ ladder 刷新失败（不影响 journal）: {e}")
+
+    entry["_trace_events"] = events
     return entry

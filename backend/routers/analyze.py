@@ -40,8 +40,8 @@ journal_router = APIRouter(prefix="/journal", tags=["analyze"])
 def list_all_journal():
     """全部标的全部历史分析（按时间倒序）。供 /journal 跨股历史页。
 
-    复用 ``journal.load_entries()``(无 ts_code 即读 journal_dir 下所有 *.jsonl)。
-    量级 ~数百条, 直接全量返回(前端本地搜索)。
+    ``journal.load_entries()`` 读所有 *.jsonl, **含 position_action**（持仓加减仓建议也是历史记录,
+    用户要在历史页看到）。量级 ~数百条, 直接全量返回(前端本地搜索)。
 
     老条目缺 ``name``(中文名), 这里用全量 name map 兜底回填, 供列表展示。
     """
@@ -62,7 +62,7 @@ def list_all_journal():
 
 @journal_router.get("/{ts_code}")
 def list_journal(ts_code: str):
-    """该股票全部历史分析（按时间倒序）。"""
+    """该股票全部历史分析（按时间倒序，含 position_action 持仓建议）。"""
     code = data_mod.normalize_ts_code(ts_code)
     entries = journal.load_entries(code)
     entries.sort(
@@ -74,7 +74,10 @@ def list_journal(ts_code: str):
 
 @journal_router.get("/{ts_code}/latest")
 def latest_journal(ts_code: str):
-    """最近一条分析记录。无记录返回 null。"""
+    """最近一条分析记录（含 position_action）。供"同步AI到持仓"取最近 advice：
+    持仓后最新可能是 position_action（new_stop），前端按 source 分流取 new_stop / price_advice。
+    无记录返回 null。
+    """
     return journal.load_latest(data_mod.normalize_ts_code(ts_code))
 
 

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { History, Search, AlertCircle, Loader2, ChevronRight } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, Drawer } from "@/components/base";
-import { VerdictTag, VerdictDetailCard, TraceEventList } from "@/components/a-share";
+import { VerdictTag, PositionActionTag, VerdictDetailCard, TraceEventList } from "@/components/a-share";
 import { getAllJournal, getTrace } from "@/api/analyze";
 import { qk } from "@/api/query-keys";
 import { cn } from "@/lib/utils";
@@ -35,6 +35,7 @@ export function JournalPage() {
         String(e.ts_code ?? ""),
         String(e.name ?? ""),
         String(e.verdict ?? ""),
+        String((e.position_action as Record<string, unknown> | null)?.action ?? ""),
         String(e.analysis_text ?? ""),
       ].join(" ").toUpperCase();
       return hay.includes(q);
@@ -97,6 +98,8 @@ export function JournalPage() {
             <div className="divide-y divide-border">
               {filtered.map((e, i) => {
                 const pa = (e.price_advice ?? {}) as Record<string, unknown>;
+                const isPa = e.source === "position_action";
+                const paAction = (e.position_action ?? {}) as Record<string, unknown>;
                 const at = String(e.analyzed_at ?? e.date ?? "");
                 const text = String(e.analysis_text ?? "");
                 const name = String(e.name ?? "");
@@ -140,10 +143,23 @@ export function JournalPage() {
                       </p>
                     </div>
                     <div className="flex flex-col items-end gap-0.5">
-                      <VerdictTag verdict={String(e.verdict ?? "")} />
-                      <span className="num text-[11px] text-text-secondary">
-                        置信度 {String(e.confidence ?? "—")}
-                      </span>
+                      {isPa ? (
+                        <>
+                          <PositionActionTag action={String(paAction.action ?? "")} />
+                          {paAction.new_stop != null && (
+                            <span className="num text-[11px] text-text-secondary">
+                              止损 {fmtOrDash(paAction.new_stop)}
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <VerdictTag verdict={String(e.verdict ?? "")} />
+                          <span className="num text-[11px] text-text-secondary">
+                            置信度 {String(e.confidence ?? "-")}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </button>
                 );

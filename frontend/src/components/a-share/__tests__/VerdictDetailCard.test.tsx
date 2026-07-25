@@ -170,3 +170,47 @@ describe("VerdictDetailCard - Playstyle Engine v1 渲染", () => {
     expect(screen.getByText("兼容")).toBeTruthy();
   });
 });
+
+describe("VerdictDetailCard - position_action 分支（v1.1.0 持仓建议卡）", () => {
+  it("source=position_action -> 持仓建议卡：当前决策 + 条件触发计划 + 判断理由，不渲染 verdict 三宫格", () => {
+    withClient(
+      <VerdictDetailCard
+        verdict={{
+          ts_code: "002415.SZ",
+          source: "position_action",
+          analyzed_at: "2026-07-24T18:53:06+08:00",
+          position_action: {
+            action: "hold",
+            new_stop: 32.5,
+            scale_plan: [
+              { level: 1, trigger_price: 36.5, action: "add", shares: 200, new_stop: 34.0, reason: "突破前高加仓" },
+            ],
+            rationale: "HOLD：基本面强劲，不加仓",
+          },
+          analysis_text: "AI 叙述全文",
+          playstyle: null,
+          playstyle_fit: null,
+          risk_level: null,
+        }}
+      />,
+    );
+    // 持仓建议卡标题（非"分析结果"）
+    expect(screen.getByText("持仓建议")).toBeTruthy();
+    expect(screen.queryByText("分析结果")).toBeNull();
+    // 当前决策：持有 + 不加不减 + 新止损 32.50
+    expect(screen.getAllByText("持有").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("不加不减")).toBeTruthy();
+    expect(screen.getByText("32.50")).toBeTruthy();
+    // 条件触发计划 ladder（带 reason）
+    expect(screen.getByText(/条件触发计划/)).toBeTruthy();
+    expect(screen.getByText("@36.50")).toBeTruthy();  // 触发价在前
+    expect(screen.getByText("加")).toBeTruthy();  // 动作在后
+    expect(screen.getByText(/突破前高加仓/)).toBeTruthy();
+    // 判断理由 + AI 叙述
+    expect(screen.getByText("判断理由")).toBeTruthy();
+    expect(screen.getByText(/基本面强劲/)).toBeTruthy();
+    expect(screen.getByText("AI 分析")).toBeTruthy();
+    // 不渲染 verdict 三宫格
+    expect(screen.queryByText("入场")).toBeNull();
+  });
+});

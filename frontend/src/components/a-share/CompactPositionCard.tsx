@@ -1,10 +1,10 @@
 import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert, X, Sparkles, Pencil } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { PriceTag } from "@/components/a-share";
+import { PriceTag, ScalePlanLadder } from "@/components/a-share";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { qk } from "@/api/query-keys";
 import { cn, formatPrice } from "@/lib/utils";
-import type { ActivePosition } from "@/api/watchlist";
+import type { ActivePosition, PositionPlan } from "@/api/watchlist";
 
 /**
  * <CompactPositionCard> - 竖向紧凑持仓卡(网格用)
@@ -145,6 +145,24 @@ export function CompactPositionCard({
         )}
       </div>
 
+      {/* v1.1.0: 持仓建议（现在 vs 未来）。持仓建议=header；现在=当前决策+止损变动(带方向)；未来=条件触发计划。 */}
+      {position.plan?.last_action || position.plan?.scale_plan?.length ? (
+        <div className="mt-2 space-y-1 border-t border-border pt-2 text-[10px] text-text-secondary">
+          <div className="flex items-center justify-between">
+            <span className="text-flat">持仓建议</span>
+            {position.plan?.updated_at ? (
+              <span className="opacity-60">{position.plan.updated_at.slice(5, 16)}</span>
+            ) : null}
+          </div>
+          {position.plan?.last_action && (
+            <LastAdviceRow plan={position.plan} stopLoss={position.stop_loss} />
+          )}
+          {position.plan?.scale_plan?.length ? (
+            <ScalePlanLadder items={position.plan.scale_plan} title="未来触发计划（触及才执行）" />
+          ) : null}
+        </div>
+      ) : null}
+
       {/* 操作按钮(可选): 加仓/减仓/同步AI/平仓 */}
       {(onAdd || onReduce || onClose || onSyncAi) && (
         <div className="mt-2 flex items-center gap-1.5">
@@ -190,6 +208,47 @@ export function CompactPositionCard({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// v1.1.0: 最近 position_action 快照行（持仓卡"现在 vs 未来"的"现在"）。
+// last_stop_before 优先（position_action 时的旧止损）；缺则回退当前 stop_loss。
+// 止损带方向：多头 after>before=↑收紧(保护浮盈，红)；after<before=↓放宽(让空间，绿)。
+const ACTION_LABELS: Record<string, string> = {
+  hold: "持有",
+  add: "加仓",
+  trim: "减仓",
+  exit: "清仓",
+};
+
+function LastAdviceRow({ plan, stopLoss }: { plan: PositionPlan; stopLoss?: number }) {
+  const action = plan.last_action;
+  if (!action) return null;
+  const label = ACTION_LABELS[action] ?? action;
+  const tone =
+    action === "add" ? "text-up" : action === "trim" || action === "exit" ? "text-down" : "text-text-primary";
+  const before = plan.last_stop_before ?? stopLoss;
+  const after = plan.last_new_stop;
+  const changed = after != null && before != null && after !== before;
+  const tighten = changed && (after as number) > (before as number);
+  const unchanged = after != null && before != null && after === before;
+  return (
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+      <span className="text-flat">现在</span>
+      <span className={cn("font-medium", tone)}>{label}</span>
+      {changed ? (
+        <span className="opacity-70">
+          止损 {formatPrice(before)}→{formatPrice(after)}
+          <span className={cn("ml-0.5 font-medium", tighten ? "text-up" : "text-down")}>
+            {tighten ? "↑收紧" : "↓放宽"}
+          </span>
+        </span>
+      ) : after != null ? (
+        <span className="opacity-70">
+          止损 {formatPrice(after)}{unchanged ? " 维持" : ""}
+        </span>
+      ) : null}
     </div>
   );
 }

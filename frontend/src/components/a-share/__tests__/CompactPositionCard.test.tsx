@@ -70,4 +70,52 @@ describe("CompactPositionCard", () => {
     expect(screen.getByText("85.00")).toBeTruthy();
     expect(screen.getByText("110.00")).toBeTruthy();
   });
+
+  it("plan.last_action + scale_plan -> 渲染最近建议(现在) + 未来触发计划", async () => {
+    const posWithPlan = {
+      ...pos,
+      stop_loss: 32.0,
+      plan: {
+        scale_plan: [
+          { level: 1, trigger_price: 36.5, action: "add", shares: 200, new_stop: 34.0 },
+        ],
+        doctrine: "single_v1",
+        updated_at: "2026-07-24T18:53:06+08:00",
+        last_action: "hold",
+        last_new_stop: 32.5,
+        last_stop_before: 32.0,
+      },
+    } as unknown as ActivePosition;
+    withClient(<CompactPositionCard position={posWithPlan} />);
+    await screen.findByText("100.00");
+    // 持仓建议 header + 现在 行
+    expect(screen.getByText("持仓建议")).toBeTruthy();
+    expect(screen.getByText("现在")).toBeTruthy();
+    expect(screen.getAllByText("持有").length).toBeGreaterThanOrEqual(1);
+    // 止损方向（32.0->32.5 = ↑收紧，红）
+    expect(screen.getByText("↑收紧")).toBeTruthy();
+    // 未来触发计划 ladder（非现役指令）
+    expect(screen.getByText(/未来触发计划/)).toBeTruthy();
+    expect(screen.getByText("@36.50")).toBeTruthy();  // 触发价在前
+    expect(screen.getByText("加")).toBeTruthy();  // 动作在后
+  });
+
+  it("止损下调 -> ↓放宽，一眼看出方向（防 AI 上移/下移说反）", async () => {
+    const posLoosen = {
+      ...pos,
+      stop_loss: 21.5,
+      plan: {
+        scale_plan: [],
+        doctrine: "single_v1",
+        updated_at: "2026-07-25T17:21:00+08:00",
+        last_action: "hold",
+        last_new_stop: 21.5,
+        last_stop_before: 22.0,
+      },
+    } as unknown as ActivePosition;
+    withClient(<CompactPositionCard position={posLoosen} />);
+    await screen.findByText("100.00");
+    // 止损方向（22.0->21.5 = ↓放宽，绿）
+    expect(screen.getByText("↓放宽")).toBeTruthy();
+  });
 });

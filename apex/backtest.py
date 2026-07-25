@@ -602,7 +602,7 @@ def load_long_entries(ts_code: Optional[str] = None) -> list:
     供 backtest_review 做 OOS 切分：先拿全部多头信号，按日期切 train/test，
     再各自喂 aggregate(entries=...)。避免 review 重复实现 load/filter/dedupe。
     """
-    entries = journal.load_entries(ts_code=ts_code)
+    entries = journal.load_verdicts(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
     return _dedupe_signals(long_entries)
 
@@ -622,7 +622,7 @@ def run(ts_code: Optional[str] = None,
         lookforward_days = cfg["backtest"]["lookforward_days"]
     min_entries = cfg["backtest"]["min_entries_for_analysis"]
 
-    entries = journal.load_entries(ts_code=ts_code)
+    entries = journal.load_verdicts(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
 
     if len(long_entries) < min_entries:
@@ -653,7 +653,7 @@ def run_sweep(ts_code: Optional[str] = None,
     holding_periods = sorted(set(int(p) for p in holding_periods))
     max_hp = max(holding_periods)
 
-    entries = journal.load_entries(ts_code=ts_code)
+    entries = journal.load_verdicts(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
     long_entries = _dedupe_signals(long_entries)
 
@@ -820,7 +820,7 @@ def aggregate(ts_code: Optional[str] = None,
         lookforward_days = cfg["backtest"]["lookforward_days"]
 
     if entries is None:
-        entries = journal.load_entries(ts_code=ts_code)
+        entries = journal.load_verdicts(ts_code=ts_code)
         long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
         long_entries = _dedupe_signals(long_entries)
     else:
@@ -959,7 +959,7 @@ def run_portfolio(ts_code: Optional[str] = None,
         lookforward_days = cfg["backtest"]["lookforward_days"]
     commission, stamp, _rtc, slip = _costs()
 
-    entries = journal.load_entries(ts_code=ts_code)
+    entries = journal.load_verdicts(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
     long_entries = _dedupe_signals(long_entries)
     if not long_entries:

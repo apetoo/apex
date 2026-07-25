@@ -300,7 +300,7 @@ def _dispatch_chat_tool(name: str, args: dict) -> str:
             detail = args.get("detail", "summary")
             if not ts_code:
                 return json.dumps({"error": "ts_code 不能为空"}, ensure_ascii=False)
-            latest = journal.load_latest(ts_code)
+            latest = journal.load_latest_verdict(ts_code)
             if not latest:
                 return json.dumps({"error": "无分析记录", "ts_code": ts_code}, ensure_ascii=False)
             today = is_today_entry(latest)

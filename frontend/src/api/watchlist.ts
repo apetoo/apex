@@ -23,6 +23,31 @@ import type { RuleChecklist } from "@/lib/trading-system";
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "0";
 
+/** v1.1.0: ladder 单档（加/减仓触发计划，AI 重新分析时演进） */
+export interface ScalePlanItem {
+  level?: number;
+  trigger_price?: number;
+  action?: "add" | "trim";
+  shares?: number;
+  pct?: number;
+  new_stop?: number;
+  reason?: string;
+  /** B3 sim 触发后标记，防同档每 bar 重触发 */
+  executed?: boolean;
+}
+
+/** v1.1.0: 持仓 ladder 快照（存于 active_positions.plan，AI 建议演进/B3 sim 消费） */
+export interface PositionPlan {
+  scale_plan: ScalePlanItem[];
+  /** B1 单一默认 'single_v1'；B2 按 playstyle 分桶 */
+  doctrine: string;
+  updated_at?: string | null;
+  /** B1 增强：最近 position_action 快照（持仓卡"现在 vs 未来"，区分当前决策与条件触发计划） */
+  last_action?: "hold" | "add" | "trim" | "exit" | null;
+  last_new_stop?: number | null;
+  last_stop_before?: number | null;
+}
+
 export interface ActivePosition {
   ts_code: string;
   name: string;
@@ -44,6 +69,8 @@ export interface ActivePosition {
   setup?: string;
   /** ADR-0001: 自录 Rule 检查表，close 后守规算分 */
   rule_checklist?: RuleChecklist;
+  /** v1.1.0: 持仓 ladder 快照（开仓空，AI 重新分析时演进，平仓 null） */
+  plan?: PositionPlan | null;
 }
 
 export interface ExpiresMeta {

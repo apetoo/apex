@@ -227,7 +227,7 @@ def check_journal(days: int = 3) -> dict:
     """检查近期 journal：bullish/bearish 信号分布。"""
     from apex import journal
 
-    all_entries = journal.load_entries()
+    all_entries = journal.load_verdicts()
     cutoff = (datetime.now(_TZ_CN) - timedelta(days=days)).isoformat()
 
     recent = [e for e in all_entries if (e.get("analyzed_at") or e.get("date", "")) >= cutoff]

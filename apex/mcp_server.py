@@ -40,6 +40,7 @@ from apex import (  # noqa: E402
     watchlist,
 )
 from apex.watchlist import DuplicatePositionError, PositionNotFoundError  # noqa: E402
+from apex.schemas import POSITION_ACTION_SOURCE  # noqa: E402
 
 
 mcp = FastMCP("apex-trader")
@@ -250,15 +251,23 @@ def archive_entry(ts_code: str,
 async def analyze_stock(ts_code: str, save: bool = True) -> dict:
     """跑一次 DeepSeek 个股分析（**阻塞，可能数分钟**；v2 改流式进度）。
 
-    返回 ``{ts_code, verdict}``；失败 ``{error: "analysis_failed", ts_code, detail}``。
+    返回 ``{ts_code, kind, verdict}``；失败 ``{error: "analysis_failed", ts_code, detail}``。
     on_progress 传 no-op（不消费 trace 事件；如需 trace 走 backend SSE 端点）。
+
+    v1.1.0 响应形状版本化（OV#14）-- ``kind`` 区分两套形状，MCP 客户端无 schema 须据此分发：
+      - ``kind="verdict"``（未持仓）：``verdict`` 是入场 verdict entry
+        （verdict/price_advice/features/evidence/...）。
+      - ``kind="position_action"``（已持仓）：``verdict`` 是 position_action entry
+        （``verdict=null``，``position_action={action, add_shares/trim_*, new_stop, scale_plan, rationale}``）。
+        持仓票重新分析走加减仓建议而非重入场 verdict（金字塔 doctrine）。
     """
     code = data.normalize_ts_code(ts_code)
     try:
-        verdict = await asyncio.to_thread(
+        entry = await asyncio.to_thread(
             analyze.run, code, save=save, on_progress=lambda _e: None
         )
-        return {"ts_code": code, "verdict": verdict}
+        kind = "position_action" if entry.get("source") == POSITION_ACTION_SOURCE else "verdict"
+        return {"ts_code": code, "kind": kind, "verdict": entry}
     except Exception as e:  # noqa: BLE001
         return _err("analysis_failed", ts_code=code, detail=str(e))
 

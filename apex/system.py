@@ -58,7 +58,7 @@ def _ai_plan_for(ts_code: str, entry_date: Optional[str]) -> dict:
     if not entry_date:
         return {}
     try:
-        entries = journal.load_entries(ts_code=ts_code)
+        entries = journal.load_verdicts(ts_code=ts_code)
     except Exception:
         return {}
     if not entries:

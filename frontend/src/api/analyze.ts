@@ -229,12 +229,19 @@ export async function getJournal(tsCode: string): Promise<unknown[]> {
 export interface LatestJournal {
   ts_code: string;
   analyzed_at?: string;
+  source?: string;
   verdict?: string;
   calibrated_confidence?: number;
   price_advice?: {
     entry?: number | null;
     stop_loss?: number | null;
     target?: number | null;
+  };
+  position_action?: {
+    action?: string;
+    new_stop?: number | null;
+    rationale?: string;
+    scale_plan?: unknown[];
   };
 }
 

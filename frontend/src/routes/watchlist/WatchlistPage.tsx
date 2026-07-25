@@ -349,13 +349,17 @@ export function WatchlistPage() {
     setSyncingCode(p.ts_code);
     try {
       const latest = await getLatestJournal(p.ts_code);
-      if (!latest || !latest.price_advice) {
+      if (!latest) {
         window.alert(`${p.name || p.ts_code} 暂无 AI 分析记录, 无法同步`);
         return;
       }
-      const pa = latest.price_advice;
-      const stop = pa.stop_loss ?? null;
-      const target = pa.target ?? null;
+      // position_action（持仓后最新）-> 用 new_stop；verdict -> 用 price_advice.stop_loss/target。
+      // 避免 sync 取到旧 verdict 的 stop 回退 position_action 自动覆盖的新止损。
+      const isPa = latest.source === "position_action";
+      const paAction = latest.position_action ?? {};
+      const pa = latest.price_advice ?? {};
+      const stop = isPa ? (paAction.new_stop ?? null) : (pa.stop_loss ?? null);
+      const target = isPa ? null : (pa.target ?? null);
       if (stop == null && target == null) {
         window.alert(`${p.name || p.ts_code} 最近 AI 分析未给出止损/目标`);
         return;

@@ -233,7 +233,7 @@ def compute() -> dict:
     """重算并写入 evidence_attribution.json。"""
     from apex import watchlist as _wl
     closed = _wl.load_closed_positions()
-    entries = journal.load_entries()
+    entries = journal.load_verdicts()
 
     by_pattern: dict[str, dict] = defaultdict(_empty_bucket)
     unmatched_samples: list[str] = []
