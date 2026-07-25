@@ -53,8 +53,8 @@ def _send_bark(title: str, body: str, url: str, cfg: dict) -> bool:
     api_url += "?" + urllib.parse.urlencode(params)
 
     req = urllib.request.Request(api_url, headers={"User-Agent": "apex-monitor/1.0"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=10) as resp:
+    from apex.data import _direct_opener  # 延迟 import 避免循环; 复用 certifi 直连 opener
+    with _direct_opener().open(req, timeout=10) as resp:
         raw = json.loads(resp.read().decode("utf-8"))
     return raw.get("code") == 200
 

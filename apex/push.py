@@ -236,6 +236,7 @@ def _send(envelope: dict) -> dict:
     base_s = float(retry_cfg.get("base_seconds", 1))
     max_s = float(retry_cfg.get("max_seconds", 60))
 
+    from apex.data import _SSL_CTX  # 延迟 import 避免循环; certifi context 防 python.org 证书缺失
     body = json.dumps(envelope, ensure_ascii=False, default=str).encode("utf-8")
     t0 = time.monotonic()
     last_err: Optional[str] = None
@@ -248,7 +249,7 @@ def _send(envelope: dict) -> dict:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
                 http_status = resp.getcode()
                 if 200 <= http_status < 300:
                     _write_log(envelope, attempt, "success", http_status, None, t0)

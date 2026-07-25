@@ -525,6 +525,19 @@ def run(
     if on_progress:
         on_progress(f"✓ 写入 {out_path}")
 
+    # 推送粗筛完成通知
+    try:
+        from apex import notify as _notify
+        _n = len(top_scored)
+        if _n > 0:
+            _top = top_scored[0]
+            _body = f"筛出 {_n} 只 ｜ top: {_top.get('name') or ''} {_top.get('ts_code','')} (ai_score={_top.get('ai_score')})"
+        else:
+            _body = "今日 0 只候选通过粗筛"
+        _notify.notify(f"🔍 粗筛完成 {trade_date}", _body)
+    except Exception:
+        pass  # 推送失败不阻断粗筛
+
     return {
         "trade_date": trade_date,
         "out_path": str(out_path),

@@ -2060,6 +2060,25 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             print(f"⚠ trace 写入失败（不影响 journal）: {e}")
         print(f"✓ 已保存到日志: {ts_code} → {entry['verdict']} (置信度 {entry['confidence']})")
 
+    # 推送分析完成通知（仅看多/偏多，避免中性/偏空刷屏）
+    if entry["verdict"] in BULLISH_VERDICTS:
+        try:
+            from apex import notify as _notify
+            _pa = entry.get("price_advice") or {}
+            _parts = [f"verdict {entry['verdict']} (置信度 {entry.get('confidence')})"]
+            if _pa.get("entry"):
+                _parts.append(f"入场 {_pa['entry']}")
+            if _pa.get("stop_loss"):
+                _parts.append(f"止损 {_pa['stop_loss']}")
+            if _pa.get("target"):
+                _parts.append(f"目标 {_pa['target']}")
+            _notify.notify(
+                f"📊 分析完成 {entry.get('name') or ''} {ts_code}".strip(),
+                " ｜ ".join(_parts),
+            )
+        except Exception:
+            pass  # 推送失败不阻断分析
+
     entry["_trace_events"] = events  # 当前会话直接用，不序列化到 journal
     return entry
 
