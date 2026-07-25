@@ -204,40 +204,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_chip_distribution",
-            "description": (
-                "查个股筹码分布（东财源，前复权）。返回获利比例/平均成本/90%与70%筹码价格区间及集中度，"
-                "附 Python 预计算的 profit_zone(7档含45-55%均衡区)、chip_concentration(4档)、"
-                "近10日趋势方向摘要(up/down/flat)、flags 风险/机会标记。\n"
-                "\n"
-                "**何时调用**：\n"
-                "  · 题材/游资股、成长股必查 -- 判断主力控盘程度、上方套牢盘压力、下方筹码支撑\n"
-                "  · 蓝筹/白马可选 -- 筹码结构意义弱于基本面\n"
-                "  · 配合 get_dragon_tiger_list 交叉验证「高度集中 + 龙虎榜常客 = 主力控盘」\n"
-                "\n"
-                "**关键指标解读**：\n"
-                "  · 获利比例 <10% = 上方套牢盘沉重(反弹压力); >90% = 获利盘堆积(回调抛压)\n"
-                "  · 90集中度 <8% = 高度集中(疑似主力控盘); >25% = 分散(无主力,趋势性弱)\n"
-                "  · snapshot.chip_band.lower/upper_cost = 90%筹码价格区间(非技术分析支撑/压力线)，"
-                "与 get_daily_price 最新 close 比较可知现价在筹码带的位置\n"
-                "  · trend_summary.concentration_90 down=趋于集中(吸筹), up=趋于分散(派发)\n"
-                "\n"
-                "**flags 是 Python 预计算标记，必须逐条引用，不要自己重算获利比例/集中度阈值**"
-                "（与 get_fundamentals.summary.flags 同款）。flags 不含实时价格判断，"
-                "现价相对筹码带的位置由 AI 用 get_daily_price 最新 close 自行比对。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ts_code": {"type": "string", "description": "股票代码，如 002050.SZ"},
-                },
-                "required": ["ts_code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "mx_data_query",
             "description": (
                 "妙想金融数据查询（东方财富官方数据源）。支持自然语言查询行情、财务、"
@@ -1636,7 +1602,6 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "\n"
                 "   **结构化补充工具（推荐使用，但非强制）**：\n"
                 "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
-                "   · get_chip_distribution - 筹码分布（获利比例/集中度/筹码区间+预计算flags）；题材/游资、成长股必查，判断主力控盘/套牢盘压力/筹码支撑；与龙虎榜交叉验证\n"
                 "   · mx_data_query — 妙想金融数据查询（东方财富）。**蓝筹/白马和成长股必须至少调用 1 次**，\n"
                 "     查营收/净利润/ROE/毛利率/经营现金流等深度财务数据，否则基本面权重是空壳。\n"
                 "     题材/游资股可选，但建议查一下排除业绩暴雷风险。\n"
