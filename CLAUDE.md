@@ -91,7 +91,7 @@ frontend/src/
 └── types/verdict.ts        # VERDICT_COLOR TS const
 ```
 
-Vite proxy (`/api` → 127.0.0.1:8000) for dev. Production: `VITE_USE_MOCK=0 npm run build` + nginx from `docs/deploy/nginx.conf`.
+Vite proxy (`/api` → 127.0.0.1:8000) for dev. Production: `npm run build` + nginx from `docs/deploy/nginx.conf`.
 
 Routes:
 - `/` Overview — market index bar (ED13 single source) + positions + chat trigger
@@ -101,7 +101,7 @@ Routes:
 - `/backtest` — per-signal bar chart + stats table + realized closed trades
 - `/screener` — strategy weight sliders (localStorage) + report with regime/by_strategy/top_scored
 
-SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `chunk` / `done` / `error`. The frontend's `useSSE` is hand-written (no `@microsoft/fetch-event-source` — default auto-reconnect re-runs DeepSeek + double-writes journal). All SSE paths support a `fetchFn` injection for dev mock (no MSW).
+SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `chunk` / `done` / `error`. The frontend's `useSSE` is hand-written (no `@microsoft/fetch-event-source` — default auto-reconnect re-runs DeepSeek + double-writes journal). All SSE paths support a `fetchFn` injection (for unit tests; no MSW).
 
 ## Critical conventions
 
@@ -122,9 +122,9 @@ SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `c
 
 **Adding an AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The agent dispatches by name through `_dispatch_tool` which only looks at `TOOL_FUNCTIONS`.
 
-**SSE data contract (cross前后端).** `sse_starlette` 3.x 的 `EventSourceResponse` 对 `data` 直接 `str()` —— dict 会变 Python repr（单引号），前端 `JSON.parse` 必失败。所以 `backend/core/streaming.py` 的 `_sse()` helper 把 data 先 `json.dumps(ensure_ascii=False, default=str)` 成字符串再 yield；**新增 SSE 事件必须走 `_sse()`，不要直接 `yield {"event":..., "data": <dict>}`**。另一坑：sse_starlette 行尾是 `\r\n`（事件间 `\r\n\r\n`），而 dev mock 的 `sseEncode` 用 `\n` —— 前端 `useSSE.parseSSEChunk` 必须用 `split(/\r?\n\r?\n/)` 兼容两者，否则真后端事件全堆 buffer、mock 单测却全过（盲区）。
+**SSE data contract (cross前后端).** `sse_starlette` 3.x 的 `EventSourceResponse` 对 `data` 直接 `str()` —— dict 会变 Python repr（单引号），前端 `JSON.parse` 必失败。所以 `backend/core/streaming.py` 的 `_sse()` helper 把 data 先 `json.dumps(ensure_ascii=False, default=str)` 成字符串再 yield；**新增 SSE 事件必须走 `_sse()`，不要直接 `yield {"event":..., "data": <dict>}`**。另一坑：sse_starlette 行尾是 `\r\n`（事件间 `\r\n\r\n`），而单测用例用 `\n` —— 前端 `useSSE.parseSSEChunk` 必须用 `split(/\r?\n\r?\n/)` 兼容两者，否则真后端事件全堆 buffer、单测却全过（盲区）。
 
-**analyze verdict 字段形状（勿按 mock 写前端）.** 真后端 `analyze.run` 返回的 entry 是**嵌套**结构：`price_advice: {entry, stop_loss, target, position_size_pct}`、`evidence: string[]`、`analysis_text`（非 `note`）、`calibrated_confidence` / `calibration_explanation`、`analyzed_at`（非 `date`）。前端 mock（`api/analyze.ts`）用的是平铺 `entry_price`/`stop_loss`/`note` —— **写前端字段前以 `apex/analyze.py:run` 的返回 dict 为准，别照 mock 抄**。`tool_result` trace 事件同理带的是 `summary`(dict) + `raw`(原始 JSON str)，不是 `result`。共享渲染走 `components/a-share/VerdictDetailCard`，AI 叙述走 `components/base/Markdown`（AI 输出含 markdown，别用 `whitespace-pre-wrap` 纯文本）。
+**analyze verdict 字段形状.** `analyze.run` 返回的 entry 是**嵌套**结构：`price_advice: {entry, stop_loss, target, position_size_pct}`、`evidence: string[]`、`analysis_text`（非 `note`）、`calibrated_confidence` / `calibration_explanation`、`analyzed_at`（非 `date`）。**写前端字段前以 `apex/analyze.py:run` 的返回 dict 为准**。`tool_result` trace 事件同理带的是 `summary`(dict) + `raw`(原始 JSON str)，不是 `result`。共享渲染走 `components/a-share/VerdictDetailCard`，AI 叙述走 `components/base/Markdown`（AI 输出含 markdown，别用 `whitespace-pre-wrap` 纯文本）。
 
 **分时不是 AI 工具，且原始 bars 不落盘.** `get_intraday_snapshot` / `get_intraday_bars` 不在 `data.TOOL_FUNCTIONS` —— 别把它们注册成 AI 工具（启动时 `_format_intraday_block` 强制注入特征到 prompt，设计上不让 AI 决定调不调）。分时原始 1 分钟 bars 在 Python 压成特征后即弃，**不进 prompt、不写 trace.jsonl**；trace 里只有日线 raw（`get_daily_price` 是工具，落 `tool_result.raw`）。所以前端分时图只能实时调 `/api/market/intraday/{ts_code}/bars`，**无法从 trace 回放历史分时**。
 
