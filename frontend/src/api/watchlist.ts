@@ -5,23 +5,19 @@ import type { RuleChecklist } from "@/lib/trading-system";
  * Watchlist API
  *
  * 对应 backend/routers/watchlist.py:
- *   GET    /api/watchlist               → { active_positions, candidates, archived }
- *   POST   /api/watchlist/positions     → 加持仓
- *   POST   /api/watchlist/positions/replace → 替换重复持仓(409 后用)
- *   POST   /api/watchlist/candidates    → 加候选
- *   POST   /api/watchlist/promote       → 候选→持仓(实际成交)
- *   POST   /api/watchlist/close         → 平仓(返回 diagnosis)
- *   POST   /api/watchlist/archive       → 归档
- *   GET    /api/watchlist/closed        → 已平仓
- *   POST   /api/watchlist/migrate       → 一次性迁移
+ *   GET    /api/watchlist               -> { active_positions, candidates, archived }
+ *   POST   /api/watchlist/positions     -> 加持仓
+ *   POST   /api/watchlist/positions/replace -> 替换重复持仓(409 后用)
+ *   POST   /api/watchlist/candidates    -> 加候选
+ *   POST   /api/watchlist/promote       -> 候选->持仓(实际成交)
+ *   POST   /api/watchlist/close         -> 平仓(返回 diagnosis)
+ *   POST   /api/watchlist/archive       -> 归档
+ *   GET    /api/watchlist/closed        -> 已平仓
+ *   POST   /api/watchlist/migrate       -> 一次性迁移
  *
  * 字段定义见 apex/watchlist.py(单 user, 文件存储)。
  * ED3 失效矩阵的失效目标 = ['watchlist', 'account', 'triggers', 'closed', 'calibration']
- *
- * PR1b: dev mock 模式联调(后端大概率没跑)。
  */
-
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "0";
 
 /** v1.1.0: ladder 单档（加/减仓触发计划，AI 重新分析时演进） */
 export interface ScalePlanItem {
@@ -168,11 +164,9 @@ export interface SellResponseClosed {
 export type SellResponse = SellResponsePartial | SellResponseClosed;
 
 /**
- * 平仓复盘 diagnosis（apex/postmortem.py:run_and_patch 返回的 dict，非字符串）。
+ * 平仓复盘 diagnosis（apex/postmortem.py:run_and_patch 返回的 dict）。
  * 机械字段由代码算好（outcome_class / nearly_hit_target / stop_hit_too_tight /
  * calibration_bucket / target_distance_max_pct），AI 只填因果解释。
- * **注意**: dev mock 的 closePosition 返回字符串 diagnosis，真后端返回此对象 --
- * 渲染端必须兼容两者（见 WatchlistPage 平仓弹窗）。
  */
 export interface PostmortemDiagnosis {
   /** "win" | "loss"（机械判定：realized_pnl >= 0） */
@@ -231,52 +225,8 @@ export interface ClosedPosition {
   [k: string]: unknown;
 }
 
-const MOCK_DATA: WatchlistData = {
-  active_positions: [
-    {
-      ts_code: "002466.SZ",
-      name: "天齐锂业",
-      entry_price: 66.04,
-      entry_date: "2026-06-24",
-      stop_loss: 60.71,
-      target: 72.0,
-      trigger_price: null,
-      trigger_direction: "below",
-      expires_at: "2026-07-04",
-      status: "active",
-      position_size_shares: 100,
-      risk_amount: 533,
-      strategy: "analyze",
-    },
-  ],
-  candidates: [
-    {
-      ts_code: "002415.SZ",
-      name: "海康威视",
-      trigger_price: 31.5,
-      trigger_direction: "below",
-      expires_at: "2026-06-30",
-      note: "AI建议买入 31.5(止损 30.16 目标 35)",
-      stop_advice: 30.16,
-      target_advice: 35,
-    },
-    {
-      ts_code: "002475.SZ",
-      name: "立讯精密",
-      trigger_price: 66.0,
-      trigger_direction: "below",
-      expires_at: "2026-06-30",
-      note: "AI偏多但未给价位, 手动设触发 66.0",
-      stop_advice: 0,
-      target_advice: 0,
-    },
-  ],
-  archived: [],
-};
-
 /** GET /api/watchlist */
 export async function getWatchlist(): Promise<WatchlistData> {
-  if (USE_MOCK) return MOCK_DATA;
   return api.get<WatchlistData>("/watchlist");
 }
 
@@ -336,195 +286,49 @@ export interface AddPositionPayload {
   position_size_shares?: number;
 }
 
-/** POST /api/watchlist/candidates — 响应带过期归因 meta */
+/** POST /api/watchlist/candidates - 响应带过期归因 meta */
 export async function addCandidate(
   payload: AddCandidatePayload,
 ): Promise<{ message: string; ts_code: string } & ExpiresMeta> {
-  if (USE_MOCK) {
-    // 对齐真后端: expires_days 不传(undefined)→ mock 动态默认 7; 显式传→manual
-    const isManual = payload.expires_days != null;
-    const days = payload.expires_days ?? 7;
-    const meta: ExpiresMeta = isManual
-      ? { expires_days: days, method: "manual" }
-      : { expires_days: days, method: "vol_based", realized_vol: 0.03, distance_pct: 5.2, t_trading: 2.99 };
-    MOCK_DATA.candidates.push({
-      ts_code: payload.ts_code,
-      name: payload.name,
-      trigger_price: payload.trigger_price,
-      trigger_direction: payload.trigger_direction ?? "below",
-      expires_at: new Date(Date.now() + days * 86400000).toISOString().slice(0, 10),
-      expires_meta: meta,
-      note: payload.note ?? `手动加候选 触发 ${payload.trigger_price}`,
-      stop_advice: payload.stop_advice ?? 0,
-      target_advice: payload.target_advice ?? 0,
-      ...(payload.setup ? { setup: payload.setup } : {}),
-      ...(payload.trigger_low != null ? { trigger_low: payload.trigger_low } : {}),
-      ...(payload.trigger_high != null ? { trigger_high: payload.trigger_high } : {}),
-    });
-    return { message: "Candidate added (mock)", ts_code: payload.ts_code, ...meta };
-  }
   return api.post("/watchlist/candidates", payload);
 }
 
-/** POST /api/watchlist/positions — 409 DuplicatePositionError 抛 ApiError */
+/** POST /api/watchlist/positions - 409 DuplicatePositionError 抛 ApiError */
 export async function addPosition(
   payload: AddPositionPayload,
 ): Promise<{ message: string; ts_code: string }> {
-  if (USE_MOCK) {
-    if (MOCK_DATA.active_positions.some((p) => p.ts_code === payload.ts_code)) {
-      throw new ApiError(409, `已存在 ${payload.ts_code} 持仓`, {
-        ts_code: payload.ts_code,
-        existing: MOCK_DATA.active_positions.find(
-          (p) => p.ts_code === payload.ts_code,
-        ),
-      });
-    }
-    MOCK_DATA.active_positions.push({
-      ts_code: payload.ts_code,
-      name: payload.name,
-      entry_price: payload.entry_price,
-      entry_date: new Date().toISOString().slice(0, 10),
-      stop_loss: payload.stop_loss,
-      target: payload.target,
-      trigger_price: null,
-      trigger_direction: "below",
-      expires_at: new Date(Date.now() + 10 * 86400000)
-        .toISOString()
-        .slice(0, 10),
-      status: "active",
-      position_size_shares: payload.position_size_shares ?? payload.shares,
-      risk_amount:
-        payload.position_size_shares && payload.entry_price
-          ? Math.abs(payload.entry_price - payload.stop_loss) *
-            payload.position_size_shares
-          : undefined,
-    });
-    return { message: "Position added (mock)", ts_code: payload.ts_code };
-  }
   return api.post("/watchlist/positions", payload);
 }
 
-/** POST /api/watchlist/positions/replace — 409 后用 */
+/** POST /api/watchlist/positions/replace - 409 后用 */
 export async function replacePosition(
   payload: AddPositionPayload,
 ): Promise<{ message: string; ts_code: string }> {
-  if (USE_MOCK) {
-    const i = MOCK_DATA.active_positions.findIndex(
-      (p) => p.ts_code === payload.ts_code,
-    );
-    if (i >= 0) MOCK_DATA.active_positions.splice(i, 1);
-    MOCK_DATA.active_positions.push({
-      ts_code: payload.ts_code,
-      name: payload.name,
-      entry_price: payload.entry_price,
-      entry_date: new Date().toISOString().slice(0, 10),
-      stop_loss: payload.stop_loss,
-      target: payload.target,
-      trigger_price: null,
-      trigger_direction: "below",
-      expires_at: new Date(Date.now() + 10 * 86400000)
-        .toISOString()
-        .slice(0, 10),
-      status: "active",
-      position_size_shares: payload.position_size_shares ?? payload.shares,
-    });
-    return { message: "Replaced (mock)", ts_code: payload.ts_code };
-  }
   return api.post("/watchlist/positions/replace", payload);
 }
 
-/** POST /api/watchlist/promote — 候选→持仓 */
+/** POST /api/watchlist/promote - 候选->持仓 */
 export async function promoteCandidate(
   payload: PromotePayload,
 ): Promise<{ message: string; ts_code: string }> {
-  if (USE_MOCK) {
-    const c = MOCK_DATA.candidates.find((x) => x.ts_code === payload.ts_code);
-    if (c) {
-      MOCK_DATA.active_positions.push({
-        ts_code: c.ts_code,
-        name: c.name,
-        entry_price: payload.entry_price,
-        entry_date: new Date().toISOString().slice(0, 10),
-        stop_loss: payload.stop_loss,
-        target: payload.target,
-        trigger_price: null,
-        trigger_direction: "below",
-        expires_at: new Date(Date.now() + 10 * 86400000)
-          .toISOString()
-          .slice(0, 10),
-        status: "active",
-        position_size_shares: payload.shares,
-        ...(payload.setup ? { setup: payload.setup } : {}),
-        ...(payload.rule_checklist ? { rule_checklist: payload.rule_checklist } : {}),
-      });
-      MOCK_DATA.archived.push({
-        ...c,
-        status: "archived_promoted",
-        archived_at: new Date().toISOString(),
-      });
-      MOCK_DATA.candidates = MOCK_DATA.candidates.filter(
-        (x) => x.ts_code !== payload.ts_code,
-      );
-    }
-    return { message: "Promoted (mock)", ts_code: payload.ts_code };
-  }
   return api.post("/watchlist/promote", payload);
 }
 
-/** POST /api/watchlist/close — 平仓 + 触发 postmortem diagnosis */
+/** POST /api/watchlist/close - 平仓 + 触发 postmortem diagnosis */
 export async function closePosition(
   payload: ClosePositionPayload,
 ): Promise<{ message: string; record: unknown; diagnosis: PostmortemDiagnosis | string | null }> {
-  if (USE_MOCK) {
-    const i = MOCK_DATA.active_positions.findIndex(
-      (p) => p.ts_code === payload.ts_code,
-    );
-    const closed = i >= 0 ? MOCK_DATA.active_positions.splice(i, 1)[0] : null;
-    const record = {
-      ...(closed ?? { ts_code: payload.ts_code }),
-      exit_price: payload.exit_price,
-      exit_date: payload.exit_date,
-      net_return:
-        closed && closed.entry_price
-          ? (payload.exit_price - closed.entry_price) / closed.entry_price
-          : 0,
-    };
-    return {
-      message: "Closed (mock)",
-      record,
-      diagnosis: `AI 复盘: ${payload.ts_code} 已平仓, 收益 ${
-        record.net_return >= 0 ? "+" : ""
-      }${(record.net_return * 100).toFixed(2)}%。回顾入场逻辑, 检查 ${closed?.note ?? "AI verdict"} 决策依据。`,
-    };
-  }
   return api.post("/watchlist/close", payload);
 }
 
-/** POST /api/watchlist/archive */
-/** POST /api/watchlist/candidates/{ts_code}/renew — 续期已过期候选(不调 AI) */
+/** POST /api/watchlist/candidates/{ts_code}/renew - 续期已过期候选(不调 AI) */
 export async function renewCandidate(
   ts_code: string,
 ): Promise<{ message: string; ts_code: string; renew_count: number } & ExpiresMeta> {
-  if (USE_MOCK) {
-    const c = MOCK_DATA.candidates.find((x) => x.ts_code === ts_code);
-    if (!c) throw new Error(`候选 ${ts_code} 不存在`);
-    const days = 7;
-    const meta: ExpiresMeta = {
-      expires_days: days,
-      method: "vol_based",
-      realized_vol: 0.03,
-      distance_pct: 5.2,
-      t_trading: 2.99,
-    };
-    c.expires_at = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
-    c.expires_meta = meta;
-    c.renew_count = (c.renew_count ?? 0) + 1;
-    return { message: "Candidate renewed (mock)", ts_code, renew_count: c.renew_count, ...meta };
-  }
   return api.post(`/watchlist/candidates/${ts_code}/renew`);
 }
 
-/** POST /api/watchlist/candidates/{ts_code}/sync-ai — 同步最近 AI 分析到候选(三字段全覆盖) */
+/** POST /api/watchlist/candidates/{ts_code}/sync-ai - 同步最近 AI 分析到候选(三字段全覆盖) */
 export async function syncCandidateAi(
   ts_code: string,
 ): Promise<{
@@ -535,40 +339,13 @@ export async function syncCandidateAi(
   target_advice: number | null;
   analyzed_at: string;
 } & ExpiresMeta> {
-  if (USE_MOCK) {
-    const c = MOCK_DATA.candidates.find((x) => x.ts_code === ts_code);
-    if (!c) throw new Error(`候选 ${ts_code} 不存在`);
-    c.trigger_price = 68.7;
-    c.stop_advice = 65.5;
-    c.target_advice = 76;
-    const days = 7;
-    const meta: ExpiresMeta = { expires_days: days, method: "vol_based", realized_vol: 0.04, distance_pct: 3, t_trading: 0.56 };
-    c.expires_at = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
-    c.expires_meta = meta;
-    return { message: "Candidate synced (mock)", ts_code, trigger_price: 68.7, stop_advice: 65.5, target_advice: 76, analyzed_at: "2026-07-01T09:53:52+08:00", ...meta };
-  }
   return api.post(`/watchlist/candidates/${ts_code}/sync-ai`);
 }
 
+/** POST /api/watchlist/archive */
 export async function archiveEntry(
   payload: ArchivePayload,
 ): Promise<{ message: string; moved: boolean }> {
-  if (USE_MOCK) {
-    let moved = false;
-    const i = MOCK_DATA.candidates.findIndex(
-      (c) => c.ts_code === payload.ts_code,
-    );
-    if (i >= 0) {
-      const [c] = MOCK_DATA.candidates.splice(i, 1);
-      MOCK_DATA.archived.push({
-        ...c,
-        status: `archived_${payload.reason}`,
-        archived_at: new Date().toISOString(),
-      });
-      moved = true;
-    }
-    return { message: moved ? "Entry archived (mock)" : "Entry not found", moved };
-  }
   return api.post("/watchlist/archive", payload);
 }
 
@@ -577,12 +354,12 @@ export async function buy(payload: BuyPayload): Promise<BuyResponse> {
   return api.post("/watchlist/buy", payload);
 }
 
-/** POST /api/watchlist/sell — 减仓或卖光 */
+/** POST /api/watchlist/sell - 减仓或卖光 */
 export async function sell(payload: SellPayload): Promise<SellResponse> {
   return api.post("/watchlist/sell", payload);
 }
 
-/** POST /api/watchlist/positions/{ts_code}/advice — 更新止损/目标(覆盖) */
+/** POST /api/watchlist/positions/{ts_code}/advice - 更新止损/目标(覆盖) */
 export interface UpdateAdvicePayload {
   ts_code: string;
   stop_loss?: number;
@@ -646,7 +423,7 @@ export async function updateCandidate(
   return api.patch(`/watchlist/candidates/${encodeURIComponent(ts_code)}`, payload);
 }
 
-/** GET /api/watchlist/trades — 交易流水(倒序) */
+/** GET /api/watchlist/trades - 交易流水(倒序) */
 export async function getTrades(params?: {
   ts_code?: string;
   limit?: number;
@@ -660,12 +437,11 @@ export async function getTrades(params?: {
   return api.get<Trade[]>(`/watchlist/trades${q ? `?${q}` : ""}`);
 }
 
-/** GET /api/watchlist/closed — 已平仓记录（按 closed_at 倒序）。 */
+/** GET /api/watchlist/closed - 已平仓记录（按 closed_at 倒序）。 */
 export async function getClosedPositions(params?: {
   limit?: number;
   since_days?: number;
 }): Promise<ClosedPosition[]> {
-  if (USE_MOCK) return [];
   const qs = new URLSearchParams();
   if (params?.limit) qs.set("limit", String(params.limit));
   if (params?.since_days) qs.set("since_days", String(params.since_days));

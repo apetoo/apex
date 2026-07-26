@@ -4,12 +4,10 @@
  * GET  /api/system          - 读 system.json（无则 null）
  * POST /api/system/recompute - 重算并落盘
  *
- * 字段形状以 apex/system.py:compute() 的返回为准（勿按 mock 写）。
+ * 字段形状以 apex/system.py:compute() 的返回为准。
  */
 
 import { api } from "./client";
-
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "0";
 
 export type Confidence =
   | "ok"
@@ -113,15 +111,10 @@ export interface SystemView {
 
 /** GET /api/system -> SystemView | null（无 system.json 时后端返回 null） */
 export async function getSystem(): Promise<SystemView | null> {
-  if (USE_MOCK) return null;
   return api.get<SystemView | null>("/system");
 }
 
 /** POST /api/system/recompute -> 重算后的 SystemView */
 export async function recomputeSystem(): Promise<SystemView> {
-  if (USE_MOCK) {
-    // dev mock 下不真算，抛错让 UI 提示「需 VITE_USE_MOCK=0 + 后端」
-    throw new Error("system recompute 需要真实后端 (VITE_USE_MOCK=0)");
-  }
   return api.post<SystemView>("/system/recompute");
 }

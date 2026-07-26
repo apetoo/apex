@@ -9,10 +9,7 @@ import { api } from "./client";
  *   error
  *
  * ED16(修正, outside voice #12): 权重存 localStorage, 不持久化到后端
- * ED8(修正, outside voice #7): SSE 单测不依赖 MSW, 同 analyze/chat
  */
-
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "0";
 
 export interface ScreenerStrategy {
   name: string;
@@ -58,52 +55,7 @@ export interface ScreenerReport {
   };
 }
 
-const MOCK_STRATEGIES: ScreenerStrategy[] = [
-  { name: "momentum", description: "动量: 突破 MA20 + 量比 > 1.5" },
-  { name: "value", description: "价值: PE-TTM < 行业均值 + PB < 2" },
-  { name: "growth", description: "成长: 营收同比 > 20% + 净利润同比 > 15%" },
-  { name: "reversal", description: "反转: RSI < 30 + 远离 MA20" },
-];
-
-const MOCK_REPORT: ScreenerReport = {
-  date: "2026-06-25",
-  picks: [
-    {
-      ts_code: "002466.SZ",
-      name: "天齐锂业",
-      score: 0.85,
-      passed_filters: 4,
-      total_filters: 5,
-      notes: "锂电板块情绪修复, 量能温和放大",
-    },
-    {
-      ts_code: "002415.SZ",
-      name: "海康威视",
-      score: 0.78,
-      passed_filters: 3,
-      total_filters: 5,
-      notes: "估值合理, 智能物联业务有韧性",
-    },
-    {
-      ts_code: "002475.SZ",
-      name: "立讯精密",
-      score: 0.72,
-      passed_filters: 3,
-      total_filters: 5,
-      notes: "果链龙头, 关注新机周期",
-    },
-  ],
-  summary: {
-    total_screened: 5423,
-    passed: 87,
-    by_strategy: { momentum: 32, value: 28, growth: 18, reversal: 9 },
-  },
-  ai_summary:
-    "今日情绪面回暖, 锂电板块资金关注度提升; 价值股整体偏弱; 反转信号在科创板小票中较多, 需谨慎追高。",
-};
-
 export async function getStrategies(): Promise<ScreenerStrategy[]> {
-  if (USE_MOCK) return MOCK_STRATEGIES;
   const data = await api.get<{
     weights: ScreenerWeights;
     strategies: ScreenerStrategy[];
@@ -112,9 +64,6 @@ export async function getStrategies(): Promise<ScreenerStrategy[]> {
 }
 
 export async function getDefaultWeights(): Promise<ScreenerWeights> {
-  if (USE_MOCK) {
-    return { momentum: 0.25, value: 0.25, growth: 0.25, reversal: 0.25 };
-  }
   const data = await api.get<{
     weights: ScreenerWeights;
     strategies: ScreenerStrategy[];
@@ -123,7 +72,6 @@ export async function getDefaultWeights(): Promise<ScreenerWeights> {
 }
 
 export async function getReport(date?: string): Promise<ScreenerReport | null> {
-  if (USE_MOCK) return MOCK_REPORT;
   const raw = await api.get<Record<string, unknown> | null>(
     date ? `/screener/report?date=${date}` : "/screener/report",
   );
@@ -216,18 +164,17 @@ export function adaptScreenerReport(
 }
 
 export async function getAvailableDates(): Promise<string[]> {
-  if (USE_MOCK) return ["2026-06-23", "2026-06-24", "2026-06-25"];
   return api.get<string[]>("/screener/dates");
 }
 
 /**
  * 因子评测表（策略体检）：IC + pool-alpha + 4 态 verdict。
  *
- * GET /screener/factor-ic —— 读已落盘的 factor_ic.json（快，不跑回测），无则 null。
- * POST /screener/factor-ic/run —— 触发一次回测（同步，涨停池基准开启时可能数分钟）。
+ * GET /screener/factor-ic -- 读已落盘的 factor_ic.json（快，不跑回测），无则 null。
+ * POST /screener/factor-ic/run -- 触发一次回测（同步，涨停池基准开启时可能数分钟）。
  *
  * verdict 4 态优先级: n_insufficient > alpha_unavailable > dead_weight > live_candidate
- * 字段形状以 apex/screener_backtest.py:run 返回的 factor_ic payload 为准（别按 mock 抄）。
+ * 字段形状以 apex/screener_backtest.py:run 返回的 factor_ic payload 为准。
  */
 export interface FactorIcRow {
   key: string;
@@ -265,94 +212,13 @@ export interface FactorIcPayload {
 }
 
 export async function getFactorIc(): Promise<FactorIcPayload | null> {
-  if (USE_MOCK) return MOCK_FACTOR_IC;
   return api.get<FactorIcPayload | null>("/screener/factor-ic");
 }
 
 export async function runFactorIc(noBenchmark = true): Promise<FactorIcPayload> {
-  // 真后端同步触发；mock 直接返回 mock 数据（dev 下不真跑回测）
-  if (USE_MOCK) return MOCK_FACTOR_IC;
   return api.post<FactorIcPayload>(
     `/screener/factor-ic/run?no_benchmark=${noBenchmark ? "true" : "false"}`,
   );
-}
-
-const MOCK_FACTOR_IC: FactorIcPayload = {
-  generated_at: "2026-06-30T13:00:00+08:00",
-  lookforward_days: 10,
-  horizons: [1, 5, 10],
-  reports_scanned: 11,
-  reports_used: 8,
-  total_candidates: 110,
-  thresholds: {
-    min_fillable_n: 10,
-    min_n_dates: 8,
-    min_benchmark_n: 5,
-    ic_dead: 0.05,
-    alpha_dead: 0.01,
-  },
-  by_strategy: [
-    {
-      key: "leader_with_volume",
-      n: 16, fillable_n: 14, unfillable_count: 2,
-      benchmark: "limit_up_pool_skipped", benchmark_n: 0, benchmark_missing_count: 14,
-      ic_1d: 0.88, ic_5d: 0.27, ic_10d: 0.21,
-      ir_5d: null, t_stat_5d: null, n_dates_5d: 1,
-      pool_alpha_5d: null, verdict: "n_insufficient",
-    },
-    {
-      key: "first_board_leader",
-      n: 38, fillable_n: 37, unfillable_count: 1,
-      benchmark: "limit_up_pool_skipped", benchmark_n: 0, benchmark_missing_count: 37,
-      ic_1d: 0.21, ic_5d: -0.12, ic_10d: 0.15,
-      ir_5d: -0.5, t_stat_5d: -0.7, n_dates_5d: 2,
-      pool_alpha_5d: null, verdict: "n_insufficient",
-    },
-    {
-      key: "industry_rotation",
-      n: 15, fillable_n: 15, unfillable_count: 0,
-      benchmark: "industry_sector_unavailable", benchmark_n: 0, benchmark_missing_count: 15,
-      ic_1d: -0.37, ic_5d: 0.03, ic_10d: -0.03,
-      ir_5d: null, t_stat_5d: null, n_dates_5d: 1,
-      pool_alpha_5d: null, verdict: "n_insufficient",
-    },
-  ],
-};
-
-
-function sseEncode(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-/** dev mock: 流式进度 + 终态报告 */
-export function buildMockScreenerFetcher() {
-  return async (): Promise<Response> => {
-    const encoder = new TextEncoder();
-    const progressSteps = [
-      "加载股票池(沪深京 A 股 5423 只)...",
-      "执行动量策略...",
-      "执行价值策略...",
-      "执行成长策略...",
-      "执行反转策略...",
-      "AI 综合评估中...",
-    ];
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        for (const msg of progressSteps) {
-          await new Promise((r) => setTimeout(r, 300));
-          controller.enqueue(
-            encoder.encode(
-              sseEncode("trace", { type: "progress", message: msg }),
-            ),
-          );
-        }
-        await new Promise((r) => setTimeout(r, 200));
-        controller.enqueue(encoder.encode(sseEncode("done", MOCK_REPORT)));
-        controller.close();
-      },
-    });
-    return new Response(stream, { status: 200 }) as unknown as Response;
-  };
 }
 
 export function screenerFetchFn(weights: ScreenerWeights) {
@@ -362,11 +228,6 @@ export function screenerFetchFn(weights: ScreenerWeights) {
     body: unknown;
     signal: AbortSignal;
   }): Promise<Response> => {
-    if (USE_MOCK) {
-      // 真后端路径才用 weights, mock 忽略(让函数签名仍可带 weights 准备切真后端)
-      void weights;
-      return buildMockScreenerFetcher()();
-    }
     return fetch(params.path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -402,6 +263,6 @@ export function saveWeights(weights: ScreenerWeights): void {
   try {
     localStorage.setItem(WEIGHTS_KEY, JSON.stringify(weights));
   } catch {
-    // localStorage 不可用(隐私模式/配额满)→ 静默, 用内存默认
+    // localStorage 不可用(隐私模式/配额满)-> 静默, 用内存默认
   }
 }

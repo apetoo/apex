@@ -49,14 +49,15 @@ git clone https://github.com/apetoo/apex.git
 cd apex
 cp config.example.yaml config.yaml   # 填入你的 tushare / deepseek / bocha token
 
-# 2. 后端
-uv venv && source .venv/bin/activate
-uv pip install -r requirements.txt
-uvicorn backend.main:app --reload --port 8000
+# 2. 装依赖（Python + Node 一条龙，含创建 .venv）
+npm run setup
 
-# 3. 前端（另开终端）
-cd frontend && npm install && VITE_USE_MOCK=0 npm run dev
+# 3. 起前后端（一条命令，Ctrl-C 一起停）
+npm run dev
 ```
+
+- 前端: http://localhost:5173
+- 后端 API 文档: http://localhost:8000/docs （`/api` 由 Vite proxy 转发到 8000）
 
 > 需要自备 [tushare](https://tushare.pro/) token 与 [DeepSeek](https://platform.deepseek.com/) API Key。详见[配置](#三配置)。
 
@@ -78,6 +79,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ## 二、安装
+
+> 一键装：`npm run setup`（= `uv venv` + `uv pip install -r requirements.txt` + `cd frontend && npm install`）。下面是分步说明。
 
 ### 后端（Python）
 
@@ -242,27 +245,17 @@ auto_trade:
 
 ## 四、启动
 
-### 后端（FastAPI）
-
 ```bash
-# 激活 .venv 后
-uvicorn backend.main:app --reload --port 8000
-# API 文档: http://localhost:8000/docs
-# 健康检查: http://localhost:8000/api/health
+npm run dev
 ```
 
-### 前端（Vite + React）
+`concurrently` 同时起前后端：后端 `uvicorn :8000`（绿）、前端 `vite :5173`（青），日志带前缀区分，Ctrl-C 一起停。Vite 把 `/api` 代理到 `127.0.0.1:8000`。
 
-```bash
-cd frontend
-npm run dev          # http://localhost:5173
-```
+- 前端: http://localhost:5173
+- 后端 API 文档: http://localhost:8000/docs
+- 健康检查: http://localhost:8000/api/health
 
-dev 模式 Vite 把 `/api` 代理到 `127.0.0.1:8000`。前端默认走 **mock 数据**（后端不在也能跑可视化），要切真后端：
-
-```bash
-VITE_USE_MOCK=0 npm run dev
-```
+只想起一端调试：`npm run backend` / `npm run frontend`。
 
 ### 页面路由
 
@@ -428,13 +421,12 @@ tar -czf apex-data-$(date +%Y%m%d).tar.gz ~/.stock-watchlist ~/.stock-journal
 
 - 后端 systemd unit 用 `--workers 1`（SSE 流式需常驻连接，多 worker 会让 stream 中断）
 - nginx 必须 `proxy_buffering off` + `proxy_read_timeout 600s`（单次 AI 分析可能跑 5–10 分钟）
-- 前端 build 前设 `VITE_USE_MOCK=0`，否则上线后全走前端 mock
 - CORS 上线收紧到实际域名（默认 `allow_origins=["*"]`）
 
 ```bash
 # 前端构建
 cd frontend
-VITE_USE_MOCK=0 npm run build      # 产物到 dist/，由 nginx 直接服务
+npm run build      # 产物到 dist/，由 nginx 直接服务
 
 # 后端
 sudo systemctl restart apex-backend
