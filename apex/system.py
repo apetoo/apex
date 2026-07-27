@@ -218,6 +218,59 @@ def _behavior(closed: list, all_trades: list, buys: list) -> dict:
         "take_profit_discipline": _take_profit_discipline(closed),
         "hold_period_distribution": _hold_distribution(closed),
         "proxy_emotional": _proxy_emotional(closed, all_trades, buys),
+        "position_action_adherence": _position_action_adherence(all_trades),
+    }
+
+
+def _position_action_adherence(all_trades: list) -> dict:
+    """加减仓 adherence 聚合（design: premise 1 矩阵 + D6 scale_plan）。
+
+    遍历 all_trades 的 adherence 字段分桶：follow / deviate / partial / na / null + stale 子集。
+    malformed adherence（非 dict，含 D4 老 trade 无此字段）按 null 处理（failure mode 表，跳过不崩）。
+
+    Q2 决策（用户推迟、不阻断 correctness，此处拍板）：confidence 口径的 n 排除 stale。
+    理由：stale position_action（>14d）是冷信号，进 n 会虚高 confidence，违背 ADR-0002 any-n honest。
+    stale_n / actionable_n 都暴露，不藏数据；follow_rate 用 fresh 口径（fresh_follow/n）保持一致。
+    """
+    follow_n = deviate_n = partial_n = na_n = null_n = 0
+    stale_follow = stale_deviate = stale_partial = 0
+    for tr in all_trades:
+        a = tr.get("adherence")
+        if not isinstance(a, dict):
+            null_n += 1
+            continue
+        followed = a.get("followed")
+        stale = bool(a.get("stale"))
+        if followed is True:
+            follow_n += 1
+            if stale:
+                stale_follow += 1
+        elif followed is False:
+            if a.get("partial"):
+                partial_n += 1
+                if stale:
+                    stale_partial += 1
+            else:
+                deviate_n += 1
+                if stale:
+                    stale_deviate += 1
+        else:  # None -> na（na_hold_advice / na_no_trigger，合计不拆）
+            na_n += 1
+    stale_n = stale_follow + stale_deviate + stale_partial
+    actionable_n = follow_n + deviate_n + partial_n  # 含 stale
+    fresh_n = actionable_n - stale_n                  # 排除 stale（confidence 口径）
+    fresh_follow = follow_n - stale_follow
+    return {
+        "follow_n": follow_n,
+        "deviate_n": deviate_n,
+        "partial_n": partial_n,
+        "na_n": na_n,
+        "null_n": null_n,
+        "stale_n": stale_n,
+        "actionable_n": actionable_n,
+        "n": fresh_n,
+        "follow_rate": round(fresh_follow / fresh_n, 3) if fresh_n > 0 else None,
+        "confidence": _desc_flag(fresh_n),
     }
 
 

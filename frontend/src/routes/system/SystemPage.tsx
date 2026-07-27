@@ -216,7 +216,7 @@ function TradingDnaCard({ data }: { data: SystemView }) {
 
 /* ── Behavior Analytics ──────────────────────────────────── */
 
-function BehaviorCard({ data }: { data: SystemView }) {
+export function BehaviorCard({ data }: { data: SystemView }) {
   const b = data.behavior;
   return (
     <Card>
@@ -244,6 +244,7 @@ function BehaviorCard({ data }: { data: SystemView }) {
         <RateRow label="复仇交易（亏损后≤3日开仓）" m={b.proxy_emotional.revenge} warnHigh />
         <RateRow label="FOMO（超 AI 入场 5%）" m={b.proxy_emotional.fomo} warnHigh />
         <RateRow label="过度交易（单日>3笔）" m={b.proxy_emotional.overtrading} warnHigh />
+        <AdherenceRow pa={b.position_action_adherence} />
       </CardContent>
     </Card>
   );
@@ -509,6 +510,47 @@ function StopCell({
       >
         {n}
       </span>
+    </div>
+  );
+}
+
+/* 加减仓 adherence：每笔 trade vs 最近 position_action 的事后守规（design 20260727）。
+   follow_rate = fresh_follow / fresh_n（Q2 排除 stale）；全 hold 数据期多为 no_data，攒出 add/trim 才有数。
+   pa 缺失防御：旧 system.json（recompute 前的 stale cache）无此字段 -> 退化为 no_data，不崩。 */
+const NO_DATA_PA: SystemView["behavior"]["position_action_adherence"] = {
+  follow_n: 0, deviate_n: 0, partial_n: 0, na_n: 0, null_n: 0, stale_n: 0,
+  actionable_n: 0, n: 0, follow_rate: null, confidence: "no_data",
+};
+
+function AdherenceRow({
+  pa,
+}: {
+  pa?: SystemView["behavior"]["position_action_adherence"];
+}) {
+  const a = pa ?? NO_DATA_PA;
+  return (
+    <div className="rounded-md border border-border bg-bg-base p-2.5">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs">
+          加减仓守规 <span className="text-flat">对比 AI 加减仓建议</span>
+        </span>
+        <div className="flex items-center gap-2">
+          {a.follow_rate != null && (
+            <span className="num text-sm font-medium text-up">
+              {(a.follow_rate * 100).toFixed(0)}%
+            </span>
+          )}
+          <ConfidenceBadge c={a.confidence} n={a.n} />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+        <StopCell label="跟建议" n={a.follow_n} tone="up" />
+        <StopCell label="偏离" n={a.deviate_n} tone="down" />
+        <StopCell label="部分减仓" n={a.partial_n} tone="down" />
+        <StopCell label="不适用" n={a.na_n} tone="flat" />
+        <StopCell label="无建议" n={a.null_n} tone="flat" />
+        <StopCell label="陈旧(>14d)" n={a.stale_n} tone="flat" />
+      </div>
     </div>
   );
 }

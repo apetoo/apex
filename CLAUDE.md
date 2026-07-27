@@ -20,7 +20,7 @@ uvicorn backend.main:app --reload --port 8000         # http://localhost:8000/do
 cd frontend && npm install && npm run dev             # http://localhost:5173
 ```
 
-`main.py` referenced in the README does not exist; ignore those CLI examples. There is no test suite, lint config, or build step. Validate syntax with `python -c "import ast; ast.parse(open('<file>').read())"`; smoke-test behavior against `apex.watchlist` / `apex.journal` in a tempdir, or hit the backend's read-only endpoints after `uvicorn` starts.
+`main.py` referenced in the README does not exist; ignore those CLI examples. No lint config or build step for Python (frontend has `npm run build`). Test suite: `tests/` (pytest, configured via `pyproject.toml`, `pytest>=8.0.0` in requirements) — run `.venv/bin/python -m pytest`. Frontend: `cd frontend && npx vitest run` + `npx tsc --noEmit`. For quick checks, validate syntax with `python -c "import ast; ast.parse(open('<file>').read())"`; smoke-test behavior against `apex.watchlist` / `apex.journal` in a tempdir, or hit the backend's read-only endpoints after `uvicorn` starts.
 
 ## Configuration
 

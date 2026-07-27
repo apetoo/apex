@@ -641,6 +641,7 @@ def buy(ts_code: str, fill_price: float, shares: int,
         avg_cost_after=position.get("avg_cost"), shares_after=position.get("position_size_shares"),
         strategy=position.get("strategy") or strategy, regime=regime_label,
         journal_ref=journal_ref, realized_pnl=None, note=note,
+        entry_date=None if existing is None else position.get("entry_date"),
     )
     _notify("position_opened" if existing is None else "position_increased",
             ts_code=ts_code, name=position.get("name", ""),
@@ -700,6 +701,7 @@ def sell(ts_code: str, fill_price: float, shares: int,
             avg_cost_after=None, shares_after=0,
             strategy=strategy, regime=regime_label, journal_ref=journal_ref,
             realized_pnl=realized, realized_pnl_pct=realized_pct, note=note,
+            entry_date=pos.get("entry_date"),
         )
         closed_record = close_position(
             ts_code=ts_code, exit_price=fill_price, exit_reason=exit_reason,
@@ -736,6 +738,7 @@ def sell(ts_code: str, fill_price: float, shares: int,
         avg_cost_after=avg_cost_before, shares_after=new_shares,
         strategy=strategy, regime=regime_label, journal_ref=journal_ref,
         realized_pnl=realized, realized_pnl_pct=realized_pct, note=note,
+        entry_date=pos.get("entry_date"),
     )
     _notify("position_decreased", ts_code=ts_code, name=name,
             before=before, after=pos, trade=trade, exit_reason=exit_reason)
@@ -1364,6 +1367,7 @@ def close_position(ts_code: str,
             journal_ref=_journal_ref_for(ts_code),
             realized_pnl=realized_pnl_amount, realized_pnl_pct=realized_pnl_pct,
             note=user_notes or exit_reason,
+            entry_date=pos.get("entry_date"),
         )
         _notify("position_closed", ts_code=ts_code, name=pos.get("name", ""),
                 before=dict(pos), after=None, trade=sell_trade,

@@ -78,6 +78,18 @@ export interface SystemView {
       fomo: RateMetric;
       overtrading: RateMetric;
     };
+    position_action_adherence: {
+      follow_n: number;
+      deviate_n: number;
+      partial_n: number;
+      na_n: number;
+      null_n: number;
+      stale_n: number;
+      actionable_n: number;
+      n: number;
+      follow_rate: number | null;
+      confidence: Confidence;
+    };
   };
   ai_adherence: {
     per_trade: Array<{
