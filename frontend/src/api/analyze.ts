@@ -64,14 +64,21 @@ export interface LatestJournal {
   analyzed_at?: string;
   source?: string;
   verdict?: string;
+  confidence?: number;
   calibrated_confidence?: number;
+  evidence?: string[];
   price_advice?: {
     entry?: number | null;
+    entry_low?: number | null;
+    entry_high?: number | null;
     stop_loss?: number | null;
     target?: number | null;
   };
   position_action?: {
     action?: string;
+    add_shares?: number | null;
+    trim_shares?: number | null;
+    trim_pct?: number | null;
     new_stop?: number | null;
     rationale?: string;
     scale_plan?: unknown[];

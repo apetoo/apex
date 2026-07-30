@@ -12,3 +12,4 @@ export { VerdictDetailCard, fmtPrice } from "./VerdictDetailCard";
 export { AddCandidateDialog } from "./AddCandidateDialog";
 export { IntradayChart } from "./IntradayChart";
 export type { IntradayChartProps } from "./IntradayChart";
+export { LatestAnalysisBadge } from "./LatestAnalysisBadge";
