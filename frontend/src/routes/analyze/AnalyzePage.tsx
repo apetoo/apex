@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { History, Search, ChevronRight, Loader2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/base";
 import { AnalyzeTraceStream, VerdictDetailCard, VerdictTag, PositionActionTag, PriceTag, TraceEventList } from "@/components/a-share";
@@ -60,6 +60,7 @@ export function AnalyzePage() {
   const [expandedAt, setExpandedAt] = useState<string | null>(null);
 
   const { setContext } = useChatContext();
+  const qc = useQueryClient();
 
   // 持久化: 三者任一变化即写 sessionStorage, 切走再回可恢复。
   useEffect(() => {
@@ -214,7 +215,14 @@ export function AnalyzePage() {
             <AnalyzeTraceStream
               key={committedCode}
               tsCode={committedCode}
-              onVerdict={setLatestVerdict}
+              onVerdict={(v) => {
+                setLatestVerdict(v);
+                // 分析落 journal 后, 让卡片徽标/历史列表立即拿到新数据
+                if (committedCode) {
+                  qc.invalidateQueries({ queryKey: qk.journalLatest(committedCode) });
+                  qc.invalidateQueries({ queryKey: qk.journal(committedCode) });
+                }
+              }}
             />
           </div>
         </div>
