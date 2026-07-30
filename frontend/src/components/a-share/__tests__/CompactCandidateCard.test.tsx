@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { CompactCandidateCard } from "../CompactCandidateCard";
+import { getLatestJournal } from "@/api/analyze";
 import type { Candidate } from "@/api/watchlist";
 
 // mock 行情: 当前价/昨收可逐用例覆盖
@@ -14,6 +15,12 @@ vi.mock("@/api/market", () => ({
   getDailyPrices: vi.fn(async (codes: string[]) =>
     Object.fromEntries(codes.map((c) => [c, mockDaily[c]]))),
 }));
+
+// mock 最新 journal: 让 LatestAnalysisBadge 拿到(或不拿到)最近分析
+vi.mock("@/api/analyze", () => ({
+  getLatestJournal: vi.fn(async () => null),
+}));
+const mockedJournal = vi.mocked(getLatestJournal);
 
 function withClient(ui: ReactNode) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -200,5 +207,25 @@ describe("CompactCandidateCard", () => {
     expect(screen.getByText(/剩 8 天/)).toBeTruthy();
     expect(screen.queryByText("·波动率算")).toBeNull();
     expect(screen.queryByText("·手动")).toBeNull();
+  });
+
+  // ── 最近 AI 分析徽标(联动 LatestAnalysisBadge)────────────────────────
+
+  it("最近分析徽标: 有 verdict journal -> 显示方向+校准置信度", async () => {
+    mockPrice["601012.SH"] = 23.0;
+    mockedJournal.mockResolvedValueOnce({
+      ts_code: "601012.SH",
+      analyzed_at: new Date().toISOString(),
+      source: "verdict",
+      verdict: "看多",
+      calibrated_confidence: 62,
+      price_advice: { entry: 22.5, stop_loss: 21.0, target: 25.0 },
+    } as never);
+    withClient(<CompactCandidateCard candidate={base} />);
+    // "看多" 在徽标 + popover + drawer 三处都渲染; 取首条即徽标
+    const matches = await screen.findAllByText("看多");
+    expect(matches[0]).toBeTruthy();
+    // 校准 62 出现 3 处(徽标 + popover + drawer), 至少 1 次即视为通过
+    expect(screen.getAllByText(/校准\s*62/).length).toBeGreaterThanOrEqual(1);
   });
 });

@@ -1,7 +1,7 @@
 import { Bell, TrendingDown, TrendingUp, Target, ShieldAlert, Archive, ArrowUpCircle, Clock, RefreshCw, Sparkles, ChevronDown, Pencil } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { PriceTag } from "@/components/a-share";
+import { PriceTag, LatestAnalysisBadge } from "@/components/a-share";
 import { getPrices, getDailyPrices } from "@/api/market";
 import { useRenewCandidate } from "@/api/mutations";
 import { qk } from "@/api/query-keys";
@@ -183,6 +183,9 @@ export function CompactCandidateCard({
           {distancePct.toFixed(2)}%)
         </p>
       ) : null}
+
+      {/* 最近 AI 分析徽标(hover 浮窗 / 点击 Drawer) */}
+      <LatestAnalysisBadge tsCode={ts_code} />
 
       <div className="my-2 border-t border-border" />
 
