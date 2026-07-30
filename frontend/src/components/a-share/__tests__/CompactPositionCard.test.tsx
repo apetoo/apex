@@ -9,8 +9,12 @@ import type { ActivePosition } from "@/api/watchlist";
 vi.mock("@/api/market", () => ({
   getPrices: vi.fn(async (codes: string[]) =>
     Object.fromEntries(codes.map((c) => [c, 100.0]))),
-  getDailyPrices: vi.fn(async (codes: string[]) =>
+  getPrevClosePrices: vi.fn(async (codes: string[]) =>
     Object.fromEntries(codes.map((c) => [c, 98.0]))),
+}));
+
+vi.mock("@/api/analyze", () => ({
+  getLatestJournal: vi.fn(async () => null),
 }));
 
 function withClient(ui: ReactNode) {
@@ -66,6 +70,8 @@ describe("CompactPositionCard", () => {
     // 100 股 @ 90.00
     expect(screen.getByText(/100\s*股/)).toBeTruthy();
     expect(screen.getByText(/90\.00/)).toBeTruthy();
+    // 持有金额(市值) = 现价 100 × 100 股 = 10,000 元
+    expect(screen.getByText(/市值.*10,000/)).toBeTruthy();
     // 止损 85.00 / 目标 110.00
     expect(screen.getByText("85.00")).toBeTruthy();
     expect(screen.getByText("110.00")).toBeTruthy();
@@ -117,5 +123,19 @@ describe("CompactPositionCard", () => {
     await screen.findByText("100.00");
     // 止损方向（22.0->21.5 = ↓放宽，绿）
     expect(screen.getByText("↓放宽")).toBeTruthy();
+  });
+
+  it("最近分析徽标: 有 position_action journal -> 显示动作行", async () => {
+    const { getLatestJournal } = await import("@/api/analyze");
+    vi.mocked(getLatestJournal).mockResolvedValueOnce({
+      ts_code: "600519.SH",
+      analyzed_at: new Date().toISOString(),
+      source: "position_action",
+      position_action: { action: "trim", trim_shares: 100, new_stop: 95 },
+    } as never);
+    withClient(<CompactPositionCard position={pos} />);
+    // 减仓 在徽标 + popover 两处都渲染; 取首条即徽标(与 LatestAnalysisBadge.test 同模式)
+    const matches = await screen.findAllByText("减仓");
+    expect(matches[0]).toBeTruthy();
   });
 });

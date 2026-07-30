@@ -1,9 +1,9 @@
 import { ArrowUpRight, ArrowDownRight, Target, ShieldAlert, X, Sparkles, Pencil } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { PriceTag, ScalePlanLadder } from "@/components/a-share";
-import { getPrices, getDailyPrices } from "@/api/market";
+import { PriceTag, ScalePlanLadder, LatestAnalysisBadge } from "@/components/a-share";
+import { getPrices, getPrevClosePrices } from "@/api/market";
 import { qk } from "@/api/query-keys";
-import { cn, formatPrice } from "@/lib/utils";
+import { cn, formatPrice, formatAmount } from "@/lib/utils";
 import type { ActivePosition, PositionPlan } from "@/api/watchlist";
 
 /**
@@ -43,9 +43,11 @@ export function CompactPositionCard({
     queryKey: qk.prices([ts_code]),
     queryFn: () => getPrices([ts_code]),
   });
+  // 昨收用 prev-close(严格排除今天)。/prices/daily 盘后 15:30 会返回今日收盘,
+  // 当 prevClose 用会导致 PriceTag 涨跌幅盘后恒 0.00%。
   const daily = useQuery({
-    queryKey: qk.dailyPrices([ts_code]),
-    queryFn: () => getDailyPrices([ts_code]),
+    queryKey: qk.prevClose([ts_code]),
+    queryFn: () => getPrevClosePrices([ts_code]),
   });
 
   const currentPrice = prices.data?.[ts_code] ?? null;
@@ -59,6 +61,11 @@ export function CompactPositionCard({
       ? (currentPrice - cost) * position_size_shares
       : null;
   const pnlDelta = currentPrice != null ? currentPrice - cost : null;
+  // 持有金额(市值) = 现价 × 股数;跟成本价同列小字,让上面的盈亏百分比有基数参照。
+  const marketValue =
+    currentPrice != null && position_size_shares != null
+      ? currentPrice * position_size_shares
+      : null;
 
   return (
     <div className="rounded-lg border border-border bg-bg-card p-3">
@@ -118,6 +125,12 @@ export function CompactPositionCard({
         </div>
       )}
 
+      {/* 最近 AI 分析徽标(hover 浮窗 / 点击 Drawer) */}
+      <LatestAnalysisBadge
+        tsCode={ts_code}
+        stopBefore={position.plan?.last_stop_before ?? stop_loss}
+      />
+
       <div className="my-2 border-t border-border" />
 
       {/* 参数行: 股数@成本 / 止损 / 目标 */}
@@ -125,6 +138,9 @@ export function CompactPositionCard({
         <div className="num">
           {position_size_shares != null && <span>{position_size_shares} 股</span>}
           {avg_cost != null && <span> @ {formatPrice(avg_cost)}</span>}
+          {marketValue != null && (
+            <span className="ml-1">· 市值 {formatAmount(marketValue)}</span>
+          )}
           {position_size_shares == null && avg_cost == null && <span>-</span>}
         </div>
         {(stop_loss != null || target != null) && (
