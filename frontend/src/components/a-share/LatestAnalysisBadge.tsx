@@ -90,7 +90,7 @@ export function LatestAnalysisBadge({
       </button>
 
       {/* hover 浮窗(桌面; 向上弹出避免遮下方卡片价格区) */}
-      <div className="absolute bottom-full left-0 z-20 mb-1 hidden w-64 group-hover:block">
+      <div className="absolute bottom-full left-0 z-20 pb-1 hidden w-64 group-hover:block">
         <div
           className="cursor-pointer rounded-md border border-border bg-bg-card p-3 text-left shadow-lg"
           onClick={() => setDrawerOpen(true)}
@@ -103,13 +103,15 @@ export function LatestAnalysisBadge({
         </div>
       </div>
 
-      <Drawer
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        title="最近分析"
-      >
-        <VerdictDetailCard verdict={data as unknown as Record<string, unknown>} />
-      </Drawer>
+      {drawerOpen && (
+        <Drawer
+          open={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+          title="最近分析"
+        >
+          <VerdictDetailCard verdict={data as unknown as Record<string, unknown>} />
+        </Drawer>
+      )}
     </div>
   );
 }
@@ -121,11 +123,15 @@ function VerdictBadgeLine({ entry }: { entry: LatestJournal }) {
   const color = verdictColor(v);
   const tone =
     color === "up" ? "text-up" : color === "down" ? "text-down" : "text-flat";
-  const conf = entry.calibrated_confidence ?? entry.confidence;
   return (
     <>
       <span className={cn("font-medium", tone)}>{v || "—"}</span>
-      {conf != null && <span className="opacity-80">校准 {conf}</span>}
+      {entry.calibrated_confidence != null && (
+        <span className="opacity-80">校准 {entry.calibrated_confidence}</span>
+      )}
+      {entry.calibrated_confidence == null && entry.confidence != null && (
+        <span className="opacity-80">置信 {entry.confidence}</span>
+      )}
     </>
   );
 }
@@ -246,7 +252,7 @@ function PaPopover({
           {sub && <span className="num ml-1 text-xs font-normal">{sub}</span>}
         </span>
         <span className="num text-text-secondary">
-          {(entry.analyzed_at ?? "").slice(5, 16)}
+          {(entry.analyzed_at ?? "").slice(5, 16).replace("T", " ")}
         </span>
       </div>
       <p className="num text-text-secondary">

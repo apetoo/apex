@@ -218,8 +218,8 @@ export function AnalyzePage() {
               onVerdict={(v) => {
                 setLatestVerdict(v);
                 // 分析落 journal 后, 让卡片徽标/历史列表立即拿到新数据
+                // prefix ["journal", code] 已匹配 latest, 无需单独 invalidate
                 if (committedCode) {
-                  qc.invalidateQueries({ queryKey: qk.journalLatest(committedCode) });
                   qc.invalidateQueries({ queryKey: qk.journal(committedCode) });
                 }
               }}

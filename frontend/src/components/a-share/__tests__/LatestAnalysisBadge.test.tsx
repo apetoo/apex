@@ -52,21 +52,21 @@ describe("LatestAnalysisBadge", () => {
   it("verdict entry -> 徽标: 看多 + 校准62 + 日期; 浮窗: 三价 + 前2条证据", async () => {
     mocked.mockResolvedValueOnce(verdictEntry as never);
     withClient(<LatestAnalysisBadge tsCode="600519.SH" />);
-    // 看多 在徽标 + popover + drawer(隐藏) 三处都渲染; 取首条即徽标
+    // 看多 在徽标 + popover 两处都渲染; 取首条即徽标(Drawer 条件挂载, 未点击不渲染)
     const matches = await screen.findAllByText("看多");
     expect(matches[0]).toBeTruthy();
-    // 校准 62 出现 3 处(徽标 + popover + drawer), 至少 1 次即视为通过
+    // 校准 62 出现 2 处(徽标 + popover), 至少 1 次即视为通过
     expect(screen.getAllByText(/校准\s*62/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/^\d{2}-\d{2}$/)).toBeTruthy(); // 日期 MM-DD(仅徽标)
     // 浮窗内容在 DOM 中(group-hover 只是 CSS 隐藏, jsdom 可直接断言)
-    // 价格类文本 popover + drawer 都有, 用 getAllByText 断言至少 1 次
+    // 价格类文本 popover 渲染, 用 getAllByText 断言至少 1 次(Drawer 条件挂载)
     expect(screen.getAllByText(/入场 12.30–12.60/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/止损 11.80/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/目标 14.50/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/业绩预增40%/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/回踩20日线/).length).toBeGreaterThanOrEqual(1);
-    // 只取前 2 条: 第三条只出现在 drawer(popover 限 2), 全局恰好 1 次
-    expect(screen.getAllByText(/第三条不该显示/).length).toBe(1);
+    // 只取前 2 条: 第三条证据不在 DOM 中(popover 限 2, Drawer 未挂载)
+    expect(screen.queryByText(/第三条不该显示/)).toBeNull();
     expect(screen.getAllByText(/点击查看完整分析/).length).toBeGreaterThanOrEqual(1);
   });
 
@@ -77,7 +77,7 @@ describe("LatestAnalysisBadge", () => {
     const matches = await screen.findAllByText("减仓");
     expect(matches[0]).toBeTruthy();
     expect(screen.getAllByText(/12\.80/).length).toBeGreaterThanOrEqual(1);
-    // 浮窗 + drawer 都渲染这些字段, 用 getAllByText 至少 1 次
+    // 浮窗渲染这些字段, 用 getAllByText 至少 1 次(Drawer 条件挂载)
     expect(screen.getAllByText(/-300股/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/放量滞涨/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/未来触发计划 2 条/).length).toBeGreaterThanOrEqual(1);
