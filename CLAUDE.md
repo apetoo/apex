@@ -129,3 +129,22 @@ SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `c
 **分时不是 AI 工具，且原始 bars 不落盘.** `get_intraday_snapshot` / `get_intraday_bars` 不在 `data.TOOL_FUNCTIONS` —— 别把它们注册成 AI 工具（启动时 `_format_intraday_block` 强制注入特征到 prompt，设计上不让 AI 决定调不调）。分时原始 1 分钟 bars 在 Python 压成特征后即弃，**不进 prompt、不写 trace.jsonl**；trace 里只有日线 raw（`get_daily_price` 是工具，落 `tool_result.raw`）。所以前端分时图只能实时调 `/api/market/intraday/{ts_code}/bars`，**无法从 trace 回放历史分时**。
 
 **web_search 有强制类别，别动 record_verdict 校验.** `MANDATORY_SEARCH_CATEGORIES = ["earnings","shareholders","regulatory","money_flow"]`（`data.py`）是 A 股判断地基，`record_verdict` 前强制校验 `searches_performed` 含全 4 类，缺则抛 `verdict_rejected` 逼 AI 补搜。这是有意覆盖设计，别为省调用次数放宽。
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
+- Author a backlog-ready spec/issue → invoke /spec
