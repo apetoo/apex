@@ -210,6 +210,9 @@ def _build_decision(bars: list[dict], bsp_list: list[dict], zs_break: str,
     sell_bsps = [bsp for bsp in bsp_list if bsp.get("type") in _BSP_SELL_TYPES]
     buy_decision = _build_buy_decision(bars, buy_bsps[-1], freq) if buy_bsps else None
 
+    if buy_decision and buy_decision["ineligible_reason"] == "signal_bar_missing":
+        return buy_decision
+
     # A non-stale buy that has not been invalidated is the strongest structure.
     if buy_decision and buy_decision["candidate_eligible"]:
         return buy_decision

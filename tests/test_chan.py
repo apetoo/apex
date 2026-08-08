@@ -399,6 +399,16 @@ class TestChanDecision:
         assert decision["trigger_price"] is None
         assert decision["invalidation_price"] is None
 
+    def test_missing_buy_signal_bar_outranks_breakout_and_sell_risk(self):
+        missing_buy = {"dt": "2026-02-05", "type": "2buy", "price": 10.0}
+        sell = {"dt": "2026-01-05", "type": "2sell", "price": 10.0}
+        decision = chan._build_decision(
+            self._bars(), [missing_buy, sell], "up", {"zg": 12, "zd": 10}, "D"
+        )
+        assert decision["state"] == "watching"
+        assert decision["ineligible_reason"] == "signal_bar_missing"
+        assert decision["bias"] == "neutral"
+
 
 # ── T5: HTTP 层 ─────────────────────────────────────────────────────────────
 
