@@ -41,7 +41,7 @@ npm run build       # 构建检查
 
 本项目无 lint 配置，但有若干强约定，提交前请确保不破坏：
 
-- **ts_code 规范化**：所有入口先用 `apex.data.normalize_ts_code()` 规范化（带后缀：6->SH、0/3->SZ、4/8->BJ）。
+- **ts_code 规范化**：所有入口先用 `apex.data.normalize_ts_code()` 规范化（带后缀：6/5->SH、0/3/1->SZ、4/8/9->BJ；9 为 920xxx 北交所新码段）。
 - **A 股配色**：红涨绿跌（与美股相反），前端走 `lib/utils.ts` 的 `directionClass` / `formatDelta`。
 - **SSE 数据契约**：新增 SSE 事件必须走 `backend/core/streaming.py` 的 `_sse()` helper（先 `json.dumps` 再 yield），不要直接 yield dict。详见 `CLAUDE.md` 的 SSE 章节。
 - **新增 AI 工具**需三处协同：`apex/data.py` 实现（返回 JSON 字符串）+ `data.TOOL_FUNCTIONS` 注册 + `analyze.TOOLS` 声明 schema。

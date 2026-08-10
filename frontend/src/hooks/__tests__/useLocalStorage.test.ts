@@ -11,7 +11,7 @@ import { useLocalStorage } from "../useLocalStorage";
 
 describe("useLocalStorage", () => {
   beforeEach(() => {
-    localStorage.clear();
+    window.localStorage.clear();
   });
 
   it("初始: localStorage 无值 -> 回退 initialValue", () => {
@@ -20,7 +20,7 @@ describe("useLocalStorage", () => {
   });
 
   it("读取: localStorage 有值 -> 反序列化", () => {
-    localStorage.setItem("k", JSON.stringify(["a", "b"]));
+    window.localStorage.setItem("k", JSON.stringify(["a", "b"]));
     const { result } = renderHook(() => useLocalStorage("k", [] as string[]));
     expect(result.current[0]).toEqual(["a", "b"]);
   });
@@ -31,7 +31,7 @@ describe("useLocalStorage", () => {
       result.current[1]((prev) => [...prev, "x"]);
     });
     expect(result.current[0]).toEqual(["x"]);
-    expect(JSON.parse(localStorage.getItem("k")!)).toEqual(["x"]);
+    expect(JSON.parse(window.localStorage.getItem("k")!)).toEqual(["x"]);
   });
 
   it("函数式更新: 基于前值累加", () => {
@@ -39,11 +39,11 @@ describe("useLocalStorage", () => {
     act(() => result.current[1]((n) => n + 1));
     act(() => result.current[1]((n) => n + 1));
     expect(result.current[0]).toBe(2);
-    expect(JSON.parse(localStorage.getItem("k")!)).toBe(2);
+    expect(JSON.parse(window.localStorage.getItem("k")!)).toBe(2);
   });
 
   it("容错: 脏 JSON -> 回退 initialValue 不抛", () => {
-    localStorage.setItem("k", "{不是合法json");
+    window.localStorage.setItem("k", "{不是合法json");
     const { result } = renderHook(() => useLocalStorage("k", [] as string[]));
     expect(result.current[0]).toEqual([]);
   });

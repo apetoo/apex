@@ -13,7 +13,9 @@ from fastapi.responses import JSONResponse
 
 from apex import analyze as ana_mod
 from apex import backtest_review as br_mod
+from apex import chan as chan_mod
 from apex import postmortem as pm_mod
+from apex import technical as tech_mod
 from apex import watchlist as wl_mod
 
 logger = logging.getLogger("apex.backend.errors")
@@ -51,6 +53,15 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _backtest_review(_req: Request, exc: br_mod.BacktestReviewError) -> JSONResponse:
         # 502 = 上游 AI 调用语义（含未配 key / 无可成交信号 / AI 未产出结论）
         return _json(502, {"detail": f"AI 回测复盘失败: {exc}"})
+
+    @app.exception_handler(chan_mod.ChanUnavailableError)
+    async def _chan_unavailable(_req: Request, exc: chan_mod.ChanUnavailableError) -> JSONResponse:
+        return _json(501, {"detail": str(exc)})
+
+    @app.exception_handler(tech_mod.DataFetchError)
+    async def _data_fetch(_req: Request, exc: tech_mod.DataFetchError) -> JSONResponse:
+        # 502 = 上游数据源语义（对齐 AnalysisError 先例）
+        return _json(502, {"detail": f"数据获取失败: {exc}"})
 
     @app.exception_handler(ValueError)
     async def _value_error(_req: Request, exc: ValueError) -> JSONResponse:

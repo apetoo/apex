@@ -148,6 +148,7 @@ class PositionActionSchema(TypedDict, total=False):
     trim_shares: Optional[int]    # action=trim 二选一
     trim_pct: Optional[float]     # action=trim 二选一（0-1）
     new_stop: Optional[float]     # 止损上移建议（add/hold 常带）
+    new_target: Optional[float]   # 止盈价上移建议（同步 target 字段，防化石止盈与 ladder 冲突）
     scale_plan: list              # ScalePlanItemSchema[], 完整 ladder 计划
     rationale: str                # 机器可读摘要
 

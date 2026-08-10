@@ -116,7 +116,7 @@ function candidateDecisionKey(data: ChanStructure) {
 export function ChanPage() {
   // ?ts_code= 预填 + 自动加载（v1.1 持仓/候选卡跳转的留口；v1 先通 URL）
   const [searchParams] = useSearchParams();
-  const initial = searchParams.get("ts_code") || "603019.SH";
+  const initial = (searchParams.get("ts_code") ?? "").trim().toUpperCase();
   const [tsCode, setTsCode] = useState(initial);
   const [committed, setCommitted] = useState(initial);
   const [freq, setFreq] = useState<ChanFreq>("D");
@@ -196,6 +196,12 @@ export function ChanPage() {
         </CardContent>
       </Card>
 
+      {!committed && (
+        <Notice tone="info" title="请输入股票代码查看缠论结构">
+          支持沪深北股票代码，例如 603019.SH。
+        </Notice>
+      )}
+
       {/* 错误态 */}
       {isCzscMissing && (
         <Notice tone="warn" title="缠论引擎不可用（501）">
@@ -228,8 +234,11 @@ export function ChanPage() {
       {data && !isCzscMissing && (
         <Card className="mb-4">
           <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 font-mono">
-              {data.ts_code}
+            <CardTitle className="flex items-center gap-2">
+              {data.name && <span>{data.name}</span>}
+              <span className="font-mono text-sm font-normal text-text-secondary">
+                {data.ts_code}
+              </span>
               <span className="text-sm font-normal text-text-secondary">
                 {FREQS.find((f) => f.key === data.freq)?.label}
               </span>

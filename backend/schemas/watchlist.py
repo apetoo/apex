@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AddPositionRequest(BaseModel):
@@ -47,7 +47,14 @@ class AddCandidateRequest(BaseModel):
 
 
 class PromoteCandidateRequest(BaseModel):
-    """候选晋升为持仓（用实际成交价）。"""
+    """候选晋升为持仓（用实际成交价）。
+
+    extra="forbid": 手数只认 position_size_shares。前端曾误发 shares 被默认
+    ignore 静默吞掉, 走 ATR 推算兜底覆盖用户手填(2026-08-03, 500→6300)。
+    字段错配必须 422, 不许静默。
+    """
+    model_config = ConfigDict(extra="forbid")
+
     ts_code: str
     entry_price: float
     stop_loss: float

@@ -62,6 +62,7 @@ function fullDecision(overrides: Partial<ChanDecision> = {}): ChanDecision {
 function fullStructure(over: Partial<ChanStructure> = {}): ChanStructure {
   return {
     ts_code: "603019.SH",
+    name: "中科曙光",
     freq: "D",
     bars: [MOCK_BAR],
     bi_list: [{ sdt: "2026-08-01", edt: "2026-08-07", direction: "up", high: 89, low: 85, confirmed: true }],
@@ -83,7 +84,7 @@ function fullStructure(over: Partial<ChanStructure> = {}): ChanStructure {
   };
 }
 
-function withClient(ui: ReactNode, initialPath = "/chan") {
+function withClient(ui: ReactNode, initialPath = "/chan?ts_code=603019.SH") {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
@@ -127,13 +128,31 @@ function inputValue(label: string) {
 }
 
 describe("ChanPage 渲染态", () => {
+  it("无 URL 代码时保持空白且不请求默认股票", () => {
+    withClient(<ChanPage />, "/chan");
+
+    expect(screen.getByPlaceholderText("代码 如 603019.SH")).toHaveValue("");
+    expect(screen.getByText("请输入股票代码查看缠论结构")).toBeTruthy();
+    expect(getChanStructure).not.toHaveBeenCalled();
+  });
+
   it("完整结构 -> 图表 + 摘要 + 指标", async () => {
     vi.mocked(getChanStructure).mockResolvedValue(fullStructure());
     withClient(<ChanPage />);
     await waitFor(() => expect(screen.getByTestId("chart")).toBeTruthy());
+    expect(screen.getByText("中科曙光")).toBeTruthy();
     expect(screen.getByText("603019.SH")).toBeTruthy();
     expect(screen.getByText("突破向上")).toBeTruthy();
     expect(screen.getByText(/80\.00 ~ 90\.00/)).toBeTruthy();
+  });
+
+  it("名称缺失时只显示股票代码", async () => {
+    vi.mocked(getChanStructure).mockResolvedValue(fullStructure({ name: "" }));
+    withClient(<ChanPage />);
+
+    await waitFor(() => expect(screen.getByTestId("chart")).toBeTruthy());
+    expect(screen.getByText("603019.SH")).toBeTruthy();
+    expect(screen.queryByText("中科曙光")).toBeNull();
   });
 
   it("口径披露包含本级别近似、重画和 250 根窗口滑动", async () => {

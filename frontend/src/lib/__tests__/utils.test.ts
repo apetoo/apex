@@ -8,6 +8,7 @@ import {
   formatDelta,
   amountKToYi,
   formatVolume,
+  normalizeTsCode,
 } from "../utils";
 
 /**
@@ -63,6 +64,22 @@ describe("formatPrice(2 位小数等宽)", () => {
   });
 });
 
+describe("字符串兜底(后端常把数字序列化成字符串, 防 toFixed 崩溃)", () => {
+  it("数字字符串被安全解析", () => {
+    expect(formatPrice("12.34")).toBe("12.34");
+    expect(formatPercent("8.2")).toBe("+8.20%");
+    expect(formatDelta("0.27")).toBe("+0.27");
+    expect(formatRatio("0.6")).toBe("60%");
+  });
+  it("非法/空字符串 → —(与 null 同语义)", () => {
+    expect(formatPrice("abc")).toBe("—");
+    expect(formatPrice("")).toBe("—");
+    expect(formatPercent("NaN")).toBe("—");
+    expect(formatDelta(undefined)).toBe("—");
+    expect(formatRatio("x")).toBe("—");
+  });
+});
+
 describe("formatDelta(涨跌额带正负号)", () => {
   it("正数 + 负数带符号", () => {
     expect(formatDelta(0.27)).toBe("+0.27");
@@ -86,6 +103,12 @@ describe("directionClass(红涨绿跌)", () => {
     expect(directionClass(null)).toBe("text-flat");
     expect(directionClass(undefined)).toBe("text-flat");
     expect(directionClass(NaN)).toBe("text-flat");
+  });
+});
+
+describe("normalizeTsCode(交易所后缀)", () => {
+  it("920 新北交所代码 → BJ", () => {
+    expect(normalizeTsCode("920185")).toBe("920185.BJ");
   });
 });
 

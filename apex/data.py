@@ -3,9 +3,11 @@ Data layer: tushare + akshare + bocha. Functions here are also registered as too
 for the Claude API agent in analyze.py.
 """
 import json
+import logging
 import os
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -13,9 +15,12 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 from apex import mx_client as _mx
 from apex.per_day_cache import per_day_cache
+
+logger = logging.getLogger(__name__)
 
 _BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
 
@@ -43,7 +48,7 @@ def _direct_opener() -> urllib.request.OpenerDirector:
 
 
 def normalize_ts_code(code: str) -> str:
-    """Add exchange suffix if missing. 6xxxxx → .SH, 0/3xxxxx → .SZ, 8/4xxxxx → .BJ."""
+    """Add exchange suffix if missing. 6/5xxxxx → .SH, 0/3/1xxxxx → .SZ, 8/4xxxxx → .BJ（旧码）, 9xxxxx → .BJ（920 新码段）。"""
     code = (code or "").strip().upper()
     if not code or "." in code:
         return code
@@ -53,9 +58,206 @@ def normalize_ts_code(code: str) -> str:
         return f"{code}.SH"
     if code.startswith(("0", "3", "1")):  # 0/3 深市个股, 1 深市 ETF/基金
         return f"{code}.SZ"
-    if code.startswith(("8", "4")):
+    if code.startswith(("8", "4", "9")):  # 8/4 北交所旧码; 9 = 920xxx 新码段（2025-05 迁移）
         return f"{code}.BJ"
     return code
+
+
+def is_etf(ts_code: str) -> bool:
+    """ETF/基金前缀判断：5xxxxx.SH、1xxxxx.SZ。接受带后缀或裸码。"""
+    code = normalize_ts_code(ts_code)
+    return code.startswith("5") and code.endswith(".SH") or \
+           code.startswith("1") and code.endswith(".SZ")
+
+
+# 东财 kline 周期 → klt 参数
+_EM_KLT = {"30": 30, "60": 60, "D": 101, "W": 102}
+_EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_EM_UT = "7eea3edcaed734bea9cbfc24409ed989"
+_EM_KLINE_CACHE_TTL = 60.0
+_EM_KLINE_CACHE: dict[tuple[str, str, int], tuple[float, list[dict]]] = {}
+_EM_SESSION: Optional[requests.Session] = None
+_SINA_KLINE_URL = (
+    "https://quotes.sina.cn/cn/api/json_v2.php/"
+    "CN_MarketDataService.getKLineData"
+)
+_SINA_SESSION: Optional[requests.Session] = None
+
+
+def _eastmoney_session() -> requests.Session:
+    """东财专用直连 Session；不继承本机代理环境变量。"""
+    global _EM_SESSION
+    if _EM_SESSION is None:
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json,text/plain,*/*",
+        })
+        _EM_SESSION = session
+    return _EM_SESSION
+
+
+def _sina_session() -> requests.Session:
+    """新浪行情专用直连 Session；作为分钟 K 线备用源。"""
+    global _SINA_SESSION
+    if _SINA_SESSION is None:
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+            "Accept": "application/json,text/plain,*/*",
+        })
+        _SINA_SESSION = session
+    return _SINA_SESSION
+
+
+def eastmoney_kline(ts_code: str, freq: str = "D", n: int = 250) -> Optional[list[dict]]:
+    """东财 push2his K 线（不复权）。缠论页分钟/备用日线源。
+
+    返回 list[dict] 升序：{dt: datetime, open, high, low, close, vol, amount(元)}。
+    失败/无数据返回 None。
+
+    注意：push2his 高频会封 IP（RemoteDisconnected，项目前科）——只允许页面级
+    低频单次调用，禁止循环批量。调用方自行保证串行。
+    """
+    code = normalize_ts_code(ts_code)
+    klt = _EM_KLT.get(freq)
+    if klt is None or "." not in code:
+        return None
+    cache_key = (code, freq, n)
+    now = time.monotonic()
+    if freq in ("30", "60"):
+        cached = _EM_KLINE_CACHE.get(cache_key)
+        if cached and now - cached[0] < _EM_KLINE_CACHE_TTL:
+            return [dict(bar) for bar in cached[1]]
+    market = "1" if code.endswith(".SH") else "0"  # SH→1, SZ/BJ→0
+    secid = f"{market}.{code.split('.')[0]}"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+        "ut": _EM_UT,
+        "klt": klt,
+        "fqt": 0,
+        "beg": 0,
+        "end": 20500101,
+        "lmt": n,
+    }
+    session = _eastmoney_session()
+    for attempt in range(1, 3):
+        try:
+            response = session.get(_EM_KLINE_URL, params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt == 2:
+                log = logger.info if freq in ("30", "60") else logger.warning
+                log(
+                    "eastmoney kline failed code=%s freq=%s attempt=%s error=%s",
+                    code, freq, attempt, type(exc).__name__,
+                )
+                return None
+        except (requests.HTTPError, requests.JSONDecodeError, ValueError) as exc:
+            log = logger.info if freq in ("30", "60") else logger.warning
+            log(
+                "eastmoney kline rejected code=%s freq=%s attempt=%s error=%s",
+                code, freq, attempt, type(exc).__name__,
+            )
+            return None
+    klines = (payload.get("data") or {}).get("klines")
+    if not klines:
+        return None
+    bars = []
+    for line in klines:
+        p = line.split(",")
+        if len(p) < 7:
+            continue
+        try:
+            dt = datetime.strptime(p[0], "%Y-%m-%d %H:%M") if " " in p[0] \
+                else datetime.strptime(p[0], "%Y-%m-%d")
+            bars.append({
+                "dt": dt, "open": float(p[1]), "close": float(p[2]),
+                "high": float(p[3]), "low": float(p[4]),
+                "vol": float(p[5]), "amount": float(p[6]),
+            })
+        except (ValueError, TypeError):
+            continue
+    if not bars:
+        return None
+    if freq in ("30", "60"):
+        _EM_KLINE_CACHE[cache_key] = (now, [dict(bar) for bar in bars])
+    return bars
+
+
+def sina_minute_kline(ts_code: str, freq: str, n: int = 250) -> Optional[list[dict]]:
+    """新浪 30/60 分钟 K 线；东财连接被风控时的备用源。"""
+    code = normalize_ts_code(ts_code)
+    if freq not in ("30", "60"):
+        return None
+    if code.endswith(".SH"):
+        symbol = f"sh{code.split('.')[0]}"
+    elif code.endswith(".SZ"):
+        symbol = f"sz{code.split('.')[0]}"
+    else:
+        return None
+
+    cache_key = (code, freq, n)
+    now = time.monotonic()
+    cached = _EM_KLINE_CACHE.get(cache_key)
+    if cached and now - cached[0] < _EM_KLINE_CACHE_TTL:
+        return [dict(bar) for bar in cached[1]]
+
+    params = {"symbol": symbol, "scale": int(freq), "ma": "no", "datalen": n}
+    try:
+        response = _sina_session().get(_SINA_KLINE_URL, params=params, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, requests.JSONDecodeError, ValueError) as exc:
+        logger.info(
+            "sina minute kline failed code=%s freq=%s error=%s",
+            code, freq, type(exc).__name__,
+        )
+        return None
+    if not isinstance(payload, list):
+        return None
+
+    bars = []
+    for row in payload:
+        try:
+            bars.append({
+                "dt": datetime.strptime(row["day"], "%Y-%m-%d %H:%M:%S"),
+                "open": float(row["open"]),
+                "close": float(row["close"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "vol": float(row["volume"]),
+                "amount": float(row["amount"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not bars:
+        return None
+    _EM_KLINE_CACHE[cache_key] = (now, [dict(bar) for bar in bars])
+    return bars
+
+
+def minute_kline(ts_code: str, freq: str, n: int = 250) -> Optional[list[dict]]:
+    """分钟 K 线统一入口：东财主源，新浪备用源。"""
+    bars = eastmoney_kline(ts_code, freq=freq, n=n)
+    if bars:
+        return bars
+    bars = sina_minute_kline(ts_code, freq=freq, n=n)
+    if bars:
+        return bars
+    logger.warning(
+        "all minute kline sources failed code=%s freq=%s",
+        normalize_ts_code(ts_code), freq,
+    )
+    return None
 
 _ts_api = None
 
@@ -1824,6 +2026,10 @@ def get_market_context(ts_code: str) -> str:
     try:
         snap = json.loads(get_intraday_snapshot("000300.SH"))
         if snap and snap.get("last_price"):
+            # 指数点位是市值加权，amount/vol 算不出点位口径的 VWAP
+            # （实测 vwap≈31.6 vs 点位≈4608，量级差 ~146 倍）——抹掉避免垃圾值落 trace/journal
+            snap["vwap"] = None
+            snap["vwap_position_pct"] = None
             result["index_intraday"] = snap
     except Exception:
         pass

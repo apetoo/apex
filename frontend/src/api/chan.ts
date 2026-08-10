@@ -100,6 +100,7 @@ export interface ChanSummary {
 
 export interface ChanStructure {
   ts_code: string;
+  name: string;
   freq: ChanFreq;
   bars: ChanBar[];
   bi_list: ChanBi[];

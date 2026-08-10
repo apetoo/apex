@@ -9,6 +9,7 @@
   if bars is None or len(bars) < 20:
       continue
 """
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -93,6 +94,145 @@ def batch_fetch_bars(ts_codes: list[str], lookback_days: int = 120) -> dict[str,
                     _BARS_CACHE[ts_code] = None
 
     return {c: _BARS_CACHE.get(c) for c in ts_codes if _BARS_CACHE.get(c) is not None}
+
+
+# ── 缠论页原始 K 线（不复权，绕过 _BARS_CACHE） ─────────────────────────────
+
+
+class DataFetchError(Exception):
+    """所有数据源都失败。backend 映射 502（对齐 AnalysisError 先例）。"""
+
+
+def _completed_minute_bars(
+    bars: list[dict], now: Optional[datetime] = None
+) -> list[dict]:
+    """剔除尚未收完的东财分钟 K。
+
+    push2his 的分钟 `dt` 是该根 K 线的区间结束时刻；只有 `dt <= now`
+    才能进入缠论计算，否则盘中结构会被未完成 bar 重画。
+    """
+    cutoff = now or datetime.now()
+    return [bar for bar in bars if bar["dt"] <= cutoff]
+
+
+def _df_to_bars(df: pd.DataFrame, n: int) -> list[dict]:
+    """pro.daily/pro.fund_daily/pro.weekly 的 DataFrame → 升序 bars list[dict]。"""
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    out = []
+    for r in df.tail(n).itertuples():
+        out.append({
+            "dt": pd.to_datetime(r.trade_date).to_pydatetime(),
+            "open": float(r.open), "high": float(r.high),
+            "low": float(r.low), "close": float(r.close),
+            "vol": float(r.vol), "amount": float(getattr(r, "amount", 0) or 0),
+        })
+    return out
+
+
+def _tushare_daily_bars(ts_code: str, n: int, freq: str) -> Optional[list[dict]]:
+    """tushare 日/周线。ETF 走 fund_daily（pro.daily 对 ETF 恒 0 行，实测）。"""
+    from datetime import datetime, timedelta
+    days = n * (7 if freq == "W" else 2) + 30
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    end = datetime.now().strftime("%Y%m%d")
+    pro = data._tushare()
+    fields = "ts_code,trade_date,open,high,low,close,vol,amount"
+    if freq == "W" and not data.is_etf(ts_code):
+        df = pro.weekly(ts_code=ts_code, start_date=start, end_date=end, fields=fields)
+        return None if df is None or df.empty else _df_to_bars(df, n)
+    if data.is_etf(ts_code):
+        df = pro.fund_daily(ts_code=ts_code, start_date=start, end_date=end, fields=fields)
+    else:
+        df = pro.daily(ts_code=ts_code, start_date=start, end_date=end, fields=fields)
+    if df is None or df.empty:
+        return None
+    bars = _df_to_bars(df, n * 5 if freq == "W" else n)
+    if freq == "W":
+        bars = _resample_weekly(bars, n)
+    return bars
+
+
+def _resample_weekly(bars: list[dict], n: int) -> list[dict]:
+    """日 bars 重采样为周 bars（ETF 周线：tushare 无 fund_weekly）。"""
+    if not bars:
+        return bars
+    df = pd.DataFrame(bars).set_index("dt")
+    agg = df.resample("W-FRI").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last",
+         "vol": "sum", "amount": "sum"}).dropna(subset=["close"])
+    out = [{"dt": idx.to_pydatetime(), **{k: float(v) for k, v in row.items()}}
+           for idx, row in agg.iterrows()]
+    return out[-n:]
+
+
+def _akshare_daily_bars(ts_code: str, n: int) -> Optional[list[dict]]:
+    """akshare 东财日线兜底（个股/ETF）。东财系接口无 V8，不需 _AKSHARE_LOCK。"""
+    import akshare as ak
+    from datetime import datetime, timedelta
+    start = (datetime.now() - timedelta(days=n * 2 + 30)).strftime("%Y%m%d")
+    end = datetime.now().strftime("%Y%m%d")
+    code6 = ts_code.split(".")[0]
+    if data.is_etf(ts_code):
+        df = ak.fund_etf_hist_em(symbol=code6, period="daily",
+                                 start_date=start, end_date=end, adjust="")
+    else:
+        df = ak.stock_zh_a_hist(symbol=code6, period="daily",
+                                start_date=start, end_date=end, adjust="")
+    if df is None or df.empty:
+        return None
+    df = df.rename(columns={"日期": "dt", "开盘": "open", "最高": "high",
+                            "最低": "low", "收盘": "close", "成交量": "vol",
+                            "成交额": "amount"})
+    out = []
+    for r in df.tail(n).itertuples():
+        out.append({"dt": pd.to_datetime(r.dt).to_pydatetime(),
+                    "open": float(r.open), "high": float(r.high),
+                    "low": float(r.low), "close": float(r.close),
+                    "vol": float(r.vol), "amount": float(getattr(r, "amount", 0) or 0)})
+    return out
+
+
+def fetch_raw_bars(ts_code: str, n: int = 250, freq: str = "D") -> list[dict]:
+    """缠论页原始 K 线：不复权、**绕过 _BARS_CACHE**（60/250 根缓存键互污染前科）。
+
+    freq: "D"（日）/ "W"（周）/ "30" / "60"（分钟）。
+    返回 list[dict] 升序：{dt, open, high, low, close, vol, amount}。
+
+    路由（day-0 实测定案）：
+      日/周  个股+BJ(920)→pro.daily/pro.weekly；ETF→pro.fund_daily（pro.daily 对 ETF 恒空）
+             日线兜底 akshare（东财系）；分钟无 tushare 源（stk_mins 限 2 次/天）
+      分钟   东财 push2his klt=30/60（页面级低频，封 IP 前科，禁止批量）
+             BJ 分钟不支持（东财 920 secid 未验证）→ DataFetchError
+      全挂   → DataFetchError（backend 502）
+    """
+    ts_code = data.normalize_ts_code(ts_code)
+    if freq in ("30", "60"):
+        if ts_code.endswith(".BJ"):
+            raise DataFetchError("BJ 分钟数据暂不可用")
+        bars = data.minute_kline(ts_code, freq=freq, n=n)
+        if bars:
+            completed = _completed_minute_bars(bars)
+            if completed:
+                return completed
+        raise DataFetchError(f"{ts_code} {freq}min 分钟数据源失败")
+
+    errors = []
+    try:
+        bars = _tushare_daily_bars(ts_code, n, freq)
+        if bars:
+            return bars
+        errors.append("tushare empty")
+    except Exception as e:
+        errors.append(f"tushare: {e}")
+    if freq == "D":
+        try:
+            bars = _akshare_daily_bars(ts_code, n)
+            if bars:
+                return bars
+            errors.append("akshare empty")
+        except Exception as e:
+            errors.append(f"akshare: {e}")
+    raise DataFetchError(f"{ts_code} {freq} 数据源全部失败: {'; '.join(errors)}")
 
 
 # ── 指标计算（输入为 bars list[dict] 升序） ──────────────────────────────────

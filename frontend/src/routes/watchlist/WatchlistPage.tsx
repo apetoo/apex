@@ -334,7 +334,7 @@ export function WatchlistPage() {
       {
         ts_code: promoteTarget.ts_code,
         entry_price: entry,
-        shares,
+        position_size_shares: shares,
         stop_loss: stop,
         target,
         setup: finalSetup,

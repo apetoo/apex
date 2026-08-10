@@ -381,10 +381,12 @@ def get_structure(ts_code: str, freq: str = "D", n: int = 250) -> dict:
         raise ValueError(f"不支持的周期: {freq}")
 
     ts_code = data.normalize_ts_code(ts_code)
+    name = data.get_name_map().get(ts_code, "")
     bars = fetch_raw_bars(ts_code, n=n, freq=freq)
 
     resp = {
         "ts_code": ts_code,
+        "name": name,
         "freq": freq,
         "bars": [{
             "dt": _fmt_dt(b["dt"], freq),

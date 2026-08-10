@@ -60,6 +60,8 @@ export interface ActivePosition {
   risk_amount?: number;
   calibrated_confidence?: number;
   strategy?: string;
+  trigger_low?: number | null;
+  trigger_high?: number | null;
   note?: string;
   /** ADR-0001: 交易原型（candidate 继承或 promote 时确认） */
   setup?: string;
@@ -95,6 +97,7 @@ export interface Candidate {
   note: string;
   stop_advice: number;
   target_advice: number;
+  strategy?: string;
   trigger_low?: number | null;
   trigger_high?: number | null;
   /** ADR-0001: 交易原型，可由 AI verdict setup_tag 预填 */
@@ -268,7 +271,9 @@ export interface ArchivePayload {
 export interface PromotePayload {
   ts_code: string;
   entry_price: number;
-  shares: number;
+  /** 手数。键名必须对齐后端 PromoteCandidateRequest.position_size_shares
+   *  (后端 extra=forbid, 错名直接 422 — 曾误发 shares 被静默吞掉, 500→ATR兜底6300) */
+  position_size_shares: number;
   stop_loss: number;
   target: number;
   /** ADR-0001: 交易原型（确认/覆盖候选的 setup） */

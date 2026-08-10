@@ -33,4 +33,20 @@
 **Cons:** 质量评分需调参 + LLM 辅助判"有逻辑 vs 纯情绪"；regime 检测需定义（如 MA 多头 + 连续涨 N 日 = 主升浪）；session 分桶需股吧 publish_time 精确到时段（股吧时间戳是 CST）。
 **Context:** design doc `~/.gstack/projects/apex/wanmingyu-v9-design-20260718-155154.md` Eng-Review Findings 节 OV5（热门票采样）/ C1（Contrarian 待校准）/ OV6（regime-dependent）/ OV7（session 语义）。Contrarian 公式 + ≥70 阈值 v1 标"待校准"，v1.1 连同 regime 上下文一起校准（5-8 只实盘票基准集，pre-log 命中率 vs 朴素基准）。
 **Depends on:** 散户画像 v1 上线 + Step 0.5 千股千评先验 go（2 周 pre-log 验证"任何 crowd 信号能预测反转"成立）+ 2 周 pre-log 验证 crowd text 信号有用。若 Step 0.5 no-go 则整个 crowd 不建，此 TODO 作废。
+
+### technical.py 既有函数测试 backfill
+**What:** 给 `apex/technical.py` 既有函数补单测（mock `pro.daily` 返回固定 DataFrame，断言 `_compute_bars` 的 tail(60)/min_bars 行为、`fetch_bars`/`batch_fetch_bars` 的缓存行为、`ma_distance`/`atr_14`/`realized_vol` 等指标计算）。
+**Why:** 2026-08-07 缠论页 eng-review 发现该文件在 tests/ 零引用零覆盖，而 screener 技术面策略全建立在它上面——指标算错不报错，只是静默降低选股质量。
+**Pros:** 补上核心模块零覆盖；`_raw_daily` 的 fixture 与缠论 PR 新增 `fetch_raw_bars` 的测试天然共享。
+**Cons:** 指标期望值需手算或从实现反推（有"测试抄实现"风险）；与任何单一功能 PR 无绑定，需要专门排期。
+**Context:** 缠论 PR（design `~/.gstack/projects/apex/wanmingyu-develop-design-20260807-133032.md`）只测新增/触及的代码，本 TODO 覆盖既有部分。评审结论：不在缠论 PR 里顺手做，保持 PR 右尺寸。
+**Depends on:** 无。可在缠论页 v1 落地后任何时间做。
+
+### BJ 旧代码自动重映射（83/88xxxx → 920xxx）
+**What:** `normalize_ts_code` 或 `migrate_and_backfill` 加北交所旧码 → 920 新码重映射（用 tushare stock_basic 对照表，非盲映射后三位）；存量 watchlist/journal 里的旧 .BJ 代码一并迁移。
+**Why:** 2026-08-07 缠论 day-0 实测：2025-05 北交所代码迁移后旧 43/83/87/88xxxx 在 tushare 全部返回 0 行（"pro.daily 不支持 BJ"的旧结论实为旧码已废）。920+后三位规则在 4 只票上验证成立，但盲映射有碰撞风险（不同旧前缀可能撞同一新码），需官方对照。当前 normalize 规则 4/8→BJ 对已迁移票产生**静默空数据**。
+**Pros:** 修掉 BJ 票全链路（行情/分析/缠论页）的静默空数据；watchlist 里若有旧 BJ 码可自愈。
+**Cons:** 需要拉全量 stock_basic 建对照表；BJ 票在用户实际持仓/候选中的占比未知，可能零收益。
+**Context:** 缠论 day-0 发现（design doc Day-0 Spike 结果节）。T2 只加了 9→BJ 新码识别，本 TODO 覆盖旧码迁移。
+**Depends on:** 确认 watchlist/journal 里是否真有 .BJ 旧码条目（没有则降级为纯防御性）。
  

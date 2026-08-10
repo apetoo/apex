@@ -32,4 +32,6 @@ export const qk = {
   factorIc: ["screener", "factor-ic"] as const,
   // 持仓推送状态（概览页 PushStatusCard 轮询；full mutation 后 refetch）
   pushStatus: ["push", "status"] as const,
+  // 缠论结构（/chan 页）：ts_code + freq 维度
+  chan: (tsCode: string, freq: string) => ["chan", tsCode, freq] as const,
 } as const;

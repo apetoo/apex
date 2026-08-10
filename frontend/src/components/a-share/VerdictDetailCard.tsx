@@ -227,7 +227,13 @@ function PlaystyleSection({
   playstyleFit,
   riskLevel,
 }: {
-  playstyle: { ratings?: Record<string, number>; top?: string; reasons?: string[]; low_confidence?: boolean } | null;
+  playstyle: {
+    ratings?: Record<string, number>;
+    primary?: string;
+    secondary?: string;
+    reasons?: string[];
+    low_confidence?: boolean;
+  } | null;
   playstyleFit: { state?: string; note?: string } | null;
   riskLevel: string | null;
 }) {

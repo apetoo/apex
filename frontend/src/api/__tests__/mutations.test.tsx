@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { addPosition } from "../watchlist";
@@ -22,7 +22,7 @@ describe("watchlist.addPosition 409 行为", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("后端返回 409 -> 抛 ApiError(409)", async () => {
-    vi.spyOn(global, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ detail: "已存在", ts_code: "002466.SZ" }), {
         status: 409,
         headers: { "Content-Type": "application/json" },
@@ -41,7 +41,7 @@ describe("watchlist.addPosition 409 行为", () => {
   });
 
   it("后端返回 200 -> 返回 {message, ts_code}", async () => {
-    vi.spyOn(global, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ message: "ok", ts_code: "999999.SH" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },

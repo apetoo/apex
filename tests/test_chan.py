@@ -140,6 +140,17 @@ class TestFetchRawBarsRouting:
 # ── T4: 结构计算（mock fetch_raw_bars） ──────────────────────────────────────
 
 class TestStructure:
+    def test_stock_name_is_included(self, monkeypatch, mock_bars):
+        monkeypatch.setattr(data, "get_name_map", lambda: {"603019.SH": "中科曙光"})
+        structure = chan.get_structure("603019.SH")
+        assert structure["name"] == "中科曙光"
+        assert structure["ts_code"] == "603019.SH"
+
+    def test_stock_name_missing_degrades_to_empty(self, monkeypatch, mock_bars):
+        monkeypatch.setattr(data, "get_name_map", lambda: {})
+        structure = chan.get_structure("603019.SH")
+        assert structure["name"] == ""
+
     def test_degrade_insufficient_bars(self, monkeypatch):
         monkeypatch.setattr(chan, "fetch_raw_bars",
                             lambda ts_code, n=250, freq="D": _mk_bars(n=20))
@@ -449,7 +460,7 @@ class TestHttp:
         r = client.get("/api/chan/603019.SH")
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"ts_code", "freq", "bars", "bi_list",
+        assert set(body) == {"ts_code", "name", "freq", "bars", "bi_list",
                              "zs_list", "bsp_list", "summary", "decision"}
 
     def test_400_bad_freq(self, client, mock_bars):

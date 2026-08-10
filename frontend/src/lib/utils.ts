@@ -10,6 +10,17 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
+ * 安全转数字: 后端/表单常常把数字序列化成字符串(null/"12.34"/"NaN"),
+ * 直接 .toFixed 会抛 "X.toFixed is not a function"。这里统一兜底成 number | null。
+ * 非有限数(Infinity/NaN/非法字符串) → null, 调用方据此显示 "—"。
+ */
+function safeNum(v: unknown): number | null {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * A 股方向 → 颜色 class
  * 红涨绿跌(铁律): >0 → up, <0 → down, 0/null → flat
  */
@@ -21,39 +32,43 @@ export function directionClass(delta: number | null | undefined): string {
 /**
  * 格式化价格: 保留 2 位小数, 等宽
  */
-export function formatPrice(price: number | null | undefined): string {
+export function formatPrice(price: unknown): string {
   // 0 视为无值: 后端看多类价位被拒后理论上不会再漏 0 进来,
   // 但历史 journal + 非看多方向占位仍可能拿到 0, A 股没有 0 元的票
-  if (price == null || price === 0 || Number.isNaN(price)) return "—";
-  return price.toFixed(2);
+  const n = safeNum(price);
+  if (n == null || n === 0) return "—";
+  return n.toFixed(2);
 }
 
 /**
  * 格式化涨跌幅: 参数已经是百分比值(8.2 表示 8.2%), 带正负号
  * 用于: net_return (0.082 → "+8.20%"), 涨跌幅已乘 100 的场景
  */
-export function formatPercent(pct: number | null | undefined): string {
-  if (pct == null || Number.isNaN(pct)) return "—";
-  const sign = pct > 0 ? "+" : "";
-  return `${sign}${pct.toFixed(2)}%`;
+export function formatPercent(pct: unknown): string {
+  const n = safeNum(pct);
+  if (n == null) return "—";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}%`;
 }
 
 /**
  * 格式化比率(0-1 之间的小数): 内部 × 100 显示为百分比, 无正负号
  * 用于: 胜率 (0.6 → "60%"), 通过率, 分数, 权重归一化
  */
-export function formatRatio(ratio: number | null | undefined, digits = 0): string {
-  if (ratio == null || Number.isNaN(ratio)) return "—";
-  return `${(ratio * 100).toFixed(digits)}%`;
+export function formatRatio(ratio: unknown, digits = 0): string {
+  const n = safeNum(ratio);
+  if (n == null) return "—";
+  return `${(n * 100).toFixed(digits)}%`;
 }
 
 /**
  * 格式化涨跌额: 带正负号, 2 位小数
  */
-export function formatDelta(delta: number | null | undefined): string {
-  if (delta == null || Number.isNaN(delta)) return "—";
-  const sign = delta > 0 ? "+" : "";
-  return `${sign}${delta.toFixed(2)}`;
+export function formatDelta(delta: unknown): string {
+  const n = safeNum(delta);
+  if (n == null) return "—";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}`;
 }
 
 /**
@@ -86,7 +101,8 @@ export function formatVolume(yi: number | null | undefined): string {
 }
 
 /**
- * ts_code 归一化(镜像后端 data.normalize_ts_code: 6->SH, 0/3->SZ, 4/8->BJ)。
+ * ts_code 归一化(镜像后端 data.normalize_ts_code:
+ * 6/5->SH, 0/3/1->SZ, 4/8/9->BJ)。
  * 接受 "601318" / "601318.SH" / "601318.sh"，非法返回 null。
  */
 export function normalizeTsCode(raw: string): string | null {
@@ -99,7 +115,7 @@ export function normalizeTsCode(raw: string): string | null {
         ? "SH" // 6 沪市个股, 5 沪市 ETF/基金
         : d === "0" || d === "3" || d === "1"
           ? "SZ" // 0/3 深市个股, 1 深市 ETF/基金
-          : d === "4" || d === "8"
+          : d === "4" || d === "8" || d === "9"
             ? "BJ"
             : null;
     return suf ? `${s}.${suf}` : null;

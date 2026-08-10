@@ -46,6 +46,8 @@ No framework glue, no DB. `apex/` is the service layer; `backend/` is a thin HTT
 
 **`apex/backtest.py`** — vectorbt-based. Each bullish journal entry becomes its own `Portfolio.from_signals` over an N-day window starting at `entry_date`, using `price_advice.stop_loss/target` as fractional SL/TP anchored to the actual fill price. One-portfolio-per-entry to avoid signal collision when the same stock has multiple verdicts.
 
+**`apex/technical.py` + `apex/chan.py`** — the `/chan` technical-analysis path. `technical.fetch_raw_bars()` fetches unadjusted completed D/W/30/60-minute bars without touching the screener cache; `chan.get_structure()` runs czsc and serializes bars, strokes, centers, approximate buy/sell points, and the current summary. Data-source failures map to 502 and an unavailable czsc runtime maps to 501.
+
 ### `backend/` — FastAPI HTTP layer (thin routing over `apex/`)
 
 ```
@@ -59,13 +61,13 @@ backend/
 ├── schemas/           # Pydantic request models (responses reuse apex's raw dicts)
 └── routers/           # one file per domain, all mounted under /api
     ├── market.py  watchlist.py  account.py  analyze.py
-    ├── backtest.py  screener.py  calibration.py
+    ├── backtest.py  screener.py  calibration.py  chan.py
     └── postmortem.py  chat.py
 ```
 
 Design rules:
 - **No `services/` layer.** `apex.*` is the service layer; a forwarding layer would be pure overhead. Routers do: parse request → `normalize_ts_code` → call `apex.*` → return JSON.
-- **Exception mapping** (`core/errors.py`) so routers have no try/except boilerplate: `DuplicatePositionError→409`, `PositionNotFoundError→404`, `AnalysisError→502`, `PostmortemError→500`, `ValueError→400`.
+- **Exception mapping** (`core/errors.py`) so routers have no try/except boilerplate: `DuplicatePositionError→409`, `PositionNotFoundError→404`, `AnalysisError/DataFetchError→502`, `ChanUnavailableError→501`, `PostmortemError→500`, `ValueError→400`.
 - **Streaming.** `analyze.run` / `screener.run` are blocking calls that take an `on_progress` callback — bridged via a worker thread + `queue.Queue` to an async SSE generator. `llm.chat_stream` is already a sync generator — wrapped with `run_in_executor`. SSE events: `trace` / `progress` / `chunk` / `done` / `error`.
 - **Every endpoint that takes a ts_code normalizes it first** via `data.normalize_ts_code()`.
 
@@ -85,7 +87,7 @@ frontend/src/
 ├── components/
 │   ├── base/               # shadcn-style Card / Button / ChatPanel / Markdown / Drawer foundation
 │   └── a-share/            # A-share primitives: PriceTag / VerdictTag / PositionCard / CandidateCard / MarketIndexBar / VerdictDetailCard
-├── routes/                 # 6 pages: overview / watchlist / analyze / journal / backtest / screener
+├── routes/                 # pages: overview / watchlist / analyze / journal / backtest / screener / chan
 ├── hooks/                  # useSSE (hand-written, no MSW) + useChatContext (single-injection hash tracking)
 ├── lib/utils.ts            # cn / directionClass / formatPrice / formatDelta / formatPercent / formatRatio
 └── types/verdict.ts        # VERDICT_COLOR TS const
@@ -100,12 +102,13 @@ Routes:
 - `/journal` — cross-stock full history list + search + click-row → `<Drawer>` with `<VerdictDetailCard>` (完整结果)
 - `/backtest` — per-signal bar chart + stats table + realized closed trades
 - `/screener` — strategy weight sliders (localStorage) + report with regime/by_strategy/top_scored
+- `/chan` — unadjusted completed K-lines with czsc strokes, centers, approximate buy/sell points, and D/W/30/60-minute switching
 
 SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `chunk` / `done` / `error`. The frontend's `useSSE` is hand-written (no `@microsoft/fetch-event-source` — default auto-reconnect re-runs DeepSeek + double-writes journal). All SSE paths support a `fetchFn` injection (for unit tests; no MSW).
 
 ## Critical conventions
 
-**ts_code normalization.** Everything below the UI/API assumes the suffixed form (`002050.SZ`, `603019.SH`, `838810.BJ`). Always pass user input through `data.normalize_ts_code()` before storing, looking up history, or calling tushare. The first digit determines exchange: 6→SH, 0/3→SZ, 4/8→BJ. The backend applies this at every endpoint boundary.
+**ts_code normalization.** Everything below the UI/API assumes the suffixed form (`002050.SZ`, `603019.SH`, `920185.BJ`). Always pass user input through `data.normalize_ts_code()` before storing, looking up history, or calling tushare. The first digit determines exchange: 6/5→SH, 0/3/1→SZ, 4/8/9→BJ (9 is the migrated 920xxx Beijing segment). The backend applies this at every endpoint boundary; frontend `normalizeTsCode` mirrors the same mapping.
 
 **Trading flow: candidate → position, not analysis → position.** AI verdicts often suggest entry prices that aren't yet met, so analysis does not directly create a position. The flow is:
 - `add_candidate()` with `trigger_price` = AI's suggested entry, optional `stop_advice` / `target_advice` carried forward

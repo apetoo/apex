@@ -23,8 +23,6 @@ interface ChatMsg {
   content: string;
 }
 
-type ChunkEvent = { content: string } | Record<string, never>;
-
 /** 工具调用事件派生状态(由 tool_call/tool_result 事件按 id 配对) */
 type ToolCall = {
   id: string;
@@ -37,6 +35,38 @@ type ToolCall = {
 
 type ToolCallData = { id: string; name: string; args: Record<string, unknown> };
 type ToolResultData = { id: string; name: string; result: string; ok: boolean; chars: number };
+type ChatEventData =
+  | { content: string }
+  | ToolCallData
+  | ToolResultData
+  | Record<string, never>;
+
+function isToolCallData(data: ChatEventData): data is ToolCallData {
+  return (
+    "id" in data &&
+    typeof data.id === "string" &&
+    "name" in data &&
+    typeof data.name === "string" &&
+    "args" in data &&
+    typeof data.args === "object" &&
+    data.args !== null
+  );
+}
+
+function isToolResultData(data: ChatEventData): data is ToolResultData {
+  return (
+    "id" in data &&
+    typeof data.id === "string" &&
+    "name" in data &&
+    typeof data.name === "string" &&
+    "result" in data &&
+    typeof data.result === "string" &&
+    "ok" in data &&
+    typeof data.ok === "boolean" &&
+    "chars" in data &&
+    typeof data.chars === "number"
+  );
+}
 
 function formatArgs(args: Record<string, unknown>): string {
   const entries = Object.entries(args);
@@ -55,17 +85,19 @@ export function ChatPanel() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const { buildMessage } = useChatContext();
-  const { events, status, error, connect, abort, reset } = useSSE<ChunkEvent>();
+  const { events, status, error, connect, abort, reset } = useSSE<ChatEventData>();
 
   // 从 tool_call/tool_result 事件派生工具调用列表(按 id 配对)
   const toolCalls: ToolCall[] = useMemo(() => {
     const map = new Map<string, ToolCall>();
     for (const e of events) {
       if (e.event === "tool_call") {
-        const d = e.data as ToolCallData;
+        if (!isToolCallData(e.data)) continue;
+        const d = e.data;
         map.set(d.id, { id: d.id, name: d.name, args: d.args ?? {}, status: "calling" });
       } else if (e.event === "tool_result") {
-        const d = e.data as ToolResultData;
+        if (!isToolResultData(e.data)) continue;
+        const d = e.data;
         const ex = map.get(d.id);
         if (ex) {
           ex.status = d.ok ? "done" : "error";

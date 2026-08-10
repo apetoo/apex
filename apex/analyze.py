@@ -421,6 +421,8 @@ TOOLS = [
                 "记录已持仓票的加减仓建议。重新分析一只**你已持有**的票时调此工具；未持仓的票调 record_verdict（调错会被系统拒绝）。"
                 "action=add 必填 add_shares(>0)；action=trim 二选一 trim_shares 或 trim_pct(0-1]；action=exit/hold 可只给 new_stop。"
                 "scale_plan 给完整 ladder（演进当前 ladder，非替换：未触发 level 保留，可新增/调整 level/trigger/new_stop）。"
+                "系统会按价格顺序模拟执行 ladder 并拒绝不自洽路径：下行路径（现价往下）必须单一意图——纯回踩加仓或纯防守减仓，先卖后买/先买后卖是 churn（两档若互斥请合并为单一防守档或拉开到不同情景）；上行路径先加后减（金字塔），trim 之后不得再有 add；trim 低于有效止损（含路径内止损上移后的新止损）是死档；add ≥ 有效止盈价是自相矛盾（用 new_target 上移止盈修复）。"
+                "target 是建仓时的一次性字段，价格观上移时必须用 new_target 同步止盈，否则化石止盈（monitor 推送）会与 ladder 打架。"
                 "rationale 是机器可读摘要，完整推理写进分析文本。"
                 "action=trim/exit 涉及实质风险决策，调用前必须已调 web_search 的 regulatory+shareholders+money_flow 三类（缺则被拒）。"
                 "4h 内重复调此工具会被反 churn 速率限制拒绝，除非 new_info 列出本次新增信息。"
@@ -433,6 +435,7 @@ TOOLS = [
                     "trim_shares": {"type": "integer", "description": "action=trim 二选一，减仓股数(>0)"},
                     "trim_pct": {"type": "number", "description": "action=trim 二选一，减仓比例 0-1（如 0.33=减1/3）"},
                     "new_stop": {"type": "number", "description": "止损上移建议（add/hold 常带，advisory）"},
+                    "new_target": {"type": "number", "description": "止盈价上移建议（hold/add 常带；价格观演进时同步 target，防化石止盈推送与 ladder 冲突）"},
                     "scale_plan": {
                         "type": "array",
                         "description": "完整 ladder 计划（演进当前 ladder，非替换）",
@@ -1839,8 +1842,19 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                     })
             elif name == "record_position_action":
                 # v1.1.0 持仓路径：守卫抽离到 _validate_position_action 供单测（T6）
+                # ladder 路径模拟需现价锚定：实时价优先、日线收盘 fallback，都失败则降级（跳过路径检查）
+                _cp_pa = None
+                try:
+                    _cp_pa = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                except Exception:
+                    pass
+                if _cp_pa is None:
+                    try:
+                        _cp_pa = (data.get_latest_price([ts_code]) or {}).get(ts_code)
+                    except Exception:
+                        pass
                 pa_reasons, _sizing_warn = _validate_position_action(
-                    tool_input, ts_code, searches_performed
+                    tool_input, ts_code, searches_performed, current_price=_cp_pa
                 )
                 if pa_reasons:
                     result = json.dumps({
@@ -2083,11 +2097,147 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     return entry
 
 
-def _validate_position_action(
-    tool_input: dict, ts_code: str, searches_performed: list
-) -> tuple[list[str], str]:
-    """v1.1.0 record_position_action dispatch 守卫：对称守卫 + 字段校验 + trim/exit 强制搜索 + 4h 反 churn + sizing_cap warn。
+def _simulate_ladder(
+    levels: list, current_price, eff_stop, eff_target
+) -> tuple[list[str], list[str]]:
+    """ladder 路径模拟校验：ladder 的执行语义是按价格顺序触发，校验照执行方式把 ladder 走一遍。
 
+    下行路径（现价往下，trigger 降序）必须单一意图（纯 add 或纯 trim）：
+    先卖后买/先买后卖 = churn（拒）。上行路径允许 add->trim（金字塔加仓后高位兑现），
+    trim->add = 卖了更高价接回（拒）。trim 低于路径上的有效止损 = 死档（拒；初始止损或
+    路径内 add 上移后的新止损）。上行档 new_stop 杀死下行 trim = 条件死档（advisory 不拒，
+    仅当上行执行到时才失效）。add ≥ 有效止盈 = 自相矛盾（拒）。
+
+    current_price=None -> 降级为锚定无关检查（不做路径顺序/单一意图检查）。
+    返回 (rejects, advisories)，调用方分别并入拒绝理由与 advisory 警告。
+    """
+    parsed: list[tuple[int, str, float, float | None]] = []  # (原档序, action, trigger, new_stop)
+    for _i, _lvl in enumerate(levels or []):
+        if not isinstance(_lvl, dict):
+            continue
+        _act = _lvl.get("action")
+        if _act not in ("add", "trim"):
+            continue
+        try:
+            _tp = float(_lvl.get("trigger_price"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            _nsf = float(_lvl.get("new_stop"))
+        except (TypeError, ValueError):
+            _nsf = None
+        parsed.append((_i, _act, _tp, _nsf))
+
+    rejects: list[str] = []
+    advisories: list[str] = []
+
+    try:
+        _cp = float(current_price) if current_price is not None else None
+    except (TypeError, ValueError):
+        _cp = None
+
+    if _cp is None:
+        # 降级（锚定无关）：trim < 有效止损 -> 拒；add ≥ 有效止盈 -> 拒；
+        # add 档 new_stop 杀死 trim -> advisory（仅 add 杀手，同旧守卫 6）。
+        if eff_stop is not None:
+            for _i, _act, _tp, _nsf in parsed:
+                if _act == "trim" and _tp < eff_stop:
+                    rejects.append(
+                        f"scale_plan 第 {_i + 1} 档 trim 触发价 {_tp} 低于有效止损 {eff_stop}："
+                        f"止损会先触发全仓离场，该减仓档永远不会执行（死代码）。"
+                        f"请把该档 trigger_price 提到 {eff_stop} 之上，或把 new_stop 降到该触发价之下。"
+                    )
+        if eff_target is not None:
+            for _i, _act, _tp, _nsf in parsed:
+                if _act == "add" and _tp >= eff_target:
+                    rejects.append(
+                        f"scale_plan 第 {_i + 1} 档 add 触发价 {_tp} ≥ 有效止盈价 {eff_target}："
+                        f"到止盈价会触发止盈提醒/离场，又在同等或更高价加仓，计划自相矛盾。"
+                        f"请用 new_target 上移止盈（当前 {eff_target}），或移除/下修该加仓档。"
+                    )
+        _add_stops = [(_i, _nsf) for _i, _act, _tp, _nsf in parsed if _act == "add" and _nsf is not None]
+        for _ti, _act, _ttp, _ in parsed:
+            if _act != "trim":
+                continue
+            _killers = [(_s, _ai) for _ai, _s in _add_stops if _ttp < _s]
+            if _killers:
+                _s, _ai = min(_killers)
+                advisories.append(
+                    f"第 {_ti + 1} 档 trim@{_ttp:g} 在第 {_ai + 1} 档 add 执行后"
+                    f"（止损上移至 {_s:g}）永不触发"
+                )
+        return rejects, advisories
+
+    _down = sorted((p for p in parsed if p[2] < _cp), key=lambda p: -p[2])   # 现价往下，降序触发
+    _up = sorted((p for p in parsed if p[2] >= _cp), key=lambda p: p[2])     # 现价往上，升序触发
+
+    # 下行路径：单一意图（纯 add 或纯 trim），止损随档上移，低于有效止损的 trim 是死档
+    _stop_w = eff_stop
+    _prev = None  # (idx, action) 上一触发档
+    for _i, _act, _tp, _nsf in _down:
+        if _prev is not None and _act != _prev[1]:
+            if _prev[1] == "trim":
+                rejects.append(
+                    f"下行路径：第 {_prev[0] + 1} 档 trim 先于第 {_i + 1} 档 add@{_tp:g} 触发——"
+                    f"同一下行路径先卖后买是 churn（两档应互斥：破位减 vs 企稳加）。"
+                    f"请合并为单一防守档，或把 add 触发价拉开到不同情景。"
+                )
+            else:
+                rejects.append(
+                    f"下行路径：第 {_prev[0] + 1} 档 add 先于第 {_i + 1} 档 trim@{_tp:g} 触发——"
+                    f"同一下行路径先买后卖是 churn。请合并为单一意图（纯回踩加仓或纯防守减仓）。"
+                )
+        if _act == "trim" and _stop_w is not None and _tp < _stop_w:
+            rejects.append(
+                f"下行路径：第 {_i + 1} 档 trim@{_tp:g} 低于有效止损 {_stop_w:g}，"
+                f"止损先触发全仓离场，该减仓档永不触发（死档）。"
+                f"请把 trigger_price 提到 {_stop_w:g} 之上，或下修止损。"
+            )
+        _prev = (_i, _act)
+        if _nsf is not None:
+            _stop_w = _nsf if _stop_w is None else max(_stop_w, _nsf)
+
+    # 上行路径：先加后减（金字塔），trim 之后不得再有 add；add 不得 ≥ 有效止盈；记录止损上移
+    _prev = None
+    _up_stops: list[tuple[int, str, float]] = []  # (idx, action, new_stop) 供跨路径 advisory
+    for _i, _act, _tp, _nsf in _up:
+        if _act == "add":
+            if _prev is not None and _prev[1] == "trim":
+                rejects.append(
+                    f"上行路径：第 {_prev[0] + 1} 档 trim 之后第 {_i + 1} 档 add@{_tp:g} 更高价接回（churn）。"
+                    f"上行路径应为先加后减（金字塔），trim 之后不允许再有 add 档。"
+                )
+            if eff_target is not None and _tp >= eff_target:
+                rejects.append(
+                    f"上行路径：第 {_i + 1} 档 add@{_tp:g} ≥ 有效止盈价 {eff_target}："
+                    f"到止盈价会触发止盈提醒/离场，又在同等或更高价加仓，计划自相矛盾。"
+                    f"请用 new_target 上移止盈（当前 {eff_target}），或移除/下修该加仓档。"
+                )
+        _prev = (_i, _act)
+        if _nsf is not None:
+            _up_stops.append((_i, _act, _nsf))
+
+    # 跨路径条件死档（advisory）：上行任一档 new_stop 上移止损后，低于新止损的下行 trim 永不触发
+    for _ti, _act, _ttp, _ in _down:
+        if _act != "trim":
+            continue
+        _killers = [(_s, _ki, _ka) for _ki, _ka, _s in _up_stops if _ttp < _s]
+        if _killers:
+            _s, _ki, _ka = min(_killers)
+            advisories.append(
+                f"第 {_ti + 1} 档 trim@{_ttp:g} 在第 {_ki + 1} 档 {_ka} 执行后"
+                f"（止损上移至 {_s:g}）永不触发"
+            )
+
+    return rejects, advisories
+
+
+def _validate_position_action(
+    tool_input: dict, ts_code: str, searches_performed: list, current_price=None
+) -> tuple[list[str], str]:
+    """v1.1.0 record_position_action dispatch 守卫：对称守卫 + 字段校验 + trim/exit 强制搜索 + 4h 反 churn + ladder 路径模拟 + sizing_cap warn。
+
+    current_price 供 ladder 路径模拟锚定（dispatch 处取实时价/日线收盘，None -> 降级为锚定无关检查）。
     返回 (reject_reasons, sizing_warn)。reasons 非空 -> 拒绝回喂 AI；sizing_warn 非空 -> advisory 警告仍接受。
     抽离自 agent loop 供单测（T6）。
     """
@@ -2156,6 +2306,34 @@ def _validate_position_action(
         except Exception:
             pass
 
+    # 守卫 5-7 (ladder 自洽 -> 路径模拟): ladder 语义=按价格顺序触发，校验照执行方式走一遍
+    # （_simulate_ladder）。有效止损 = new_stop（若给）否则持仓 stop_loss；有效止盈 = new_target（若给）
+    # 否则持仓 target。current_price 缺失时降级为锚定无关检查（不做路径顺序/单一意图检查）。
+    ladder_warn = ""
+    if _held_pa is not None:
+        _ns = tool_input.get("new_stop")
+        _eff_stop = _ns if isinstance(_ns, (int, float)) and not isinstance(_ns, bool) else _held_pa.get("stop_loss")
+        try:
+            _eff_stop_f = float(_eff_stop) if _eff_stop is not None else None
+        except (TypeError, ValueError):
+            _eff_stop_f = None
+        _nt = tool_input.get("new_target")
+        _eff_tgt = _nt if isinstance(_nt, (int, float)) and not isinstance(_nt, bool) else _held_pa.get("target")
+        try:
+            _eff_tgt_f = float(_eff_tgt) if _eff_tgt is not None else None
+        except (TypeError, ValueError):
+            _eff_tgt_f = None
+        _rejects, _advisories = _simulate_ladder(
+            tool_input.get("scale_plan") or [], current_price, _eff_stop_f, _eff_tgt_f
+        )
+        reasons.extend(_rejects)
+        if _advisories:
+            ladder_warn = (
+                "⚠ ladder 跨档自洽：" + "；".join(_advisories) +
+                "（死代码）。如属有意（trim 仅加仓前有效）请在该 trim 档 reason 注明失效条件，"
+                "否则调整 trigger_price/new_stop。"
+            )
+
     # A1 sizing_cap warn（advisory，不拒）：加仓后总风险超上限则警告仍接受
     sizing_warn = ""
     if action == "add" and _held_pa is not None and not reasons:
@@ -2173,7 +2351,8 @@ def _validate_position_action(
         except Exception:
             pass
 
-    return reasons, sizing_warn
+    _warn = " ".join(w for w in (ladder_warn, sizing_warn) if w)
+    return reasons, _warn
 
 
 def _finalize_position_action(
@@ -2221,6 +2400,7 @@ def _finalize_position_action(
             "trim_shares": position_action_data.get("trim_shares"),
             "trim_pct": position_action_data.get("trim_pct"),
             "new_stop": position_action_data.get("new_stop"),
+            "new_target": position_action_data.get("new_target"),
             "scale_plan": position_action_data.get("scale_plan") or [],
             "rationale": position_action_data.get("rationale"),
         },
@@ -2275,6 +2455,16 @@ def _finalize_position_action(
                         print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止损未应用")
                     except Exception as e:
                         print(f"⚠ 新止损应用失败（不影响 journal/plan）: {e}")
+                # 同 new_stop：new_target 直接覆盖持仓 target（防化石止盈推送与 ladder 打架）。
+                _new_target = entry["position_action"].get("new_target")
+                if _new_target is not None:
+                    try:
+                        _wl_fin.update_advice(ts_code, target=_new_target, emit_notify=False)
+                        print(f"✓ 已应用新止盈: {ts_code} target -> {_new_target}")
+                    except _wl_fin.PositionNotFoundError:
+                        print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止盈未应用")
+                    except Exception as e:
+                        print(f"⚠ 新止盈应用失败（不影响 journal/plan）: {e}")
         except Exception as e:
             print(f"⚠ ladder 刷新失败（不影响 journal）: {e}")
 

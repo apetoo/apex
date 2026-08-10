@@ -152,6 +152,31 @@ def test_account_no_warning_when_complete(isolated_paths):
     assert risk["missing_warning"] is None
 
 
+# ── 边界: promote 请求 schema 不许静默吞 shares ──────────────────────────────
+
+def test_promote_request_forbids_unknown_shares_field():
+    """regression(2026-08-03): 前端误发 shares(非 position_size_shares), pydantic
+    默认 extra=ignore 静默吞掉 → 走 ATR 兜底把用户手填 500 覆盖成 6300。
+    extra=forbid 后字段错配必须 ValidationError(422), 不许再静默。"""
+    from pydantic import ValidationError
+    from backend.schemas.watchlist import PromoteCandidateRequest
+    with pytest.raises(ValidationError):
+        PromoteCandidateRequest(
+            ts_code="601600.SH", entry_price=9.51, stop_loss=9.08, target=10.4,
+            shares=500,  # 旧前端字段名 — 必须被拒绝而非静默丢弃
+        )
+
+
+def test_promote_request_accepts_position_size_shares():
+    """正例: 规范字段 position_size_shares 正常透传。"""
+    from backend.schemas.watchlist import PromoteCandidateRequest
+    req = PromoteCandidateRequest(
+        ts_code="601600.SH", entry_price=9.51, stop_loss=9.08, target=10.4,
+        position_size_shares=500,
+    )
+    assert req.position_size_shares == 500
+
+
 # ── 断层4: monitor._emit_trigger 带上下文 ─────────────────────────────────────
 
 def test_monitor_emit_trigger_carries_candidate_advice():

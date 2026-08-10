@@ -16,6 +16,7 @@ import { qk } from "@/api/query-keys";
 import { cn, formatPercent } from "@/lib/utils";
 import { CompactPositionCard } from "@/components/a-share/CompactPositionCard";
 import { PushStatusCard } from "@/routes/overview/PushStatusCard";
+import { calcTodayPnlTotal, positionTodayPnl } from "@/routes/overview/todayPnl";
 
 /**
  * / 概览首页
@@ -86,8 +87,9 @@ export function OverviewPage() {
     enabled: codes.length > 0,
   });
 
-  /* ── 当日平仓：今日盈亏要计入「今日那段」(exit_price - 昨收) × 股数 ─────── */
+  /* ── 当日平仓：今日盈亏要计入「今日那段」(exit - 基准) × 股数 ─────────── */
   // 平仓后仓位从 active_positions 移除, 否则今日盈亏会漏掉这笔今天的涨跌。
+  // 基准 = 昨日开仓→昨收; 今日开今日平→买入价(见 todayPnl.ts)。
   // CN 时区今日字符串, 与后端 close.exit_date (date.today().isoformat()) 对齐。
   const todayStr = new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
@@ -112,25 +114,14 @@ export function OverviewPage() {
 
   /* ── 今日盈亏汇总 ──────────────────────────────────── */
 
-  const todayPnlTotal: number | null = (() => {
-    let sum = 0;
-    // 在仓: (现价 - 昨收) × 股数
-    for (const pos of positions) {
-      const cur = prices.data?.[pos.ts_code] ?? null;
-      const prev = daily.data?.[pos.ts_code] ?? null;
-      if (cur == null || prev == null || pos.position_size_shares == null) return null;
-      sum += (cur - prev) * pos.position_size_shares;
-    }
-    // 当日平仓: (exit_price - 昨收) × 股数（best-effort, 取不到昨收则跳过这条, 不拖垮整指标）
-    for (const c of closedToday) {
-      const exitPrice = c.close?.actual_exit_price;
-      const prev = closedPrevClose.data?.[c.ts_code] ?? null;
-      const shares = c.open?.position_size_shares ?? null;
-      if (exitPrice == null || prev == null || shares == null) continue;
-      sum += (exitPrice - prev) * shares;
-    }
-    return positions.length > 0 || closedToday.length > 0 ? sum : null;
-  })();
+  const todayPnlTotal = calcTodayPnlTotal({
+    positions,
+    closedToday,
+    prices: prices.data,
+    prevClose: daily.data,
+    closedPrevClose: closedPrevClose.data,
+    todayStr,
+  });
 
   const acc = account.data;
   const totalCapital = acc?.total_capital ?? null;
@@ -142,12 +133,14 @@ export function OverviewPage() {
 
   const pnlIsUp = todayPnlTotal != null && todayPnlTotal >= 0;
 
+  // 盈亏计数与合计同口径(positionTodayPnl 基准): 今日开仓按买入价, 否则按昨收。
   const winningCount = (() => {
     let n = 0;
     for (const pos of positions) {
       const cur = prices.data?.[pos.ts_code] ?? null;
       const prev = daily.data?.[pos.ts_code] ?? null;
-      if (cur != null && prev != null && cur - prev > 0) n++;
+      const pnl = positionTodayPnl(pos, cur, prev, todayStr);
+      if (pnl != null && pnl > 0) n++;
     }
     return n;
   })();
