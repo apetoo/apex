@@ -240,6 +240,7 @@ export interface AddCandidatePayload {
   stop_advice?: number;
   target_advice?: number;
   note?: string;
+  strategy?: string;
   expires_days?: number;
   trigger_low?: number;
   trigger_high?: number;
