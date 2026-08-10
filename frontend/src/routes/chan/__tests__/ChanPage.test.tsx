@@ -16,7 +16,7 @@ vi.mock("@/api/chan", async () => {
 });
 
 import { ChanPage } from "../ChanPage";
-import { getChanStructure, type ChanStructure } from "@/api/chan";
+import { getChanStructure, type ChanDecision, type ChanStructure } from "@/api/chan";
 import { ApiError } from "@/api/client";
 
 /**
@@ -28,7 +28,7 @@ import { ApiError } from "@/api/client";
 
 const MOCK_BAR = { dt: "2026-08-07", open: 87, high: 89, low: 86, close: 88, vol: 100 };
 
-function fullDecision() {
+function fullDecision(overrides: Partial<ChanDecision> = {}): ChanDecision {
   return {
     bias: "long" as const,
     setup: "bsp_buy" as const,
@@ -44,6 +44,7 @@ function fullDecision() {
     candidate_eligible: true,
     ineligible_reason: null,
     basis: ["二买信号待确认"],
+    ...overrides,
   };
 }
 
@@ -83,6 +84,12 @@ function withClient(ui: ReactNode, initialPath = "/chan") {
 }
 
 beforeEach(() => vi.restoreAllMocks());
+
+describe("ChanPage fixture", () => {
+  it("allows a single decision field to be overridden", () => {
+    expect(fullDecision({ state: "confirmed" }).state).toBe("confirmed");
+  });
+});
 
 describe("ChanPage 渲染态", () => {
   it("完整结构 -> 图表 + 摘要 + 指标", async () => {
