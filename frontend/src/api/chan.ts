@@ -59,6 +59,13 @@ export type ChanDecisionSetup = "bsp_buy" | "zs_breakout" | "none";
 
 export type ChanDecisionState = "watching" | "pending" | "confirmed" | "invalid";
 
+export type ChanDecisionIneligibleReason =
+  | "no_actionable_structure"
+  | "signal_bar_missing"
+  | "signal_invalidated"
+  | "stale_signal"
+  | "risk_structure";
+
 export interface ChanDecision {
   bias: ChanDecisionBias;
   setup: ChanDecisionSetup;
@@ -72,7 +79,7 @@ export interface ChanDecision {
   trigger_low: number | null;
   trigger_high: number | null;
   candidate_eligible: boolean;
-  ineligible_reason: string | null;
+  ineligible_reason: ChanDecisionIneligibleReason | null;
   basis: string[];
 }
 

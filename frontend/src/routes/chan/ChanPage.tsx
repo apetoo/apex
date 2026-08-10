@@ -14,6 +14,8 @@ import { CandlestickChart } from "@/components/a-share/CandlestickChart";
 import {
   CHAN_BSP_LABEL,
   getChanStructure,
+  type ChanDecision,
+  type ChanDecisionIneligibleReason,
   type ChanFreq,
   type ChanStructure,
 } from "@/api/chan";
@@ -66,11 +68,32 @@ const DECISION_BIAS_META: Record<
   risk: { text: "风险", cls: "text-down" },
 };
 
+const DECISION_INELIGIBLE_REASON_LABEL: Record<
+  ChanDecisionIneligibleReason,
+  string
+> = {
+  no_actionable_structure: "暂无可执行的做多结构",
+  signal_bar_missing: "未找到信号对应的已完成 K 线",
+  signal_invalidated: "当前收盘已跌破结构失效价",
+  stale_signal: "信号已超过 10 根已完成 K 线",
+  risk_structure: "当前结构为卖点或向下跌破风险",
+};
+
 const CANDIDATE_INPUT_CLASS =
   "w-full rounded-md border border-border bg-bg-card px-3 py-1.5 font-mono text-sm outline-none focus:border-text-secondary";
 
 function decisionInputPrice(value: number | null) {
-  return value == null ? "" : formatPrice(value);
+  return value == null ? "" : value.toFixed(3).replace(/0$/, "");
+}
+
+function decisionIneligibleReason(reason: ChanDecision["ineligible_reason"]) {
+  return reason == null ? null : DECISION_INELIGIBLE_REASON_LABEL[reason];
+}
+
+function candidateSetupLabel(decision: ChanDecision) {
+  return decision.setup === "zs_breakout"
+    ? "中枢突破回踩"
+    : `缠论${CHAN_BSP_LABEL[decision.bsp_type ?? ""] ?? "买点"}`;
 }
 
 function candidateDecisionKey(data: ChanStructure) {
@@ -101,7 +124,7 @@ export function ChanPage() {
   const isBj = committed.endsWith(".BJ");
   const effectiveFreq = isBj && (freq === "30" || freq === "60") ? "D" : freq;
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: qk.chan(committed, effectiveFreq),
     queryFn: () => getChanStructure(committed, effectiveFreq),
     enabled: !!committed,
@@ -229,7 +252,16 @@ export function ChanPage() {
       )}
 
       {/* 决策卡（保留原结构摘要指标） */}
-      {data && !insufficient && <DecisionPanel data={data} />}
+      {data && !insufficient && (
+        <DecisionPanel
+          data={data}
+          refetchDecision={async () => {
+            const result = await refetch({ throwOnError: true });
+            if (result.data == null) throw new Error("刷新结果为空");
+            return result.data;
+          }}
+        />
+      )}
 
       {/* loading */}
       {isLoading && (
@@ -264,7 +296,13 @@ export function ChanPage() {
   );
 }
 
-function DecisionPanel({ data }: { data: ChanStructure }) {
+function DecisionPanel({
+  data,
+  refetchDecision,
+}: {
+  data: ChanStructure;
+  refetchDecision: () => Promise<ChanStructure>;
+}) {
   const s = data.summary;
   const decision = data.decision;
   const mutation = useAddCandidate();
@@ -285,14 +323,14 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
   const [formError, setFormError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [openedDecisionKey, setOpenedDecisionKey] = useState<string | null>(null);
+  const [isRefreshingCandidate, setIsRefreshingCandidate] = useState(false);
   const zb = ZS_BREAK_LABEL[s.zs_break ?? "none"];
   const stateMeta = DECISION_STATE_META[decision.state];
   const biasMeta = DECISION_BIAS_META[decision.bias];
   const lastBiDir = s.last_bi_direction === "up" ? "向上" : s.last_bi_direction === "down" ? "向下" : "—";
   const freqLabel = FREQS.find((item) => item.key === data.freq)?.label ?? data.freq;
-  const setupLabel = decision.setup === "zs_breakout"
-    ? "中枢突破回踩"
-    : `缠论${CHAN_BSP_LABEL[decision.bsp_type ?? ""] ?? "买点"}`;
+  const setupLabel = candidateSetupLabel(decision);
+  const ineligibleReason = decisionIneligibleReason(decision.ineligible_reason);
   const existingCandidate = watchlist?.candidates.some(
     (candidate) => candidate.ts_code === data.ts_code,
   );
@@ -328,7 +366,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
     setFormError(null);
   }, [candidateOpen, decisionKey, openedDecisionKey]);
 
-  const submitCandidate = (event: React.FormEvent) => {
+  const submitCandidate = async (event: React.FormEvent) => {
     event.preventDefault();
     setFormError(null);
 
@@ -337,11 +375,6 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
       setOpenedDecisionKey(null);
       return;
     }
-    if (!decision.candidate_eligible) {
-      setFormError(decision.ineligible_reason ?? "当前结构已不可加入候选");
-      return;
-    }
-
     const trigger = Number(triggerPrice);
     if (!triggerPrice.trim() || !Number.isFinite(trigger) || trigger <= 0) {
       setFormError("触发价必须大于 0");
@@ -374,18 +407,46 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
       return;
     }
 
+    let freshData: ChanStructure;
+    setIsRefreshingCandidate(true);
+    try {
+      freshData = await refetchDecision();
+    } catch (refreshError) {
+      setFormError(
+        `刷新当前缠论决策失败：${refreshError instanceof Error ? refreshError.message : String(refreshError)}`,
+      );
+      return;
+    } finally {
+      setIsRefreshingCandidate(false);
+    }
+
+    const freshDecisionKey = candidateDecisionKey(freshData);
+    if (openedDecisionKey == null || openedDecisionKey !== freshDecisionKey) {
+      setCandidateOpen(false);
+      setOpenedDecisionKey(null);
+      return;
+    }
+    const freshDecision = freshData.decision;
+    if (!freshDecision.candidate_eligible) {
+      setFormError(
+        decisionIneligibleReason(freshDecision.ineligible_reason)
+          ?? "当前结构已不可加入候选",
+      );
+      return;
+    }
+
     mutation.mutate(
       {
-        ts_code: data.ts_code,
+        ts_code: freshData.ts_code,
         name: "",
         trigger_price: trigger,
-        trigger_direction: decision.setup === "zs_breakout" ? "below" : "above",
+        trigger_direction: freshDecision.setup === "zs_breakout" ? "below" : "above",
         trigger_low: low,
         trigger_high: high,
         stop_advice: stop,
         note,
         strategy: "chan",
-        setup: setupLabel,
+        setup: candidateSetupLabel(freshDecision),
       },
       {
         onSuccess: () => {
@@ -453,8 +514,8 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
             已确认不等于可追高，请按候选触发条件等待机会。
           </p>
         )}
-        {!decision.candidate_eligible && decision.ineligible_reason && (
-          <p className="text-xs text-down">{decision.ineligible_reason}</p>
+        {!decision.candidate_eligible && ineligibleReason && (
+          <p className="text-xs text-down">{ineligibleReason}</p>
         )}
 
         <div className="grid grid-cols-2 gap-x-6 gap-y-2 border-t border-border pt-3 sm:grid-cols-4">
@@ -525,7 +586,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
             setCandidateOpen(false);
             setOpenedDecisionKey(null);
           }}
-          busy={mutation.isPending}
+          busy={mutation.isPending || isRefreshingCandidate}
           title="确认加入候选"
         >
         <form onSubmit={submitCandidate} className="space-y-4">
@@ -557,7 +618,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
               <input
                 id="chan-trigger-price"
                 type="number"
-                step="0.01"
+                step="0.001"
                 value={triggerPrice}
                 onChange={(event) => setTriggerPrice(event.target.value)}
                 className={CANDIDATE_INPUT_CLASS}
@@ -570,7 +631,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
               <input
                 id="chan-stop-price"
                 type="number"
-                step="0.01"
+                step="0.001"
                 value={stopPrice}
                 onChange={(event) => setStopPrice(event.target.value)}
                 className={CANDIDATE_INPUT_CLASS}
@@ -586,7 +647,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
               <input
                 id="chan-trigger-low"
                 type="number"
-                step="0.01"
+                step="0.001"
                 value={triggerLow}
                 onChange={(event) => setTriggerLow(event.target.value)}
                 className={CANDIDATE_INPUT_CLASS}
@@ -599,7 +660,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
               <input
                 id="chan-trigger-high"
                 type="number"
-                step="0.01"
+                step="0.001"
                 value={triggerHigh}
                 onChange={(event) => setTriggerHigh(event.target.value)}
                 className={CANDIDATE_INPUT_CLASS}
@@ -628,7 +689,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
           <div className="flex justify-end gap-2">
             <button
               type="button"
-              disabled={mutation.isPending}
+              disabled={mutation.isPending || isRefreshingCandidate}
               onClick={() => {
                 setCandidateOpen(false);
                 setOpenedDecisionKey(null);
@@ -639,10 +700,10 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
             </button>
             <button
               type="submit"
-              disabled={mutation.isPending}
+              disabled={mutation.isPending || isRefreshingCandidate}
               className="rounded-md bg-text-primary px-3 py-1.5 text-sm text-bg-card disabled:opacity-50"
             >
-              {mutation.isPending ? "加入中…" : "确认加入候选"}
+              {isRefreshingCandidate ? "刷新决策中…" : mutation.isPending ? "加入中…" : "确认加入候选"}
             </button>
           </div>
           </form>

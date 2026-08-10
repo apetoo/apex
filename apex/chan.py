@@ -161,7 +161,31 @@ def _build_sell_risk_decision(bars: list[dict], bsp: dict, freq: str) -> dict:
     )
 
 
-def _build_breakout_decision(zs_break: str, last_confirmed_zs: Optional[dict]) -> dict:
+def _find_active_breakout_bar(bars: list[dict], zg: float, zd: float,
+                              zs_edt: str, freq: str) -> tuple[Optional[int], Optional[dict]]:
+    """Find the first breakout since the latest completed-bar invalidation.
+
+    The confirmed pivot's ``edt`` is the earliest scan boundary.  Scanning is
+    strictly left-to-right over the completed bars already in this response;
+    a close below ``zd`` clears an earlier breakout before a later close above
+    ``zg`` can start a new lifecycle.
+    """
+    breakout_idx = None
+    for index, bar in enumerate(bars):
+        if _fmt_dt(bar["dt"], freq) < zs_edt:
+            continue
+        close = float(bar["close"])
+        if close < zd:
+            breakout_idx = None
+        elif close > zg and breakout_idx is None:
+            breakout_idx = index
+    if breakout_idx is None:
+        return None, None
+    return breakout_idx, bars[breakout_idx]
+
+
+def _build_breakout_decision(bars: list[dict], zs_break: str,
+                             last_confirmed_zs: Optional[dict], freq: str) -> dict:
     if last_confirmed_zs is None:
         return _empty_decision()
     try:
@@ -171,11 +195,21 @@ def _build_breakout_decision(zs_break: str, last_confirmed_zs: Optional[dict]) -
         return _empty_decision()
 
     if zs_break == "up":
+        try:
+            signal_idx, signal_bar = _find_active_breakout_bar(
+                bars, zg, zd, last_confirmed_zs["edt"], freq,
+            )
+        except (KeyError, TypeError, ValueError):
+            return _decision_with(ineligible_reason="signal_bar_missing")
+        if signal_bar is None:
+            return _decision_with(ineligible_reason="signal_bar_missing")
         trigger_high = round(zg * 1.01, 3)
         return _decision_with(
             bias="long",
             setup="zs_breakout",
             state="confirmed",
+            signal_dt=_fmt_dt(signal_bar["dt"], freq),
+            bars_since_signal=len(bars) - 1 - signal_idx,
             confirm_price=zg,
             invalidation_price=zd,
             trigger_price=zg,
@@ -217,7 +251,9 @@ def _build_decision(bars: list[dict], bsp_list: list[dict], zs_break: str,
     if buy_decision and buy_decision["candidate_eligible"]:
         return buy_decision
 
-    breakout_decision = _build_breakout_decision(zs_break, last_confirmed_zs)
+    breakout_decision = _build_breakout_decision(
+        bars, zs_break, last_confirmed_zs, freq,
+    )
     if breakout_decision["setup"] == "zs_breakout":
         return breakout_decision
 

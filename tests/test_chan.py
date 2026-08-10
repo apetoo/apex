@@ -321,6 +321,13 @@ class TestChanDecision:
     def _bsp():
         return {"dt": "2026-01-05", "type": "2buy", "price": 10.0}
 
+    @staticmethod
+    def _zs(edt="2026-01-05"):
+        return {
+            "sdt": "2026-01-05", "edt": edt,
+            "zg": 12.0, "zd": 10.0, "zz": 11.0, "state": "confirmed",
+        }
+
     def test_empty_decision_has_stable_shape(self):
         assert chan._build_decision(self._bars(), [], "none", None, "D") == self.EMPTY_DECISION
 
@@ -349,7 +356,7 @@ class TestChanDecision:
 
     def test_upward_breakout_has_retest_band(self):
         decision = chan._build_decision(
-            self._bars(), [], "up", {"zg": 12, "zd": 10}, "D"
+            self._bars((11.8, 12.2)), [], "up", self._zs(), "D"
         )
         assert decision["setup"] == "zs_breakout"
         assert decision["state"] == "confirmed"
@@ -358,6 +365,24 @@ class TestChanDecision:
         assert decision["trigger_high"] == 12.12
         assert decision["invalidation_price"] == 10
         assert decision["candidate_eligible"] is True
+
+    def test_upward_breakout_tracks_first_uninvalidated_completed_bar(self):
+        decision = chan._build_decision(
+            self._bars((11.5, 11.8, 12.1, 11.0, 12.4)),
+            [], "up", self._zs(edt="2026-01-06"), "D",
+        )
+
+        assert decision["signal_dt"] == "2026-01-07"
+        assert decision["bars_since_signal"] == 2
+
+    def test_upward_breakout_restarts_lifecycle_after_invalidation(self):
+        decision = chan._build_decision(
+            self._bars((11.5, 12.2, 9.9, 11.8, 12.3, 12.4)),
+            [], "up", self._zs(), "D",
+        )
+
+        assert decision["signal_dt"] == "2026-01-09"
+        assert decision["bars_since_signal"] == 1
 
     def test_downward_break_is_risk_and_ineligible(self):
         decision = chan._build_decision(
@@ -381,7 +406,8 @@ class TestChanDecision:
 
     def test_expired_buy_falls_through_to_breakout(self):
         decision = chan._build_decision(
-            self._bars((10.2,) * 12), [self._bsp()], "up", {"zg": 12, "zd": 10}, "D"
+            self._bars((10.2,) * 11 + (12.2,)),
+            [self._bsp()], "up", self._zs(), "D",
         )
         assert decision["setup"] == "zs_breakout"
         assert decision["candidate_eligible"] is True

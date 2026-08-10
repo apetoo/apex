@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent, within, act } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -29,7 +29,6 @@ import { getChanStructure, type ChanDecision, type ChanStructure } from "@/api/c
 import { ApiError } from "@/api/client";
 import { useAddCandidate } from "@/api/mutations";
 import { getWatchlist } from "@/api/watchlist";
-import { qk } from "@/api/query-keys";
 
 /**
  * /chan 页前端测试（T8）
@@ -100,6 +99,9 @@ const addCandidateMutate = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(getChanStructure).mockReset();
+  vi.mocked(getWatchlist).mockReset();
+  vi.mocked(useAddCandidate).mockReset();
   addCandidateMutate.mockReset();
   vi.mocked(getWatchlist).mockResolvedValue({
     active_positions: [],
@@ -200,7 +202,7 @@ describe("ChanPage 缠论决策卡", () => {
         decision: fullDecision({
           state: "invalid",
           candidate_eligible: false,
-          ineligible_reason: "当前收盘已跌破结构失效价",
+          ineligible_reason: "signal_invalidated",
         }),
       }),
     );
@@ -220,7 +222,7 @@ describe("ChanPage 缠论决策卡", () => {
         setup: "none",
         state: "watching",
         candidate_eligible: false,
-        ineligible_reason: "暂无可执行结构",
+        ineligible_reason: "no_actionable_structure",
       }),
       stateLabel: "观察中",
       biasLabel: "中性",
@@ -231,7 +233,7 @@ describe("ChanPage 缠论决策卡", () => {
         bias: "risk",
         state: "invalid",
         candidate_eligible: false,
-        ineligible_reason: "出现卖点风险",
+        ineligible_reason: "risk_structure",
       }),
       stateLabel: "已失效",
       biasLabel: "风险",
@@ -244,6 +246,28 @@ describe("ChanPage 缠论决策卡", () => {
     await waitFor(() => expect(screen.getByText(stateLabel)).toBeTruthy());
     expect(screen.getByText(biasLabel)).toBeTruthy();
     expect(screen.getByRole("button", { name: "加入候选" })).toBeDisabled();
+  });
+
+  it.each([
+    ["stale_signal", "信号已超过 10 根已完成 K 线"],
+    ["signal_bar_missing", "未找到信号对应的已完成 K 线"],
+  ] as const)("真实不可执行原因 %s 映射为中文", async (reason, label) => {
+    vi.mocked(getChanStructure).mockResolvedValue(
+      fullStructure({
+        decision: fullDecision({
+          bias: "neutral",
+          setup: "none",
+          state: "watching",
+          candidate_eligible: false,
+          ineligible_reason: reason,
+        }),
+      }),
+    );
+
+    withClient(<ChanPage />);
+
+    expect(await screen.findByText(label)).toBeTruthy();
+    expect(screen.queryByText(reason)).toBeNull();
   });
 
   it("nullable 决策价格显示占位符", async () => {
@@ -270,10 +294,10 @@ describe("ChanPage 候选确认弹窗", () => {
     vi.mocked(getChanStructure).mockResolvedValue(
       fullStructure({
         decision: fullDecision({
-          trigger_price: 10.5,
+          trigger_price: 10.555,
           trigger_low: null,
           trigger_high: null,
-          invalidation_price: 10,
+          invalidation_price: 10.125,
         }),
       }),
     );
@@ -286,22 +310,23 @@ describe("ChanPage 候选确认弹窗", () => {
     expect(screen.getAllByText("603019.SH").length).toBeGreaterThan(1);
     expect(within(dialog).getByText("日线")).toBeTruthy();
     expect(within(dialog).getByText("缠论二买")).toBeTruthy();
-    expect(inputValue("触发价")).toBe("10.50");
-    expect(inputValue("止损价")).toBe("10.00");
+    expect(inputValue("触发价")).toBe("10.555");
+    expect(inputValue("止损价")).toBe("10.125");
+    expect(screen.getByLabelText("触发价").getAttribute("step")).toBe("0.001");
     expect(inputValue("备注")).toContain("2026-08-05");
 
     fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
 
-    expect(addCandidateMutate).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(addCandidateMutate).toHaveBeenCalledTimes(1));
     const payload = addCandidateMutate.mock.calls[0][0];
     expect(payload).toEqual({
       ts_code: "603019.SH",
       name: "",
-      trigger_price: 10.5,
+      trigger_price: 10.555,
       trigger_direction: "above",
       trigger_low: undefined,
       trigger_high: undefined,
-      stop_advice: 10,
+      stop_advice: 10.125,
       note: expect.stringContaining("2026-08-05"),
       strategy: "chan",
       setup: "缠论二买",
@@ -333,17 +358,20 @@ describe("ChanPage 候选确认弹窗", () => {
     expect(screen.getByText("中枢突破回踩")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
 
-    expect(addCandidateMutate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        trigger_price: 12,
-        trigger_direction: "below",
-        trigger_low: 12,
-        trigger_high: 12.12,
-        strategy: "chan",
-        setup: "中枢突破回踩",
-      }),
-      expect.any(Object),
-    );
+    await waitFor(() => {
+      expect(addCandidateMutate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          trigger_price: 12,
+          trigger_direction: "below",
+          trigger_low: 12,
+          trigger_high: 12.12,
+          note: expect.stringContaining("信号 2026-08-05"),
+          strategy: "chan",
+          setup: "中枢突破回踩",
+        }),
+        expect.any(Object),
+      );
+    });
   });
 
   it("提交采用人工修改后的价格和备注", async () => {
@@ -358,16 +386,18 @@ describe("ChanPage 候选确认弹窗", () => {
     fireEvent.change(screen.getByLabelText("备注"), { target: { value: "人工复核后提交" } });
     fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
 
-    expect(addCandidateMutate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        trigger_price: 91.25,
-        trigger_low: 90,
-        trigger_high: 91,
-        stop_advice: 84.5,
-        note: "人工复核后提交",
-      }),
-      expect.any(Object),
-    );
+    await waitFor(() => {
+      expect(addCandidateMutate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          trigger_price: 91.25,
+          trigger_low: 90,
+          trigger_high: 91,
+          stop_advice: 84.5,
+          note: "人工复核后提交",
+        }),
+        expect.any(Object),
+      );
+    });
   });
 
   it("mutation 失败时保留弹窗、输入和错误信息", async () => {
@@ -383,9 +413,9 @@ describe("ChanPage 候选确认弹窗", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
 
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(await screen.findByRole("dialog")).toBeTruthy();
     expect(inputValue("备注")).toBe("保留我的修改");
-    expect(screen.getByText(/保存失败/)).toBeTruthy();
+    expect(await screen.findByText(/保存失败/)).toBeTruthy();
   });
 
   it("mutation 成功时关闭弹窗并显示本地成功反馈", async () => {
@@ -436,7 +466,7 @@ describe("ChanPage 候选确认弹窗", () => {
 
     expect(await screen.findByText(/无法确认是否已有候选/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
-    expect(addCandidateMutate).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(addCandidateMutate).toHaveBeenCalledTimes(1));
   });
 
   it("非正数触发价显示行内错误且不提交", async () => {
@@ -464,33 +494,48 @@ describe("ChanPage 候选确认弹窗", () => {
     expect(addCandidateMutate).not.toHaveBeenCalled();
   });
 
-  it("弹窗打开后最新决策变为不可加入时提交被拒绝", async () => {
-    vi.mocked(getChanStructure).mockResolvedValue(fullStructure());
-    const { queryClient } = withClient(<ChanPage />);
-    fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
-
-    act(() => {
-      queryClient.setQueryData(
-        qk.chan("603019.SH", "D"),
+  it("提交时强制刷新并拒绝缓存尚未更新的过期决策", async () => {
+    vi.mocked(getChanStructure)
+      .mockResolvedValueOnce(fullStructure())
+      .mockResolvedValueOnce(
         fullStructure({
           decision: fullDecision({
             candidate_eligible: false,
-            ineligible_reason: "信号已过期",
+            ineligible_reason: "stale_signal",
           }),
         }),
       );
-    });
-
-    await screen.findByText("信号已过期");
+    withClient(<ChanPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
+    fireEvent.change(screen.getByLabelText("备注"), { target: { value: "保留竞态中的表单" } });
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "确认加入候选" }));
 
-    expect(within(dialog).getByText("信号已过期")).toBeTruthy();
+    expect(await within(dialog).findByText("信号已超过 10 根已完成 K 线")).toBeTruthy();
+    expect(inputValue("备注")).toBe("保留竞态中的表单");
+    expect(getChanStructure).toHaveBeenCalledTimes(2);
+    expect(addCandidateMutate).not.toHaveBeenCalled();
+  });
+
+  it("提交前刷新失败时保留表单、展示错误且不写候选", async () => {
+    vi.mocked(getChanStructure)
+      .mockResolvedValueOnce(fullStructure())
+      .mockRejectedValueOnce(new Error("网络刷新失败"));
+    withClient(<ChanPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
+    fireEvent.change(screen.getByLabelText("备注"), { target: { value: "刷新失败也保留" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
+
+    expect(await screen.findByText(/刷新当前缠论决策失败：网络刷新失败/)).toBeTruthy();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(inputValue("备注")).toBe("刷新失败也保留");
+    expect(getChanStructure).toHaveBeenCalledTimes(2);
     expect(addCandidateMutate).not.toHaveBeenCalled();
   });
 
   it("弹窗打开后 setup 和触发参数刷新时关闭旧表单且不得提交", async () => {
-    vi.mocked(getChanStructure).mockResolvedValue(
+    vi.mocked(getChanStructure).mockResolvedValueOnce(
       fullStructure({
         decision: fullDecision({
           trigger_price: 10.5,
@@ -499,33 +544,24 @@ describe("ChanPage 候选确认弹窗", () => {
           invalidation_price: 10,
         }),
       }),
+    ).mockResolvedValueOnce(
+      fullStructure({
+        decision: fullDecision({
+          setup: "zs_breakout",
+          state: "confirmed",
+          bsp_type: null,
+          trigger_price: 12,
+          trigger_low: 12,
+          trigger_high: 12.12,
+          invalidation_price: 11.5,
+        }),
+      }),
     );
-    const { queryClient } = withClient(<ChanPage />);
+    withClient(<ChanPage />);
     fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
     expect(inputValue("触发价")).toBe("10.50");
 
-    act(() => {
-      queryClient.setQueryData(
-        qk.chan("603019.SH", "D"),
-        fullStructure({
-          decision: fullDecision({
-            setup: "zs_breakout",
-            state: "confirmed",
-            bsp_type: null,
-            trigger_price: 12,
-            trigger_low: 12,
-            trigger_high: 12.12,
-            invalidation_price: 11.5,
-          }),
-        }),
-      );
-    });
-
-    await waitFor(() => {
-      expect(within(screen.getByRole("dialog")).getByText("中枢突破回踩")).toBeTruthy();
-    });
-    const staleSubmit = screen.queryByRole("button", { name: "确认加入候选" });
-    if (staleSubmit) fireEvent.click(staleSubmit);
+    fireEvent.click(screen.getByRole("button", { name: "确认加入候选" }));
 
     expect(addCandidateMutate).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
