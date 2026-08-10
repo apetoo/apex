@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { Activity, AlertTriangle, Info, Loader2 } from "lucide-react";
@@ -71,6 +71,23 @@ const CANDIDATE_INPUT_CLASS =
 
 function decisionInputPrice(value: number | null) {
   return value == null ? "" : formatPrice(value);
+}
+
+function candidateDecisionKey(data: ChanStructure) {
+  const decision = data.decision;
+  return JSON.stringify([
+    data.ts_code,
+    data.freq,
+    decision.state,
+    decision.setup,
+    decision.bsp_type,
+    decision.signal_dt,
+    decision.confirm_price,
+    decision.invalidation_price,
+    decision.trigger_price,
+    decision.trigger_low,
+    decision.trigger_high,
+  ]);
 }
 
 export function ChanPage() {
@@ -267,6 +284,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
   const [note, setNote] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [openedDecisionKey, setOpenedDecisionKey] = useState<string | null>(null);
   const zb = ZS_BREAK_LABEL[s.zs_break ?? "none"];
   const stateMeta = DECISION_STATE_META[decision.state];
   const biasMeta = DECISION_BIAS_META[decision.bias];
@@ -278,6 +296,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
   const existingCandidate = watchlist?.candidates.some(
     (candidate) => candidate.ts_code === data.ts_code,
   );
+  const decisionKey = candidateDecisionKey(data);
 
   const clearCandidateForm = () => {
     setTriggerPrice("");
@@ -298,12 +317,30 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
     );
     setFormError(null);
     setSuccessMessage(null);
+    setOpenedDecisionKey(decisionKey);
     setCandidateOpen(true);
   };
+
+  useEffect(() => {
+    if (!candidateOpen || openedDecisionKey == null || openedDecisionKey === decisionKey) return;
+    setCandidateOpen(false);
+    setOpenedDecisionKey(null);
+    setFormError(null);
+  }, [candidateOpen, decisionKey, openedDecisionKey]);
 
   const submitCandidate = (event: React.FormEvent) => {
     event.preventDefault();
     setFormError(null);
+
+    if (openedDecisionKey == null || openedDecisionKey !== decisionKey) {
+      setCandidateOpen(false);
+      setOpenedDecisionKey(null);
+      return;
+    }
+    if (!decision.candidate_eligible) {
+      setFormError(decision.ineligible_reason ?? "当前结构已不可加入候选");
+      return;
+    }
 
     const trigger = Number(triggerPrice);
     if (!triggerPrice.trim() || !Number.isFinite(trigger) || trigger <= 0) {
@@ -354,6 +391,7 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
         onSuccess: () => {
           clearCandidateForm();
           setCandidateOpen(false);
+          setOpenedDecisionKey(null);
           setSuccessMessage("已加入候选");
         },
         onError: (mutationError) => {
@@ -483,7 +521,10 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
       {candidateOpen && (
         <Dialog
           open
-          onClose={() => setCandidateOpen(false)}
+          onClose={() => {
+            setCandidateOpen(false);
+            setOpenedDecisionKey(null);
+          }}
           busy={mutation.isPending}
           title="确认加入候选"
         >
@@ -588,7 +629,10 @@ function DecisionPanel({ data }: { data: ChanStructure }) {
             <button
               type="button"
               disabled={mutation.isPending}
-              onClick={() => setCandidateOpen(false)}
+              onClick={() => {
+                setCandidateOpen(false);
+                setOpenedDecisionKey(null);
+              }}
               className="rounded-md px-3 py-1.5 text-sm text-text-secondary hover:bg-bg-base disabled:opacity-50"
             >
               取消

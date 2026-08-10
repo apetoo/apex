@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -29,6 +29,7 @@ import { getChanStructure, type ChanDecision, type ChanStructure } from "@/api/c
 import { ApiError } from "@/api/client";
 import { useAddCandidate } from "@/api/mutations";
 import { getWatchlist } from "@/api/watchlist";
+import { qk } from "@/api/query-keys";
 
 /**
  * /chan 页前端测试（T8）
@@ -87,11 +88,12 @@ function withClient(ui: ReactNode, initialPath = "/chan") {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
-  return render(
+  const view = render(
     <MemoryRouter initialEntries={[initialPath]}>
       <QueryClientProvider client={qc}>{ui}</QueryClientProvider>
     </MemoryRouter>,
   );
+  return { ...view, queryClient: qc };
 }
 
 const addCandidateMutate = vi.fn();
@@ -460,6 +462,73 @@ describe("ChanPage 候选确认弹窗", () => {
 
     expect(screen.getByText("区间下沿不能高于区间上沿")).toBeTruthy();
     expect(addCandidateMutate).not.toHaveBeenCalled();
+  });
+
+  it("弹窗打开后最新决策变为不可加入时提交被拒绝", async () => {
+    vi.mocked(getChanStructure).mockResolvedValue(fullStructure());
+    const { queryClient } = withClient(<ChanPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
+
+    act(() => {
+      queryClient.setQueryData(
+        qk.chan("603019.SH", "D"),
+        fullStructure({
+          decision: fullDecision({
+            candidate_eligible: false,
+            ineligible_reason: "信号已过期",
+          }),
+        }),
+      );
+    });
+
+    await screen.findByText("信号已过期");
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "确认加入候选" }));
+
+    expect(within(dialog).getByText("信号已过期")).toBeTruthy();
+    expect(addCandidateMutate).not.toHaveBeenCalled();
+  });
+
+  it("弹窗打开后 setup 和触发参数刷新时关闭旧表单且不得提交", async () => {
+    vi.mocked(getChanStructure).mockResolvedValue(
+      fullStructure({
+        decision: fullDecision({
+          trigger_price: 10.5,
+          trigger_low: null,
+          trigger_high: null,
+          invalidation_price: 10,
+        }),
+      }),
+    );
+    const { queryClient } = withClient(<ChanPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "加入候选" }));
+    expect(inputValue("触发价")).toBe("10.50");
+
+    act(() => {
+      queryClient.setQueryData(
+        qk.chan("603019.SH", "D"),
+        fullStructure({
+          decision: fullDecision({
+            setup: "zs_breakout",
+            state: "confirmed",
+            bsp_type: null,
+            trigger_price: 12,
+            trigger_low: 12,
+            trigger_high: 12.12,
+            invalidation_price: 11.5,
+          }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(within(screen.getByRole("dialog")).getByText("中枢突破回踩")).toBeTruthy();
+    });
+    const staleSubmit = screen.queryByRole("button", { name: "确认加入候选" });
+    if (staleSubmit) fireEvent.click(staleSubmit);
+
+    expect(addCandidateMutate).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });
 
