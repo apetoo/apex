@@ -9,6 +9,7 @@ DEFAULT_QUERY_TEMPLATES = (
     "{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股",
     "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情",
 )
+FINANCIAL_ANCHORS = ("股票", "A股", "板块", "概念股", "ETF", "龙头", "投资", "行情")
 
 
 @dataclass(frozen=True)
@@ -31,11 +32,17 @@ def build_search_jobs(
 
     for sector in taxonomy:
         terms = dict.fromkeys([sector["sector_name"], *sector.get("aliases", [])])
-        queries = list(dict.fromkeys(
-            template.format(term=term).strip()
-            for term in terms
-            for template in templates
-        ))[:limit]
+        queries = []
+        for term in terms:
+            for template in templates:
+                query = template.format(term=term).strip()
+                if not any(anchor in query for anchor in FINANCIAL_ANCHORS):
+                    raise ValueError(
+                        f"query template rendered without a financial anchor: {template!r}"
+                    )
+                if query not in queries:
+                    queries.append(query)
+        queries = queries[:limit]
         for platform in platforms:
             for query in queries:
                 key = (platform, query)

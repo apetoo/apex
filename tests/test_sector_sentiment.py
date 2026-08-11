@@ -259,3 +259,12 @@ def test_query_planning_is_stable_and_deduplicated():
 
     assert first == second
     assert [job.value for job in first] == ["机器人 股票"]
+
+
+def test_query_planning_rejects_unanchored_templates():
+    taxonomy = [{"sector_id": "concept:robot", "sector_name": "机器人",
+                 "taxonomy": "concept", "aliases": []}]
+
+    with pytest.raises(ValueError, match="financial anchor"):
+        retrieval.build_search_jobs(taxonomy, ["bili"], {
+            "query_templates": ["{term}"], "max_queries_per_sector": 8})
