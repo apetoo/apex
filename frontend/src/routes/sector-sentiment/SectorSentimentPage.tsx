@@ -225,7 +225,7 @@ function SectorCard({ sector }: { sector: SectorSentimentScore }) {
   );
 }
 
-function RetrievalFunnelSummary({ funnel }: { funnel: RetrievalFunnel | undefined }) {
+function RetrievalFunnelSummary({ funnel }: { funnel: RetrievalFunnel | null | undefined }) {
   if (!funnel) return <p className="text-xs text-text-secondary">暂无检索漏斗数据</p>;
   return (
     <div>

@@ -4,8 +4,9 @@ import { expect, test, vi } from "vitest";
 
 import { SectorSentimentPage } from "../SectorSentimentPage";
 
-const { getSectorSentimentCreators, moderateSectorSentimentCreator } = vi.hoisted(() => ({
+const { getSectorSentimentCreators, getSectorSentimentDetail, moderateSectorSentimentCreator } = vi.hoisted(() => ({
   getSectorSentimentCreators: vi.fn(),
+  getSectorSentimentDetail: vi.fn(),
   moderateSectorSentimentCreator: vi.fn(),
 }));
 
@@ -47,20 +48,22 @@ vi.mock("@/api/sector-sentiment", () => ({
     short: { n: 5, precision: 0.6 },
     swing: { n: 2, precision: 0.5 },
   }),
-  getSectorSentimentDetail: vi.fn().mockResolvedValue({
-    history: [{ trade_date: "2026-08-10", short_risk: 88, swing_risk: 71 }],
-    sector: { evidence: [{ platform: "bili", text: "机器人必须起飞", stance: 1 }] },
-    retrieval_funnel: {
-      raw_recalled: 10,
-      financial_relevant: 4,
-      filtered: 6,
-      search_sources: 3,
-      creator_sources: 1,
-    },
-  }),
+  getSectorSentimentDetail,
   getSectorSentimentCreators,
   moderateSectorSentimentCreator,
 }));
+
+getSectorSentimentDetail.mockResolvedValue({
+  history: [{ trade_date: "2026-08-10", short_risk: 88, swing_risk: 71 }],
+  sector: { evidence: [{ platform: "bili", text: "机器人必须起飞", stance: 1 }] },
+  retrieval_funnel: {
+    raw_recalled: 10,
+    financial_relevant: 4,
+    filtered: 6,
+    search_sources: 3,
+    creator_sources: 1,
+  },
+});
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -108,6 +111,19 @@ test("shows retrieval funnel in sector detail", async () => {
   expect(screen.getByText("已过滤 6")).toBeInTheDocument();
   expect(screen.getByText("搜索来源 3")).toBeInTheDocument();
   expect(screen.getByText("作者来源 1")).toBeInTheDocument();
+});
+
+test("shows missing retrieval funnel telemetry instead of zero values", async () => {
+  getSectorSentimentDetail.mockResolvedValueOnce({
+    history: [{ trade_date: "2026-08-10", short_risk: 88, swing_risk: 71 }],
+    sector: { evidence: [{ platform: "bili", text: "机器人必须起飞", stance: 1 }] },
+    retrieval_funnel: null,
+  });
+  renderPage();
+
+  fireEvent.click(await screen.findByRole("button", { name: "查看机器人证据" }));
+  expect(await screen.findByText("暂无检索漏斗数据")).toBeInTheDocument();
+  expect(screen.queryByText("原始召回 0")).not.toBeInTheDocument();
 });
 
 test("shows an empty state for a creator status without rows", async () => {

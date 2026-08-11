@@ -97,3 +97,18 @@ def test_detail_exposes_retrieval_funnel(tmp_path):
         "raw_recalled": 10, "financial_relevant": 4, "filtered": 6,
         "search_sources": 3, "creator_sources": 1,
     }
+
+
+def test_historical_score_without_collection_telemetry_returns_null_funnel(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.save_daily_score({
+        "trade_date": "2026-08-09", "sector_id": "concept:robot", "sector_name": "机器人",
+        "taxonomy": "concept", "platforms": ["bili", "eastmoney"], "independent_authors": 20,
+        "mapping_confidence": 0.9, "sentiment_extreme": 0.95,
+        "attention_acceleration": 0.92, "consensus_crowding": 0.8,
+        "market_divergence": 0.2, "short_risk": 66, "swing_risk": 48,
+    })
+    client = _client(store)
+
+    assert client.get("/api/sector-sentiment/overview?date=2026-08-09").json()["retrieval_funnel"] is None
+    assert client.get("/api/sector-sentiment/concept:robot?date=2026-08-09").json()["retrieval_funnel"] is None

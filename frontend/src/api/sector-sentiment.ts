@@ -30,7 +30,7 @@ export interface SectorSentimentOverview {
   shadow_mode: boolean;
   sectors: SectorSentimentScore[];
   changes: Array<{ event_id: string; sector_name: string; event_type: string; trade_date: string }>;
-  retrieval_funnel: RetrievalFunnel;
+  retrieval_funnel: RetrievalFunnel | null;
 }
 
 export interface SectorSentimentValidation {
@@ -45,7 +45,7 @@ export interface SectorSentimentValidation {
 export interface SectorSentimentDetail {
   history: SectorSentimentScore[];
   sector: SectorSentimentScore;
-  retrieval_funnel: RetrievalFunnel;
+  retrieval_funnel: RetrievalFunnel | null;
 }
 
 export type CreatorStatus = "candidate" | "approved" | "rejected";

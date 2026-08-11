@@ -56,12 +56,9 @@ def _quality_meta(store: ss.SentimentStore, date: str | None) -> dict:
             "stale": stale}
 
 
-def _retrieval_funnel(store: ss.SentimentStore, date: str | None) -> dict:
-    """Return the daily retrieval accounting, including an empty safe default."""
-    return store.collection_summary(date).get("funnel") or {
-        "raw_recalled": 0, "financial_relevant": 0, "filtered": 0,
-        "search_sources": 0, "creator_sources": 0,
-    }
+def _retrieval_funnel(store: ss.SentimentStore, date: str | None) -> dict | None:
+    """Return daily accounting, preserving absent telemetry as null."""
+    return store.collection_summary(date).get("funnel")
 
 
 def _public_creator(creator: dict) -> dict:
