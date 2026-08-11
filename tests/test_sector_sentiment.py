@@ -210,6 +210,88 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
     assert store.get_state("concept:robot")["state"] == "observe"
 
 
+def financial_config(tmp_path):
+    return {"sector_sentiment": {
+        "enabled": True,
+        "cache_dir": str(tmp_path),
+        "platforms": ["bili", "eastmoney"],
+        "taxonomy": [{
+            "sector_id": "concept:robot",
+            "sector_name": "机器人",
+            "taxonomy": "concept",
+            "aliases": ["机器人"],
+        }],
+        "retrieval": {
+            "query_templates": ["{term} 股票"],
+            "max_queries_per_sector": 1,
+        },
+        "market_metrics": {"concept:robot": {
+            "return": -1.0,
+            "volume_change": -0.2,
+            "breadth": 0.3,
+            "fund_flow": -1.0,
+        }},
+    }}
+
+
+def mixed_robot_runner(job, destination, _timeout, _limits):
+    rows = [
+        _item(
+            job.platform,
+            f"{job.platform}-financial-{index}",
+            f"机器人板块资金流入，必须起飞，坚定看多 {index}",
+            title="机器人板块资金流入",
+            author_hash=f"{job.platform}-author-{index}",
+            engagement=100,
+        )
+        for index in range(6)
+    ]
+    rows.append(_item(
+        job.platform,
+        f"{job.platform}-physical",
+        "机器人机械臂安装教程",
+        title="机械臂安装教程",
+        author_hash=f"{job.platform}-physical-author",
+        engagement=1000,
+    ))
+    destination.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    )
+
+
+def test_financial_retrieval_replay_excludes_pollution_and_is_idempotent(tmp_path):
+    cfg = financial_config(tmp_path)
+
+    first = ss.run_configured(
+        cfg, runner=mixed_robot_runner, trade_date="2026-08-10",
+    )
+    store = ss.open_store(tmp_path)
+    first_score = store.scores_for_date("2026-08-10")
+    first_state = store.get_state("concept:robot")
+    first_events = store.list_events()
+
+    second = ss.run_configured(
+        cfg, runner=mixed_robot_runner, trade_date="2026-08-10",
+    )
+    raw = store.list_content("2026-08-10")
+    eligible = store.list_eligible_content("2026-08-10")
+    second_events = store.list_events()
+
+    assert any("机械臂安装教程" in row["text"] for row in raw)
+    assert all("机械臂安装教程" not in row["text"] for row in eligible)
+    assert all(
+        "机械臂安装教程" not in evidence["text"]
+        for score in first_score for evidence in score["evidence"]
+    )
+    assert first["funnel"]["filtered"] == 2
+    assert second["ingest"]["inserted"] == 0
+    assert store.scores_for_date("2026-08-10") == first_score
+    assert store.get_state("concept:robot") == first_state
+    assert second_events == first_events
+    assert len(first_score) == 1
+    assert len(second_events) == len({event["event_key"] for event in second_events})
+
+
 def test_same_trade_date_rerun_keeps_score_events_and_alert_state_deterministic(tmp_path):
     store = ss.open_store(tmp_path)
     store.save_daily_score({
