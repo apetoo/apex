@@ -39,6 +39,25 @@ def test_ingest_is_idempotent_and_cross_platform_reposts_are_downweighted(tmp_pa
     assert sorted(row["repost_weight"] for row in rows) == [0.35, 1.0]
 
 
+def test_duplicate_search_hits_merge_sector_scope_without_duplicate_content(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    base = _item("bili", "same", "机器人算力板块资金流入", author_id="up-1")
+
+    store.ingest([{**base, "retrieval_source": "search",
+                   "retrieval_source_id": "query:机器人 股票",
+                   "sector_ids": ["concept:robot"]}])
+    result = store.ingest([{**base, "retrieval_source": "search",
+                            "retrieval_source_id": "query:算力 股票",
+                            "sector_ids": ["concept:compute"]}])
+    store.save_relevance("bili", "same", "", retrieval.RelevanceDecision(
+        0.9, "accepted", ("finance:板块",), retrieval.RELEVANCE_VERSION))
+
+    assert result == {"inserted": 0, "duplicates": 1}
+    accepted = store.accepted_search_records("2026-08-10")
+    assert len(accepted) == 1
+    assert accepted[0]["sector_ids"] == ["concept:compute", "concept:robot"]
+
+
 def test_aggregate_requires_two_platforms_before_opening_observation(tmp_path):
     store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
     store.save_daily_score({
@@ -168,10 +187,10 @@ def test_configured_pipeline_is_disabled_by_default():
 
 
 def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
-    def runner(platform, _keywords, destination, _timeout):
+    def runner(job, destination, _timeout, _limits):
         rows = [
-            _item(platform, f"{platform}-{i}", "机器人必须起飞，赶紧上车，坚定看多",
-                  title="机器人板块资金流入", author_hash=f"{platform}-author-{i}", engagement=100)
+            _item(job.platform, f"{job.platform}-{i}", "机器人必须起飞，赶紧上车，坚定看多",
+                  title="机器人板块资金流入", author_hash=f"{job.platform}-author-{i}", engagement=100)
             for i in range(12)
         ]
         destination.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
@@ -182,6 +201,7 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
             {"sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
              "aliases": ["机器人"]},
         ],
+        "retrieval": {"query_templates": ["{term} 股票"], "max_queries_per_sector": 1},
     }}, runner=runner, trade_date="2026-08-10")
 
     store = ss.open_store(tmp_path)
@@ -214,12 +234,108 @@ def test_mediacrawler_runner_exports_new_jsonl_to_canonical_destination(tmp_path
     )
     destination = tmp_path / "canonical.jsonl"
 
-    ss.default_mediacrawler_runner(root)("bili", ["机器人"], destination, 10)
+    ss.default_mediacrawler_runner(root)(
+        retrieval.RetrievalJob(
+            "bili", "search", "机器人 股票", ("concept:robot",), "query:机器人 股票"),
+        destination, 10, {"max_contents": 20, "max_comments": 50},
+    )
 
     row = json.loads(destination.read_text())
     assert row["platform"] == "bili"
     assert row["content_id"] == "BV1"
     assert row["text"] == "机器人起飞"
+
+
+def test_mediacrawler_runner_uses_search_and_creator_modes(tmp_path, monkeypatch):
+    root = tmp_path / "MediaCrawler"
+    root.mkdir()
+    (root / "main.py").write_text("# test boundary\n")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        output = root / f"output-{len(commands)}.jsonl"
+        output.write_text(json.dumps({
+            "video_id": f"BV{len(commands)}", "title": "机器人板块资金流入",
+            "user_id": "up-1", "nickname": "财经小王",
+        }, ensure_ascii=False) + "\n")
+
+    monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    runner = ss.default_mediacrawler_runner(root, creator_id_argument="--creator_id")
+    runner(retrieval.RetrievalJob(
+        "bili", "search", "机器人 股票", ("concept:robot",), "query:机器人 股票"),
+        tmp_path / "search.jsonl", 10, {"max_contents": 20, "max_comments": 50},
+    )
+    runner(retrieval.RetrievalJob(
+        "bili", "creator", "up-1", (), "creator:bili:up-1"),
+        tmp_path / "creator.jsonl", 10, {"max_contents": 20, "max_comments": 50},
+    )
+
+    assert "--type search" in " ".join(commands[0])
+    assert "--keywords 机器人 股票" in " ".join(commands[0])
+    assert "--type creator" in " ".join(commands[1])
+    assert "--creator_id up-1" in " ".join(commands[1])
+    creator_row = json.loads((tmp_path / "creator.jsonl").read_text())
+    assert creator_row["retrieval_source"] == "creator"
+    assert creator_row["retrieval_source_id"] == "creator:bili:up-1"
+    assert creator_row["author_id"] == "up-1"
+    assert creator_row["author_name"] == "财经小王"
+
+
+def test_creator_failure_does_not_discard_successful_search_results(tmp_path):
+    store = ss.open_store(tmp_path)
+    store.discover_creator_candidates(_candidate_records(), {"candidate_min_contents": 3})
+    store.moderate_creator("bili", "up-1", "approve")
+
+    def runner(job, destination, _timeout, _limits):
+        if job.mode == "creator":
+            raise TimeoutError("creator login expired")
+        destination.write_text(json.dumps(_item(
+            job.platform, "search-ok", "机器人继续看多，准备加仓",
+            title="机器人板块资金流入", author_id="up-1", author_name="财经小王",
+        ), ensure_ascii=False) + "\n")
+
+    result = ss.run_configured({"sector_sentiment": {
+        "enabled": True,
+        "cache_dir": str(tmp_path),
+        "platforms": ["bili"],
+        "keywords": ["机器人"],
+        "taxonomy": [{
+            "sector_id": "concept:robot", "sector_name": "机器人",
+            "taxonomy": "concept", "aliases": ["机器人"],
+        }],
+        "retrieval": {
+            "query_templates": ["{term} 股票"], "max_queries_per_sector": 1,
+            "max_contents_per_query": 20, "max_comments_per_content": 50,
+        },
+    }}, runner=runner, trade_date="2026-08-10")
+
+    assert result["collection"]["search_coverage"] == 1.0
+    assert result["collection"]["creator_coverage"] == 0.0
+    assert result["funnel"]["financial_relevant"] == 1
+    assert ss.open_store(tmp_path).list_eligible_content("2026-08-10")
+    approved = ss.open_store(tmp_path).approved_creators("bili")[0]
+    assert approved["status"] == "approved"
+    assert "TimeoutError" in approved["last_collection_error"]
+
+
+def test_collection_summary_preserves_dual_coverage_and_daily_funnel(tmp_path):
+    store = ss.open_store(tmp_path)
+    funnel = {
+        "raw_recalled": 10, "financial_relevant": 4, "filtered": 6,
+        "search_sources": 3, "creator_sources": 1,
+    }
+
+    store.record_collection({
+        "trade_date": "2026-08-10", "coverage": 0.75,
+        "search_coverage": 1.0, "creator_coverage": 0.5,
+        "platforms": {}, "funnel": funnel,
+    })
+
+    summary = store.collection_summary("2026-08-10")
+    assert summary["search_coverage"] == 1.0
+    assert summary["creator_coverage"] == 0.5
+    assert summary["funnel"] == funnel
 
 
 def test_normalization_preserves_headline_fields_for_relevance_gate():
@@ -337,6 +453,23 @@ def test_creator_becomes_candidate_once_after_three_unique_financial_contents(tm
     creators = store.list_creators("candidate")
     assert len(creators) == 1
     assert creators[0]["valid_content_count"] == 3
+
+
+def test_creator_candidate_respects_configured_minimum_sector_count(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    records = [
+        {**_item("bili", "v1", "机器人板块资金流入"), "author_id": "up-1",
+         "relevance_score": 0.8, "sector_ids": ["concept:robot"]},
+        {**_item("bili", "v2", "算力板块资金流入"), "author_id": "up-1",
+         "relevance_score": 0.8, "sector_ids": ["concept:compute"]},
+    ]
+
+    result = store.discover_creator_candidates(records, {
+        "candidate_min_contents": 3, "candidate_min_sectors": 3,
+    })
+
+    assert result == {"created": 0, "updated": 0}
+    assert store.list_creators() == []
 
 
 def test_candidate_requires_manual_approval_and_writes_audit_event(tmp_path):

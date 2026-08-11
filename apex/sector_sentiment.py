@@ -18,7 +18,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from apex.sector_retrieval import RelevanceDecision, classify_financial_relevance
+from apex.sector_retrieval import (
+    RetrievalJob,
+    RelevanceDecision,
+    build_creator_jobs,
+    build_search_jobs,
+    classify_financial_relevance,
+)
 
 
 MODEL_VERSION = "sector-sentiment-heuristic-v1"
@@ -67,6 +73,8 @@ class SentimentStore:
                     relevance_reasons_json TEXT NOT NULL DEFAULT '[]',
                     relevance_version TEXT,
                     retrieval_source TEXT NOT NULL DEFAULT 'search',
+                    retrieval_source_id TEXT,
+                    retrieval_sector_ids_json TEXT NOT NULL DEFAULT '[]',
                     author_id TEXT,
                     author_name TEXT,
                     UNIQUE(platform, content_id, comment_id)
@@ -110,7 +118,10 @@ class SentimentStore:
                 );
                 CREATE TABLE IF NOT EXISTS collection_runs (
                     run_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, coverage REAL NOT NULL,
-                    platforms_json TEXT NOT NULL, status TEXT NOT NULL, completed_at TEXT NOT NULL
+                    search_coverage REAL NOT NULL DEFAULT 0,
+                    creator_coverage REAL NOT NULL DEFAULT 0,
+                    platforms_json TEXT NOT NULL, funnel_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL, completed_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS creators (
                     platform TEXT NOT NULL, creator_id TEXT NOT NULL, display_name TEXT,
@@ -146,6 +157,8 @@ class SentimentStore:
                 "relevance_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
                 "relevance_version": "TEXT",
                 "retrieval_source": "TEXT NOT NULL DEFAULT 'search'",
+                "retrieval_source_id": "TEXT",
+                "retrieval_sector_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "author_id": "TEXT",
                 "author_name": "TEXT",
             }
@@ -156,6 +169,17 @@ class SentimentStore:
             for name in ("price_baseline_hit", "heat_baseline_hit"):
                 if name not in outcome_columns:
                     conn.execute(f"ALTER TABLE outcomes ADD COLUMN {name} INTEGER")
+            collection_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(collection_runs)")
+            }
+            collection_migrations = {
+                "search_coverage": "REAL NOT NULL DEFAULT 0",
+                "creator_coverage": "REAL NOT NULL DEFAULT 0",
+                "funnel_json": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for name, definition in collection_migrations.items():
+                if name not in collection_columns:
+                    conn.execute(f"ALTER TABLE collection_runs ADD COLUMN {name} {definition}")
 
     def ingest(self, items: Iterable[dict]) -> dict[str, int]:
         inserted = duplicates = 0
@@ -167,12 +191,14 @@ class SentimentStore:
                         """INSERT INTO content
                         (platform, content_id, comment_id, published_at, collected_at, text,
                          engagement, url, batch_id, author_hash, fingerprint, retrieval_source,
-                         author_id, author_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         retrieval_source_id, retrieval_sector_ids_json, author_id, author_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (item["platform"], str(item["content_id"]), str(item.get("comment_id") or ""),
                          item.get("published_at"), item.get("collected_at") or _now(), item.get("text", ""),
                          float(item.get("engagement") or 0), item.get("url"), item.get("batch_id"),
                          item.get("author_hash"), fp, item.get("retrieval_source", "search"),
+                         item.get("retrieval_source_id"),
+                         json.dumps(item.get("sector_ids", []), ensure_ascii=False),
                          item.get("author_id"), item.get("author_name")),
                     )
                     inserted += 1
@@ -186,6 +212,23 @@ class SentimentStore:
                         )
                 except sqlite3.IntegrityError:
                     duplicates += 1
+                    existing = conn.execute(
+                        """SELECT retrieval_sector_ids_json FROM content
+                           WHERE platform=? AND content_id=? AND comment_id=?""",
+                        (item["platform"], str(item["content_id"]),
+                         str(item.get("comment_id") or "")),
+                    ).fetchone()
+                    if existing:
+                        sector_ids = sorted({
+                            *json.loads(existing["retrieval_sector_ids_json"] or "[]"),
+                            *(str(value) for value in item.get("sector_ids", []) if value),
+                        })
+                        conn.execute(
+                            """UPDATE content SET retrieval_sector_ids_json=?
+                               WHERE platform=? AND content_id=? AND comment_id=?""",
+                            (json.dumps(sector_ids, ensure_ascii=False), item["platform"],
+                             str(item["content_id"]), str(item.get("comment_id") or "")),
+                        )
         return {"inserted": inserted, "duplicates": duplicates}
 
     def list_content(self, trade_date: str) -> list[dict]:
@@ -217,6 +260,20 @@ class SentimentStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def accepted_search_records(self, trade_date: str) -> list[dict]:
+        """Return accepted search discoveries with their retrieval sector scope."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content
+                   WHERE substr(collected_at,1,10)=? AND relevance_decision='accepted'
+                     AND retrieval_source='search'
+                   ORDER BY id""", (trade_date,)
+            ).fetchall()
+        records = [dict(row) for row in rows]
+        for record in records:
+            record["sector_ids"] = json.loads(record.pop("retrieval_sector_ids_json") or "[]")
+        return records
+
     def discover_creator_candidates(self, records: list[dict], settings: dict) -> dict[str, int]:
         """Persist eligible creator evidence and add, but never approve, candidates.
 
@@ -225,6 +282,7 @@ class SentimentStore:
         transition performed by :meth:`moderate_creator`.
         """
         minimum = int(settings.get("candidate_min_contents", 3))
+        minimum_sectors = int(settings.get("candidate_min_sectors", 2))
         very_high = float(settings.get("very_high_relevance", 0.9))
         thresholds = settings.get(
             "platform_engagement_thresholds", settings.get("high_engagement_thresholds", {})
@@ -270,7 +328,11 @@ class SentimentStore:
                     float(record.get("engagement") or 0) >= platform_threshold
                     for record in creator_records
                 )
-                qualifies = valid_count >= minimum or high_signal or len(sector_ids) >= 2
+                qualifies = (
+                    valid_count >= minimum
+                    or high_signal
+                    or len(sector_ids) >= minimum_sectors
+                )
                 existing = conn.execute(
                     "SELECT * FROM creators WHERE platform=? AND creator_id=?",
                     (platform, creator_id),
@@ -322,6 +384,17 @@ class SentimentStore:
     def approved_creators(self, platform: str | None = None) -> list[dict]:
         creators = self.list_creators("approved")
         return [creator for creator in creators if platform is None or creator["platform"] == platform]
+
+    def set_creator_collection_error(
+        self, platform: str, creator_id: str, error: str | None,
+    ) -> None:
+        """Record collection health without changing the creator's review status."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE creators SET last_collection_error=?
+                   WHERE platform=? AND creator_id=?""",
+                (error, platform, creator_id),
+            )
 
     def moderate_creator(self, platform: str, creator_id: str, action: str,
                          actor: str = "local-user") -> dict:
@@ -487,9 +560,15 @@ class SentimentStore:
     def record_collection(self, report: dict) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO collection_runs VALUES (?, ?, ?, ?, ?, ?)",
+                """INSERT INTO collection_runs
+                (run_id, trade_date, coverage, search_coverage, creator_coverage,
+                 platforms_json, funnel_json, status, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (uuid.uuid4().hex, report["trade_date"], float(report["coverage"]),
-                 json.dumps(report["platforms"], ensure_ascii=False),
+                 float(report.get("search_coverage", report["coverage"])),
+                 float(report.get("creator_coverage", report["coverage"])),
+                 json.dumps(report.get("platforms", {}), ensure_ascii=False),
+                 json.dumps(report.get("funnel", {}), ensure_ascii=False),
                  "ok" if report["coverage"] == 1 else "degraded", _now()),
             )
 
@@ -508,6 +587,7 @@ class SentimentStore:
         value = dict(row)
         value["trading_days"] = days
         value["platforms"] = json.loads(value.pop("platforms_json"))
+        value["funnel"] = json.loads(value.pop("funnel_json"))
         return value
 
     def collection_dates(self) -> list[str]:
@@ -763,11 +843,13 @@ def evaluate_layer(rows: list[dict], hit_key: str, *, samples: int = 1000) -> di
             "uplift": uplift, "ci_low": low, "ci_high": high, "verdict": verdict}
 
 
-def default_mediacrawler_runner(root: Path, commit: str | None = None) -> Callable:
+def default_mediacrawler_runner(
+    root: Path, commit: str | None = None, creator_id_argument: str = "--creator_id",
+) -> Callable:
     """Return a subprocess runner for a separately installed MediaCrawler checkout."""
     root = root.expanduser().resolve()
 
-    def run(platform: str, keywords: list[str], destination: Path, timeout: int) -> None:
+    def run(job: RetrievalJob, destination: Path, timeout: int, limits: dict) -> None:
         if not (root / "main.py").exists():
             raise FileNotFoundError(f"MediaCrawler not found: {root}")
         if commit:
@@ -776,8 +858,12 @@ def default_mediacrawler_runner(root: Path, commit: str | None = None) -> Callab
             if actual != commit:
                 raise RuntimeError(f"MediaCrawler commit mismatch: expected {commit}, got {actual}")
         before = {path: path.stat().st_mtime_ns for path in root.rglob("*.jsonl")}
-        cmd = [str(root / ".venv" / "bin" / "python"), "main.py", "--platform", platform,
-               "--type", "search", "--keywords", ",".join(keywords)]
+        cmd = [str(root / ".venv" / "bin" / "python"), "main.py", "--platform", job.platform,
+               "--type", job.mode]
+        if job.mode == "search":
+            cmd.extend(["--keywords", job.value])
+        else:
+            cmd.extend([creator_id_argument, job.value])
         subprocess.run(cmd, cwd=root, check=True, timeout=timeout)
         candidates = [path for path in root.rglob("*.jsonl")
                       if path.stat().st_mtime_ns > before.get(path, -1)]
@@ -789,8 +875,13 @@ def default_mediacrawler_runner(root: Path, commit: str | None = None) -> Callab
                 for line in source.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
                         continue
-                    normalized = normalize_external_record(json.loads(line), platform)
+                    normalized = normalize_external_record(json.loads(line), job.platform)
                     if normalized:
+                        normalized.update(
+                            retrieval_source=job.mode,
+                            retrieval_source_id=job.source_id,
+                            sector_ids=list(job.sector_ids),
+                        )
                         target.write(json.dumps(normalized, ensure_ascii=False) + "\n")
     return run
 
@@ -840,6 +931,76 @@ def collect_external(*, platforms: list[str], keywords: list[str], raw_dir: str 
     ok = sum(value["status"] == "ok" for value in statuses.values())
     return {"trade_date": trade_date, "platforms": statuses,
             "coverage": ok / len(platforms) if platforms else 0.0, "as_of": _now()}
+
+
+def collect_jobs(jobs: list[RetrievalJob], runner: Callable, raw_dir: str | Path,
+                 trade_date: str, limits: dict, timeout: int = 900) -> dict:
+    """Run typed retrieval jobs independently and retain every successful output."""
+    base = Path(raw_dir) / trade_date
+    base.mkdir(parents=True, exist_ok=True)
+    statuses = []
+    for job in jobs:
+        destination = base / f"{job.platform}-{job.mode}-{uuid.uuid4().hex}.jsonl"
+        status = {
+            "platform": job.platform, "mode": job.mode, "value": job.value,
+            "source_id": job.source_id, "sector_ids": list(job.sector_ids),
+        }
+        try:
+            runner(job, destination, timeout, limits)
+            count = sum(1 for line in destination.read_text(encoding="utf-8").splitlines()
+                        if line.strip())
+            statuses.append({**status, "status": "ok", "records": count,
+                             "path": str(destination)})
+        except Exception as exc:
+            statuses.append({**status, "status": "failed", "records": 0,
+                             "error": f"{type(exc).__name__}: {exc}"})
+    successful = sum(item["status"] == "ok" for item in statuses)
+    return {
+        "trade_date": trade_date,
+        "jobs": statuses,
+        "coverage": successful / len(jobs) if jobs else 1.0,
+        "as_of": _now(),
+    }
+
+
+def _ingest_and_classify_relevance(report: dict, store: SentimentStore,
+                                   taxonomy: list[dict]) -> dict:
+    """Ingest successful job outputs, then persist finance relevance decisions."""
+    sector_terms = list(dict.fromkeys(
+        term for sector in taxonomy
+        for term in [sector.get("sector_name", ""), *(sector.get("aliases") or [])]
+        if term
+    ))
+    totals = {"inserted": 0, "duplicates": 0}
+    raw_recalled = accepted = 0
+    source_ids: set[str] = set()
+    for item in report["jobs"]:
+        if item["status"] != "ok":
+            continue
+        path = Path(item["path"])
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                   if line.strip()]
+        raw_recalled += len(records)
+        if records:
+            source_ids.add(item["source_id"])
+        for record in records:
+            record["retrieval_source"] = item["mode"]
+            record["retrieval_source_id"] = item["source_id"]
+            record["sector_ids"] = item["sector_ids"]
+        ingested = store.ingest(records)
+        totals = {key: totals[key] + ingested[key] for key in totals}
+        for record in records:
+            relevance = classify_financial_relevance(
+                record, sector_terms, item["mode"] == "creator")
+            accepted += relevance.decision == "accepted"
+            store.save_relevance(
+                record["platform"], record["content_id"], record.get("comment_id", ""), relevance)
+    return {
+        **totals,
+        "raw_recalled": raw_recalled,
+        "financial_relevant": accepted,
+        "sources": len(source_ids),
+    }
 
 
 def briefing_changes(store: SentimentStore, trade_date: str, coverage: float = 1.0) -> list[str]:
@@ -929,41 +1090,74 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     cache_dir = Path(str(settings.get("cache_dir", "~/.stock-sentiment"))).expanduser()
     if market_provider is None and settings.get("market_data_enabled", False):
         market_provider = fetch_sector_market
-    if runner is None:
-        external_root = Path(str(settings["mediacrawler_path"])).expanduser()
-        runner = default_mediacrawler_runner(external_root, settings.get("mediacrawler_commit"))
-    report = collect_external(
-        platforms=list(settings.get("platforms", ["bili", "dy"])),
-        keywords=list(settings.get("keywords", [])), raw_dir=cache_dir / "raw",
-        runner=runner, timeout=int(settings.get("timeout_seconds", 900)), trade_date=trade_date,
-    )
-    store = open_store(cache_dir)
-    store.record_collection(report)
-    totals = {"inserted": 0, "duplicates": 0}
-    all_records = []
-    for item in report["platforms"].values():
-        if item["status"] != "ok":
-            continue
-        path = Path(item["path"])
-        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        all_records.extend(records)
-        result = store.ingest(records)
-        totals = {key: totals[key] + result[key] for key in totals}
     taxonomy = list(settings.get("taxonomy", []))
     if not taxonomy:
         taxonomy = [{"sector_id": f"concept:{word}", "sector_name": word,
                      "taxonomy": "concept", "aliases": [word]}
                     for word in settings.get("keywords", [])]
-    sector_terms = list(dict.fromkeys(
-        term for sector in taxonomy
-        for term in [sector.get("sector_name", ""), *(sector.get("aliases") or [])]
-        if term
-    ))
-    for record in all_records:
-        relevance = classify_financial_relevance(
-            record, sector_terms, bool(record.get("approved_author")))
-        store.save_relevance(record["platform"], record["content_id"], record.get("comment_id", ""), relevance)
-    all_records = store.list_eligible_content(report["trade_date"])
+    platforms = list(settings.get("platforms", ["bili", "dy"]))
+    retrieval_settings = dict(settings.get("retrieval") or {})
+    timeout = int(settings.get("timeout_seconds", 900))
+    limits = {
+        "max_contents": int(retrieval_settings.get("max_contents_per_query", 20)),
+        "max_comments": int(retrieval_settings.get("max_comments_per_content", 50)),
+    }
+    if runner is None:
+        external_root = Path(str(settings["mediacrawler_path"])).expanduser()
+        runner = default_mediacrawler_runner(
+            external_root,
+            settings.get("mediacrawler_commit"),
+            retrieval_settings.get("creator_id_argument", "--creator_id"),
+        )
+    resolved_date = trade_date or date.today().isoformat()
+    raw_dir = cache_dir / "raw"
+    store = open_store(cache_dir)
+
+    search_jobs = build_search_jobs(taxonomy, platforms, retrieval_settings)
+    search_report = collect_jobs(
+        search_jobs, runner, raw_dir, resolved_date, limits, timeout,
+    )
+    search_ingest = _ingest_and_classify_relevance(search_report, store, taxonomy)
+    store.discover_creator_candidates(store.accepted_search_records(resolved_date), retrieval_settings)
+    creator_jobs = build_creator_jobs(store.approved_creators(), platforms)
+    creator_report = collect_jobs(
+        creator_jobs, runner, raw_dir, resolved_date, limits, timeout,
+    )
+    for item in creator_report["jobs"]:
+        store.set_creator_collection_error(
+            item["platform"], item["value"], item.get("error") if item["status"] == "failed" else None,
+        )
+    creator_ingest = _ingest_and_classify_relevance(creator_report, store, taxonomy)
+    totals = {
+        key: search_ingest[key] + creator_ingest[key]
+        for key in ("inserted", "duplicates")
+    }
+    funnel = {
+        "raw_recalled": search_ingest["raw_recalled"] + creator_ingest["raw_recalled"],
+        "financial_relevant": (
+            search_ingest["financial_relevant"] + creator_ingest["financial_relevant"]
+        ),
+        "filtered": 0,
+        "search_sources": search_ingest["sources"],
+        "creator_sources": creator_ingest["sources"],
+    }
+    funnel["filtered"] = funnel["raw_recalled"] - funnel["financial_relevant"]
+    all_jobs = search_report["jobs"] + creator_report["jobs"]
+    successful_jobs = sum(item["status"] == "ok" for item in all_jobs)
+    report = {
+        "trade_date": resolved_date,
+        "search_coverage": search_report["coverage"],
+        "creator_coverage": creator_report["coverage"],
+        "coverage": successful_jobs / len(all_jobs) if all_jobs else 1.0,
+        "jobs": all_jobs,
+        "search_jobs": search_report["jobs"],
+        "creator_jobs": creator_report["jobs"],
+        "platforms": {},
+        "funnel": funnel,
+        "as_of": _now(),
+    }
+    store.record_collection(report)
+    all_records = store.list_eligible_content(resolved_date)
     if semantic_classifier is None:
         if settings.get("llm_enabled", False):
             def semantic_classifier(record, taxonomy):
@@ -985,7 +1179,6 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     for item in evidence:
         by_sector.setdefault(item["sector_id"], []).append(item)
     market_metrics = settings.get("market_metrics") or {}
-    resolved_date = report["trade_date"]
     for sector_id, rows in by_sector.items():
         meta = rows[0]
         history = store.scores_for_sector(sector_id)
@@ -1027,6 +1220,7 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                 continue
     return {"status": "ok" if report["coverage"] == 1 else "degraded",
             "coverage": report["coverage"], "collection": report, "ingest": totals,
+            "funnel": funnel,
             "sectors_scored": len(by_sector), "alerts": changes, "events_labeled": labeled,
             "classification_errors": classification_errors}
 

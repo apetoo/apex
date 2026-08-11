@@ -127,6 +127,13 @@ sector_sentiment:
     max_queries_per_sector: 8
     max_contents_per_query: 20
     max_comments_per_content: 50
+    creator_id_argument: "--creator_id"
+    candidate_min_contents: 3
+    candidate_min_sectors: 2
+    very_high_relevance: 0.9
+    high_engagement_thresholds: {bili: 1000, dy: 1000}
+    relevance_version: "sector-finance-relevance-v1"
+    creator_rule_version: "sector-finance-creator-v1"
   keywords: ["机器人", "算力", "创新药"]
   # 正式运行应扩充为完整的申万行业＋东方财富概念版本化词典。
   taxonomy:
