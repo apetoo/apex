@@ -30,6 +30,7 @@ export interface SectorSentimentOverview {
   shadow_mode: boolean;
   sectors: SectorSentimentScore[];
   changes: Array<{ event_id: string; sector_name: string; event_type: string; trade_date: string }>;
+  retrieval_funnel: RetrievalFunnel;
 }
 
 export interface SectorSentimentValidation {
@@ -44,6 +45,30 @@ export interface SectorSentimentValidation {
 export interface SectorSentimentDetail {
   history: SectorSentimentScore[];
   sector: SectorSentimentScore;
+  retrieval_funnel: RetrievalFunnel;
+}
+
+export type CreatorStatus = "candidate" | "approved" | "rejected";
+
+export interface FinanceCreator {
+  platform: string;
+  creator_id: string;
+  display_name: string | null;
+  status: CreatorStatus;
+  financial_ratio: number;
+  valid_content_count: number;
+  sector_ids: string[];
+  last_discovered_at: string;
+  evidence: Array<{ text: string }>;
+  last_collection_error: string | null;
+}
+
+export interface RetrievalFunnel {
+  raw_recalled: number;
+  financial_relevant: number;
+  filtered: number;
+  search_sources: number;
+  creator_sources: number;
 }
 
 export function getSectorSentimentOverview(date?: string) {
@@ -61,3 +86,16 @@ export function getSectorSentimentDetail(sectorId: string, date?: string) {
     `/sector-sentiment/${encodeURIComponent(sectorId)}${date ? `?date=${date}` : ""}`,
   );
 }
+
+export const getSectorSentimentCreators = (status?: CreatorStatus) =>
+  api.get<{ creators: FinanceCreator[] }>(
+    `/sector-sentiment/creators${status ? `?status=${status}` : ""}`,
+  );
+
+export const moderateSectorSentimentCreator = (
+  platform: string,
+  id: string,
+  action: "approve" | "reject" | "restore",
+) => api.post(
+  `/sector-sentiment/creators/${encodeURIComponent(platform)}/${encodeURIComponent(id)}/${action}`,
+);

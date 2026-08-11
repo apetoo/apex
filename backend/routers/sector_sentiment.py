@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -55,6 +56,24 @@ def _quality_meta(store: ss.SentimentStore, date: str | None) -> dict:
             "stale": stale}
 
 
+def _retrieval_funnel(store: ss.SentimentStore, date: str | None) -> dict:
+    """Return the daily retrieval accounting, including an empty safe default."""
+    return store.collection_summary(date).get("funnel") or {
+        "raw_recalled": 0, "financial_relevant": 0, "filtered": 0,
+        "search_sources": 0, "creator_sources": 0,
+    }
+
+
+def _public_creator(creator: dict) -> dict:
+    """Limit reviewer responses to the public creator contract and content evidence."""
+    fields = (
+        "platform", "creator_id", "display_name", "status", "financial_ratio",
+        "valid_content_count", "sector_ids", "last_discovered_at", "evidence",
+        "last_collection_error",
+    )
+    return {field: creator[field] for field in fields}
+
+
 @router.get("/overview")
 def overview(date: str | None = Query(None)):
     store = _store()
@@ -65,7 +84,8 @@ def overview(date: str | None = Query(None)):
     events = [event for event in store.list_events() if event["trade_date"] == resolved]
     meta = _quality_meta(store, resolved)
     return {**meta,
-            "sectors": sectors, "changes": events, "shadow_mode": True}
+            "sectors": sectors, "changes": events, "shadow_mode": True,
+            "retrieval_funnel": _retrieval_funnel(store, resolved)}
 
 
 @router.get("/events")
@@ -89,6 +109,39 @@ def validation():
             "short": short, "swing": swing, "go_no_go": go_no_go}
 
 
+@router.get("/creators")
+def creators(status: Literal["candidate", "approved", "rejected"] | None = Query(None)):
+    store = _store()
+    return {
+        **_quality_meta(store, store.latest_date()),
+        "creators": [_public_creator(creator) for creator in store.list_creators(status)],
+    }
+
+
+def _moderate(platform: str, creator_id: str, action: Literal["approve", "reject", "restore"]):
+    store = _store()
+    try:
+        creator = store.moderate_creator(platform, creator_id, action)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="creator not found") from exc
+    return {**_quality_meta(store, store.latest_date()), "creator": _public_creator(creator)}
+
+
+@router.post("/creators/{platform}/{creator_id}/approve")
+def approve_creator(platform: str, creator_id: str):
+    return _moderate(platform, creator_id, "approve")
+
+
+@router.post("/creators/{platform}/{creator_id}/reject")
+def reject_creator(platform: str, creator_id: str):
+    return _moderate(platform, creator_id, "reject")
+
+
+@router.post("/creators/{platform}/{creator_id}/restore")
+def restore_creator(platform: str, creator_id: str):
+    return _moderate(platform, creator_id, "restore")
+
+
 @router.get("/{sector_id}")
 def detail(sector_id: str, date: str | None = Query(None)):
     store = _store()
@@ -99,9 +152,10 @@ def detail(sector_id: str, date: str | None = Query(None)):
         raise HTTPException(status_code=404, detail="sector not found")
     latest = history[-1]
     state = store.get_state(sector_id)
-    return {**_meta(store, latest["trade_date"]), "data_quality": "ok" if _detail_ok(latest) else "degraded",
+    return {**_quality_meta(store, latest["trade_date"]), "data_quality": "ok" if _detail_ok(latest) else "degraded",
             "coverage": min(1.0, len(latest["platforms"]) / _expected_platforms()), "sector": latest,
-            "state": state, "history": history[-60:]}
+            "state": state, "history": history[-60:],
+            "retrieval_funnel": _retrieval_funnel(store, latest["trade_date"])}
 
 
 def _detail_ok(score: dict) -> bool:
