@@ -274,10 +274,14 @@ def test_financial_retrieval_replay_excludes_pollution_and_is_idempotent(tmp_pat
     assert first_state["state"] == "observe"
     assert len(first_events) == 1
     opened = first_events[0]
+    assert opened["event_id"]
     assert opened["event_key"] == f'{opened["event_id"]}:opened:2026-08-10'
     assert opened["event_type"] == "opened"
+    assert opened["level"] == "observe"
     assert opened["trade_date"] == "2026-08-10"
     assert opened["sector_id"] == "concept:robot"
+    assert opened["sector_name"] == "机器人"
+    assert opened["taxonomy"] == "concept"
 
     second = ss.run_configured(
         cfg, runner=mixed_robot_runner, trade_date="2026-08-10",
