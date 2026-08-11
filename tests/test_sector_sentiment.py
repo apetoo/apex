@@ -2,11 +2,29 @@ import json
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from apex import sector_sentiment as ss
 from apex import sector_retrieval as retrieval
+
+
+PINNED_COMMIT = "a" * 40
+
+
+def _frozen_retrieval(**overrides):
+    value = {
+        "query_version": retrieval.QUERY_VERSION,
+        "relevance_version": retrieval.RELEVANCE_VERSION,
+        "creator_rule_version": retrieval.CREATOR_RULE_VERSION,
+        "query_templates": ["{term} 股票"],
+        "max_queries_per_sector": 1,
+        "max_contents_per_query": 20,
+        "max_comments_per_content": 50,
+    }
+    value.update(overrides)
+    return value
 
 
 def _item(platform: str, content_id: str, text: str, **extra) -> dict:
@@ -197,11 +215,13 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
 
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili", "eastmoney"],
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "keywords": ["机器人"], "taxonomy": [
             {"sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
              "aliases": ["机器人"]},
         ],
-        "retrieval": {"query_templates": ["{term} 股票"], "max_queries_per_sector": 1},
+        "retrieval": _frozen_retrieval(),
     }}, runner=runner, trade_date="2026-08-10")
 
     store = ss.open_store(tmp_path)
@@ -214,6 +234,8 @@ def financial_config(tmp_path):
     return {"sector_sentiment": {
         "enabled": True,
         "cache_dir": str(tmp_path),
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "platforms": ["bili", "eastmoney"],
         "taxonomy": [{
             "sector_id": "concept:robot",
@@ -221,10 +243,7 @@ def financial_config(tmp_path):
             "taxonomy": "concept",
             "aliases": ["机器人"],
         }],
-        "retrieval": {
-            "query_templates": ["{term} 股票"],
-            "max_queries_per_sector": 1,
-        },
+        "retrieval": _frozen_retrieval(),
         "market_metrics": {"concept:robot": {
             "return": -1.0,
             "volume_change": -0.2,
@@ -339,12 +358,14 @@ def test_same_trade_date_rerun_keeps_score_events_and_alert_state_deterministic(
 
     config = {"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path),
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "platforms": ["bili", "eastmoney"],
         "taxonomy": [{
             "sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
             "aliases": ["机器人"],
         }],
-        "retrieval": {"query_templates": ["{term} 股票"], "max_queries_per_sector": 1},
+        "retrieval": _frozen_retrieval(),
         "market_metrics": {"concept:robot": {
             "return": -1.0, "volume_change": -0.2, "breadth": 0.3, "fund_flow": -1.0,
         }},
@@ -381,8 +402,10 @@ def test_mediacrawler_runner_exports_new_jsonl_to_canonical_destination(tmp_path
     (root / "data").mkdir()
     os.symlink(sys.executable, root / ".venv" / "bin" / "python")
     (root / "main.py").write_text(
-        "from pathlib import Path\n"
-        "Path('data/bili.jsonl').write_text('{\"video_id\":\"BV1\",\"title\":\"机器人起飞\"}\\n')\n"
+        "import sys\nfrom pathlib import Path\n"
+        "p=Path(sys.argv[sys.argv.index('--save_data_path')+1])/'bili'/'jsonl'/'contents.jsonl'\n"
+        "p.parent.mkdir(parents=True)\n"
+        "p.write_text('{\"video_id\":\"BV1\",\"title\":\"机器人起飞\"}\\n')\n"
     )
     destination = tmp_path / "canonical.jsonl"
 
@@ -406,10 +429,12 @@ def test_mediacrawler_runner_uses_search_and_creator_modes(tmp_path, monkeypatch
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = root / f"output-{len(commands)}.jsonl"
+        stage = Path(command[command.index("--save_data_path") + 1])
+        output = stage / f"output-{len(commands)}.jsonl"
         output.write_text(json.dumps({
             "video_id": f"BV{len(commands)}", "title": "机器人板块资金流入",
             "user_id": "up-1", "nickname": "财经小王",
+            "published_at": "2026-08-10T03:00:00+00:00",
         }, ensure_ascii=False) + "\n")
 
     monkeypatch.setattr(ss.subprocess, "run", fake_run)
@@ -419,14 +444,16 @@ def test_mediacrawler_runner_uses_search_and_creator_modes(tmp_path, monkeypatch
         tmp_path / "search.jsonl", 10, {"max_contents": 20, "max_comments": 50},
     )
     runner(retrieval.RetrievalJob(
-        "bili", "creator", "up-1", (), "creator:bili:up-1"),
+        "bili", "creator", "up-1", (), "creator:bili:up-1",
+        trade_date="2026-08-10", cutoff="2026-08-10T02:00:00+00:00",
+        crawl_locator="123456"),
         tmp_path / "creator.jsonl", 10, {"max_contents": 20, "max_comments": 50},
     )
 
     assert "--type search" in " ".join(commands[0])
     assert "--keywords 机器人 股票" in " ".join(commands[0])
     assert "--type creator" in " ".join(commands[1])
-    assert "--creator_id up-1" in " ".join(commands[1])
+    assert "--creator_id 123456" in " ".join(commands[1])
     creator_row = json.loads((tmp_path / "creator.jsonl").read_text())
     assert creator_row["retrieval_source"] == "creator"
     assert creator_row["retrieval_source_id"] == "creator:bili:up-1"
@@ -448,8 +475,9 @@ def test_mediacrawler_runner_enforces_content_and_per_content_comment_limits(
             {"content_id": content_id, "comment_id": f"{content_id}-m2", "text": "评论2"},
         ])
 
-    def fake_run(_command, **_kwargs):
-        (root / "output.jsonl").write_text(
+    def fake_run(command, **_kwargs):
+        stage = Path(command[command.index("--save_data_path") + 1])
+        (stage / "output.jsonl").write_text(
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
         )
 
@@ -483,16 +511,15 @@ def test_creator_failure_does_not_discard_successful_search_results(tmp_path):
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True,
         "cache_dir": str(tmp_path),
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "platforms": ["bili"],
         "keywords": ["机器人"],
         "taxonomy": [{
             "sector_id": "concept:robot", "sector_name": "机器人",
             "taxonomy": "concept", "aliases": ["机器人"],
         }],
-        "retrieval": {
-            "query_templates": ["{term} 股票"], "max_queries_per_sector": 1,
-            "max_contents_per_query": 20, "max_comments_per_content": 50,
-        },
+        "retrieval": _frozen_retrieval(),
     }}, runner=runner, trade_date="2026-08-10")
 
     assert result["collection"]["search_coverage"] == 1.0
@@ -520,15 +547,17 @@ def test_creator_file_failure_updates_approved_creator_error_after_ingest(tmp_pa
 
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili"],
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "taxonomy": [{
             "sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
             "aliases": ["机器人"],
         }],
-        "retrieval": {"query_templates": ["{term} 股票"], "max_queries_per_sector": 1},
+        "retrieval": _frozen_retrieval(),
     }}, runner=runner, trade_date="2026-08-10")
 
     assert result["collection"]["creator_coverage"] == 0.0
-    assert "JSONDecodeError" in store.approved_creators("bili")[0]["last_collection_error"]
+    assert "quarantined" in store.approved_creators("bili")[0]["last_collection_error"]
 
 
 def test_ingest_failures_are_isolated_per_job_and_collection_is_recorded(
@@ -568,31 +597,32 @@ def test_ingest_failures_are_isolated_per_job_and_collection_is_recorded(
 
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili"],
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "taxonomy": [{
             "sector_id": "concept:mixed", "sector_name": "好数据", "taxonomy": "concept",
             "aliases": ["坏JSON", "缺字段", "分类异常", "SQLite异常"],
         }],
-        "retrieval": {
-            "query_templates": ["{term} 股票"], "max_queries_per_sector": 5,
-        },
+        "retrieval": _frozen_retrieval(max_queries_per_sector=5),
     }}, runner=runner, trade_date="2026-08-10")
 
     statuses = {job["value"]: job for job in result["collection"]["search_jobs"]}
     assert statuses["好数据 股票"]["status"] == "ok"
+    assert statuses["分类异常 股票"]["status"] == "ok"
     assert all(statuses[f"{term} 股票"]["status"] == "failed" for term in (
-        "坏JSON", "缺字段", "分类异常", "SQLite异常",
+        "坏JSON", "缺字段", "SQLite异常",
     ))
-    assert result["collection"]["search_coverage"] == pytest.approx(0.2)
+    assert result["collection"]["search_coverage"] == pytest.approx(0.4)
     assert result["status"] == "degraded"
     assert [row["content_id"] for row in ss.open_store(tmp_path).list_eligible_content(
         "2026-08-10"
     )] == ["好数据"]
     assert ss.open_store(tmp_path).collection_summary("2026-08-10")[
         "search_coverage"
-    ] == pytest.approx(0.2)
+    ] == pytest.approx(0.4)
 
 
-def test_relevance_persistence_failure_rolls_back_the_entire_failed_job(
+def test_invalid_relevance_decision_isolated_to_its_record(
     tmp_path, monkeypatch,
 ):
     real_classifier = ss.classify_financial_relevance
@@ -620,18 +650,20 @@ def test_relevance_persistence_failure_rolls_back_the_entire_failed_job(
 
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili"],
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "taxonomy": [{
             "sector_id": "concept:mixed", "sector_name": "好数据", "taxonomy": "concept",
             "aliases": ["坏事务"],
         }],
-        "retrieval": {"query_templates": ["{term} 股票"], "max_queries_per_sector": 2},
+        "retrieval": _frozen_retrieval(max_queries_per_sector=2),
     }}, runner=runner, trade_date="2026-08-10")
 
     statuses = {job["value"]: job["status"] for job in result["collection"]["search_jobs"]}
-    assert statuses == {"好数据 股票": "ok", "坏事务 股票": "failed"}
+    assert statuses == {"好数据 股票": "ok", "坏事务 股票": "ok"}
     assert [row["content_id"] for row in ss.open_store(tmp_path).list_eligible_content(
         "2026-08-10"
-    )] == ["good"]
+    )] == ["good", "bad-1"]
 
 
 def test_collection_summary_preserves_dual_coverage_and_daily_funnel(tmp_path):
@@ -656,7 +688,10 @@ def test_collection_summary_preserves_dual_coverage_and_daily_funnel(tmp_path):
 def test_empty_mandatory_search_plan_is_degraded_while_creator_plan_is_complete(tmp_path):
     result = ss.run_configured({"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili"],
+        "mediacrawler_commit": PINNED_COMMIT,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
         "keywords": [], "taxonomy": [],
+        "retrieval": _frozen_retrieval(),
     }}, runner=lambda *_args: pytest.fail("empty plans must not invoke the runner"),
         trade_date="2026-08-10")
 
@@ -776,7 +811,7 @@ def test_creator_becomes_candidate_once_after_three_unique_financial_contents(tm
         "created": 1, "updated": 0,
     }
     assert store.discover_creator_candidates(records, {"candidate_min_contents": 3}) == {
-        "created": 0, "updated": 1,
+        "created": 0, "updated": 0,
     }
     creators = store.list_creators("candidate")
     assert len(creators) == 1
@@ -832,7 +867,7 @@ def test_rejection_restoration_and_invalid_moderation_are_audited(tmp_path):
     assert [event["action"] for event in store.creator_events("bili", "up-1")] == ["reject", "restore"]
     with pytest.raises(ValueError, match="unknown moderation action"):
         store.moderate_creator("bili", "up-1", "archive")
-    with pytest.raises(KeyError):
+    with pytest.raises(ss.CreatorNotFoundError):
         store.moderate_creator("bili", "missing", "approve")
 
 
@@ -850,11 +885,11 @@ def test_creator_retrieval_jobs_only_use_approved_creators(tmp_path):
 def test_creator_retrieval_jobs_scope_platforms_and_disambiguate_source_ids():
     creators = [
         {"platform": "bili", "creator_id": "up-1", "status": "approved",
-         "sector_ids": ["concept:robot"]},
+         "sector_ids": ["concept:robot"], "approved_at": "2026-08-10T02:00:00+00:00"},
         {"platform": "eastmoney", "creator_id": "up-1", "status": "approved",
-         "sector_ids": ["concept:robot"]},
+         "sector_ids": ["concept:robot"], "approved_at": "2026-08-10T02:00:00+00:00"},
         {"platform": "douyin", "creator_id": "up-2", "status": "approved",
-         "sector_ids": ["concept:ai"]},
+         "sector_ids": ["concept:ai"], "approved_at": "2026-08-10T02:00:00+00:00"},
     ]
 
     jobs = retrieval.build_creator_jobs(creators, ["bili", "eastmoney"])

@@ -15,6 +15,7 @@ from apex import analyze as ana_mod
 from apex import backtest_review as br_mod
 from apex import chan as chan_mod
 from apex import postmortem as pm_mod
+from apex import sector_sentiment as sentiment_mod
 from apex import technical as tech_mod
 from apex import watchlist as wl_mod
 
@@ -62,6 +63,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _data_fetch(_req: Request, exc: tech_mod.DataFetchError) -> JSONResponse:
         # 502 = 上游数据源语义（对齐 AnalysisError 先例）
         return _json(502, {"detail": f"数据获取失败: {exc}"})
+
+    @app.exception_handler(sentiment_mod.CreatorNotFoundError)
+    async def _creator_not_found(
+        _req: Request, exc: sentiment_mod.CreatorNotFoundError,
+    ) -> JSONResponse:
+        return _json(404, {"detail": str(exc)})
 
     @app.exception_handler(ValueError)
     async def _value_error(_req: Request, exc: ValueError) -> JSONResponse:

@@ -68,7 +68,14 @@ def _public_creator(creator: dict) -> dict:
         "valid_content_count", "sector_ids", "last_discovered_at", "evidence",
         "last_collection_error",
     )
-    return {field: creator[field] for field in fields}
+    value = {field: creator[field] for field in fields}
+    value["evidence"] = [
+        {"text": ss._redact_text(item.get("text"), 200)}
+        for item in creator.get("evidence", []) if isinstance(item, dict) and item.get("text")
+    ]
+    if value["last_collection_error"]:
+        value["last_collection_error"] = "采集失败，请稍后重试"
+    return value
 
 
 @router.get("/overview")
@@ -117,10 +124,7 @@ def creators(status: Literal["candidate", "approved", "rejected"] | None = Query
 
 def _moderate(platform: str, creator_id: str, action: Literal["approve", "reject", "restore"]):
     store = _store()
-    try:
-        creator = store.moderate_creator(platform, creator_id, action)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="creator not found") from exc
+    creator = store.moderate_creator(platform, creator_id, action)
     return {**_quality_meta(store, store.latest_date()), "creator": _public_creator(creator)}
 
 
@@ -149,8 +153,9 @@ def detail(sector_id: str, date: str | None = Query(None)):
         raise HTTPException(status_code=404, detail="sector not found")
     latest = history[-1]
     state = store.get_state(sector_id)
-    return {**_quality_meta(store, latest["trade_date"]), "data_quality": "ok" if _detail_ok(latest) else "degraded",
-            "coverage": min(1.0, len(latest["platforms"]) / _expected_platforms()), "sector": latest,
+    meta = _quality_meta(store, latest["trade_date"])
+    quality = "ok" if meta["data_quality"] == "ok" and _detail_ok(latest) else "degraded"
+    return {**meta, "data_quality": quality, "sector": latest,
             "state": state, "history": history[-60:],
             "retrieval_funnel": _retrieval_funnel(store, latest["trade_date"])}
 

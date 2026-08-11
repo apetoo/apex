@@ -1,13 +1,18 @@
+import json
+from datetime import date, timedelta
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from apex import sector_sentiment as ss
+from backend.core.errors import register_exception_handlers
 from backend.routers import sector_sentiment as router_module
 
 
 def _client(store):
     router_module.set_store_for_testing(store)
     app = FastAPI()
+    register_exception_handlers(app)
     app.include_router(router_module.router, prefix="/api")
     return TestClient(app)
 
@@ -112,3 +117,105 @@ def test_historical_score_without_collection_telemetry_returns_null_funnel(tmp_p
 
     assert client.get("/api/sector-sentiment/overview?date=2026-08-09").json()["retrieval_funnel"] is None
     assert client.get("/api/sector-sentiment/concept:robot?date=2026-08-09").json()["retrieval_funnel"] is None
+
+
+def test_detail_keeps_collection_coverage_instead_of_sector_platform_ratio(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.save_daily_score({
+        "trade_date": "2026-08-10", "sector_id": "concept:robot", "sector_name": "机器人",
+        "taxonomy": "concept", "platforms": ["bili", "eastmoney"], "independent_authors": 20,
+        "mapping_confidence": 0.9, "sentiment_extreme": 0.95,
+        "attention_acceleration": 0.92, "consensus_crowding": 0.8,
+        "market_divergence": 0.2, "short_risk": 66, "swing_risk": 48,
+    })
+    store.record_collection({
+        "trade_date": "2026-08-10", "coverage": 0.5,
+        "search_coverage": 0.5, "creator_coverage": 1.0,
+        "platforms": {}, "funnel": None,
+    })
+
+    payload = _client(store).get("/api/sector-sentiment/concept:robot").json()
+
+    assert payload["coverage"] == 0.5
+    assert payload["data_quality"] == "degraded"
+
+
+def test_creator_not_found_uses_the_global_domain_error_mapping(tmp_path):
+    response = _client(ss.SentimentStore(tmp_path / "sentiment.sqlite3")).post(
+        "/api/sector-sentiment/creators/bili/missing/approve",
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "creator not found"}
+
+
+def test_creator_api_returns_redacted_minimal_evidence_without_content_ids(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.discover_creator_candidates([{
+        "platform": "bili", "content_id": "private-content-id", "author_id": "up-1",
+        "author_name": "财经小王", "text": "邮箱 test@example.com 手机13800138000 微信wx_secret",
+        "published_at": "2026-08-10T08:00:00+00:00", "relevance_score": 0.9,
+        "relevance_decision": "accepted", "relevance_reasons": ["path:entity_and_finance"],
+        "sector_ids": ["concept:robot"],
+    }], {
+        "candidate_min_contents": 1,
+        "query_version": "sector-finance-query-v1",
+        "relevance_version": "sector-finance-relevance-v1",
+        "creator_rule_version": "sector-finance-creator-v1",
+        "config_hash": "policy-hash",
+    })
+
+    creator = _client(store).get("/api/sector-sentiment/creators?status=candidate").json()["creators"][0]
+
+    assert set(creator) == {
+        "platform", "creator_id", "display_name", "status", "financial_ratio",
+        "valid_content_count", "sector_ids", "last_discovered_at", "evidence",
+        "last_collection_error",
+    }
+    assert "content_id" not in creator["evidence"][0]
+    assert "private-content-id" not in json.dumps(creator, ensure_ascii=False)
+    assert "example.com" not in json.dumps(creator, ensure_ascii=False)
+    assert "13800138000" not in json.dumps(creator, ensure_ascii=False)
+    assert "wx_secret" not in json.dumps(creator, ensure_ascii=False)
+
+
+def test_creator_api_does_not_expose_collection_exception_paths(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.discover_creator_candidates([{
+        "platform": "bili", "content_id": "content", "author_id": "opaque",
+        "text": "机器人板块资金流入", "relevance_score": 0.9,
+        "relevance_decision": "accepted", "sector_ids": ["concept:robot"],
+    }], {"candidate_min_contents": 1})
+    store.set_creator_collection_error(
+        "bili", "opaque", "FileNotFoundError: /Users/private/MediaCrawler/main.py",
+    )
+
+    creator = _client(store).get(
+        "/api/sector-sentiment/creators?status=candidate",
+    ).json()["creators"][0]
+
+    assert creator["last_collection_error"] == "采集失败，请稍后重试"
+    assert "/Users/private" not in json.dumps(creator, ensure_ascii=False)
+
+
+def test_validation_resets_to_one_day_when_a_new_policy_cohort_starts(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    start = date(2026, 1, 1)
+    for offset in range(60):
+        store.record_collection({
+            "trade_date": (start + timedelta(days=offset)).isoformat(),
+            "coverage": 1.0, "search_coverage": 1.0, "creator_coverage": 1.0,
+            "platforms": {}, "funnel": {}, "config_hash": "policy-v1",
+        })
+    store.record_collection({
+        "trade_date": (start + timedelta(days=60)).isoformat(),
+        "coverage": 1.0, "search_coverage": 1.0, "creator_coverage": 1.0,
+        "platforms": {}, "funnel": {}, "config_hash": "policy-v2",
+    })
+
+    payload = _client(store).get("/api/sector-sentiment/validation").json()
+
+    assert payload["trading_days"] == 1
+    assert payload["status"] == "accumulating"
+    assert payload["short"]["verdict"] == "PENDING"
+    assert payload["swing"]["verdict"] == "PENDING"

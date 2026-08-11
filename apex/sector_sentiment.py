@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import math
+import os
 import random
+import re
 import sqlite3
 import subprocess
 import uuid
@@ -18,7 +20,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from apex.mediacrawler_bounded import ADAPTER_VERSION
 from apex.sector_retrieval import (
+    CREATOR_RULE_VERSION,
+    EXCLUDE_TERMS,
+    FINANCE_TERMS,
+    QUERY_VERSION,
+    RELEVANCE_VERSION,
     RetrievalJob,
     RelevanceDecision,
     build_creator_jobs,
@@ -37,6 +45,15 @@ MIN_AUTHORS = 10
 MIN_MAPPING_CONFIDENCE = 0.70
 
 
+class CreatorNotFoundError(Exception):
+    """Raised when moderation targets a creator absent from the audited pool."""
+
+    def __init__(self, platform: str, creator_id: str):
+        self.platform = platform
+        self.creator_id = creator_id
+        super().__init__("creator not found")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -44,6 +61,224 @@ def _now() -> str:
 def _fingerprint(text: str) -> str:
     normalized = re.sub(r"\W+", "", (text or "").lower())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _policy_cohort_id(config_hash: str, start_date: str) -> str:
+    return hashlib.sha256(f"{config_hash}:{start_date}".encode("utf-8")).hexdigest()[:24]
+
+
+def _redact_text(value: Any, limit: int | None = None) -> str:
+    """Remove contact handles from persisted/API evidence while keeping semantics."""
+    text = str(value or "")
+    text = re.sub(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        "[邮箱已脱敏]", text,
+    )
+    text = re.sub(
+        r"(?<!\d)(?:\+?86[-\s]?)?1[3-9](?:[-\s]?\d){9}(?!\d)",
+        "[电话已脱敏]", text,
+    )
+    text = re.sub(
+        r"(?<!\d)0\d{2,3}[-\s]\d{7,8}(?!\d)", "[电话已脱敏]", text,
+    )
+    text = re.sub(
+        r"(?i)(?:https?://)?(?:weibo\.com|t\.me|douyin\.com/user|"
+        r"xiaohongshu\.com/user|space\.bilibili\.com)/?[^\s,，。；;]*",
+        "[社交链接已脱敏]", text,
+    )
+    text = re.sub(
+        r"(?i)(微信|wechat|wx|qq|抖音号|小红书号|b站uid|uid|公众号|微博|"
+        r"weibo|telegram|tg|知乎号)\s*[:：号]?\s*[^\s,，。；;、]{2,}",
+        r"\1[账号已脱敏]", text,
+    )
+    text = re.sub(r"@[\w.-]{2,}", "@[账号已脱敏]", text)
+    return text if limit is None else text[:limit]
+
+
+def _semantic_text(record: dict) -> str:
+    """Build the redacted classification input without dropping retrieval metadata."""
+    tags = record.get("tags") or []
+    if isinstance(tags, (list, tuple, set)):
+        tags = " ".join(str(tag) for tag in tags)
+    parts = [
+        str(record.get("title") or ""),
+        str(record.get("description") or ""),
+        str(tags or ""),
+        str(record.get("text") or ""),
+    ]
+    return _redact_text("\n".join(dict.fromkeys(part for part in parts if part)))
+
+
+def _json_list(value: Any) -> list:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(value, tuple):
+        return list(value)
+    return value if isinstance(value, list) else []
+
+
+def _sanitize_creator_evidence(value: Any) -> list[dict]:
+    allowed = (
+        "text", "published_at", "relevance_score", "reasons",
+        "query_version", "relevance_version", "creator_rule_version", "config_hash",
+    )
+    output = []
+    for item in _json_list(value):
+        if not isinstance(item, dict):
+            continue
+        sanitized = {key: item[key] for key in allowed if key in item}
+        if "text" in sanitized:
+            sanitized["text"] = _redact_text(sanitized["text"], 200)
+        if "reasons" in sanitized:
+            sanitized["reasons"] = [
+                _redact_text(reason, 200) for reason in _json_list(sanitized["reasons"])
+            ]
+        output.append(sanitized)
+    return output
+
+
+def _sanitize_score_evidence(value: Any) -> list[dict]:
+    output = []
+    for item in _json_list(value):
+        if not isinstance(item, dict):
+            continue
+        sanitized = {
+            key: item[key] for key in ("platform", "text", "stance") if key in item
+        }
+        if "text" in sanitized:
+            sanitized["text"] = _redact_text(sanitized["text"], 160)
+        output.append(sanitized)
+    return output
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    """Parse canonical ISO timestamps and common MediaCrawler epoch values."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("timestamp is missing")
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        parsed = datetime.fromtimestamp(numeric, tz=timezone.utc)
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        raise ValueError("unsupported timestamp type")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalized_timestamp(value: Any) -> str:
+    return _parse_timestamp(value).isoformat(timespec="seconds")
+
+
+def _creator_cutoff_reason(record: dict, cutoff: str | None) -> str | None:
+    if not cutoff:
+        return "creator_missing_approval_cutoff"
+    published_at = record.get("published_at")
+    if published_at in (None, ""):
+        return "creator_missing_published_at"
+    try:
+        published = _parse_timestamp(published_at)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "creator_invalid_published_at"
+    try:
+        approved = _parse_timestamp(cutoff)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError("creator job has an invalid approval cutoff") from exc
+    if published <= approved:
+        return "creator_before_approval"
+    return None
+
+
+def _creator_parent_cutoffs(records: list[dict], cutoff: str | None) -> dict[str, str | None]:
+    """Resolve each creator content root once so comments cannot revive old posts."""
+    roots: dict[str, str | None] = {}
+    for record in records:
+        if str(record.get("comment_id") or ""):
+            continue
+        content_id = str(record.get("content_id") or "")
+        if not content_id:
+            continue
+        reason = _creator_cutoff_reason(record, cutoff)
+        if content_id not in roots or reason is None:
+            roots[content_id] = reason
+    return roots
+
+
+def _creator_record_cutoff_reason(
+    record: dict, cutoff: str | None, parent_cutoffs: dict[str, str | None],
+) -> str | None:
+    """Apply the approval cutoff to both a row and its canonical parent content."""
+    if str(record.get("comment_id") or ""):
+        content_id = str(record.get("content_id") or "")
+        if content_id not in parent_cutoffs:
+            return "creator_missing_parent_content"
+        parent_reason = parent_cutoffs[content_id]
+        if parent_reason:
+            return "creator_parent_" + parent_reason.removeprefix("creator_")
+    return _creator_cutoff_reason(record, cutoff)
+
+
+def _validate_retrieval_policy(settings: dict, retrieval_settings: dict) -> str:
+    """Validate frozen versions and return the canonical audit hash."""
+    commit = str(settings.get("mediacrawler_commit") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+        raise ValueError("sector_sentiment.mediacrawler_commit must be a full 40-hex pin")
+    expected = {
+        "query_version": QUERY_VERSION,
+        "relevance_version": RELEVANCE_VERSION,
+        "creator_rule_version": CREATOR_RULE_VERSION,
+    }
+    for key, required in expected.items():
+        actual = retrieval_settings.get(key)
+        if actual != required:
+            raise ValueError(f"retrieval.{key} must equal frozen version {required!r}")
+    if settings.get("semantic_prompt_version") != PROMPT_VERSION:
+        raise ValueError(
+            f"sector_sentiment.semantic_prompt_version must equal {PROMPT_VERSION!r}"
+        )
+    relevance_llm_enabled = bool(retrieval_settings.get(
+        "relevance_llm_enabled", settings.get("llm_enabled", False),
+    ))
+    if relevance_llm_enabled and not settings.get("relevance_llm_model"):
+        raise ValueError("sector_sentiment.relevance_llm_model is required when enabled")
+    if settings.get("llm_enabled", False) and not settings.get("semantic_llm_model"):
+        raise ValueError("sector_sentiment.semantic_llm_model is required when enabled")
+    frozen = {
+        **expected,
+        "mediacrawler_commit": commit.lower(),
+        "platforms": settings.get("platforms", ["bili", "dy"]),
+        "taxonomy": settings.get("taxonomy"),
+        "fallback_keywords": settings.get("keywords"),
+        "llm_enabled": bool(settings.get("llm_enabled", False)),
+        "relevance_llm_enabled": relevance_llm_enabled,
+        "relevance_llm_model": settings.get("relevance_llm_model"),
+        "semantic_llm_model": settings.get("semantic_llm_model"),
+        "semantic_prompt_version": PROMPT_VERSION,
+        "semantic_model_version": settings.get("llm_model_version"),
+        "collector_adapter_version": ADAPTER_VERSION,
+        "query_templates": retrieval_settings.get("query_templates"),
+        "max_queries_per_sector": retrieval_settings.get("max_queries_per_sector"),
+        "max_contents_per_query": retrieval_settings.get("max_contents_per_query"),
+        "max_comments_per_content": retrieval_settings.get("max_comments_per_content"),
+        "candidate_min_contents": retrieval_settings.get("candidate_min_contents"),
+        "candidate_min_sectors": retrieval_settings.get("candidate_min_sectors"),
+        "very_high_relevance": retrieval_settings.get("very_high_relevance"),
+        "high_engagement_thresholds": retrieval_settings.get("high_engagement_thresholds"),
+        "platform_engagement_thresholds": retrieval_settings.get(
+            "platform_engagement_thresholds"
+        ),
+        "creator_id_argument": retrieval_settings.get("creator_id_argument", "--creator_id"),
+        "finance_terms": list(FINANCE_TERMS),
+        "exclude_terms": list(EXCLUDE_TERMS),
+    }
+    payload = json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class SentimentStore:
@@ -64,7 +299,8 @@ class SentimentStore:
                     id INTEGER PRIMARY KEY,
                     platform TEXT NOT NULL, content_id TEXT NOT NULL,
                     comment_id TEXT NOT NULL DEFAULT '', published_at TEXT,
-                    collected_at TEXT NOT NULL, text TEXT NOT NULL,
+                    collected_at TEXT NOT NULL, trade_date TEXT, text TEXT NOT NULL,
+                    semantic_text TEXT NOT NULL DEFAULT '',
                     engagement REAL NOT NULL DEFAULT 0, url TEXT, batch_id TEXT,
                     author_hash TEXT, fingerprint TEXT NOT NULL,
                     repost_weight REAL NOT NULL DEFAULT 1.0,
@@ -118,9 +354,11 @@ class SentimentStore:
                 );
                 CREATE TABLE IF NOT EXISTS collection_runs (
                     run_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, coverage REAL NOT NULL,
-                    search_coverage REAL NOT NULL DEFAULT 0,
-                    creator_coverage REAL NOT NULL DEFAULT 0,
-                    platforms_json TEXT NOT NULL, funnel_json TEXT NOT NULL DEFAULT '{}',
+                    search_coverage REAL, creator_coverage REAL,
+                    platforms_json TEXT NOT NULL, funnel_json TEXT,
+                    query_version TEXT, relevance_version TEXT,
+                    creator_rule_version TEXT, semantic_prompt_version TEXT,
+                    config_hash TEXT, policy_cohort_id TEXT, cohort_start_date TEXT,
                     status TEXT NOT NULL, completed_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS creators (
@@ -131,18 +369,45 @@ class SentimentStore:
                     total_content_count INTEGER NOT NULL DEFAULT 0,
                     financial_ratio REAL NOT NULL DEFAULT 0,
                     sector_ids_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '[]',
-                    reviewed_at TEXT, last_collection_error TEXT,
+                    reviewed_at TEXT, approved_at TEXT, last_collection_error TEXT,
+                    creator_rule_version TEXT, config_hash TEXT,
                     PRIMARY KEY(platform, creator_id)
                 );
                 CREATE TABLE IF NOT EXISTS creator_content (
                     platform TEXT NOT NULL, creator_id TEXT NOT NULL, content_id TEXT NOT NULL,
                     relevance_score REAL NOT NULL, sector_ids_json TEXT NOT NULL DEFAULT '[]',
+                    relevance_decision TEXT NOT NULL DEFAULT 'accepted',
+                    relevance_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    query_version TEXT, relevance_version TEXT,
+                    creator_rule_version TEXT, config_hash TEXT,
+                    published_at TEXT, evidence_text TEXT, engagement REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY(platform, creator_id, content_id)
                 );
                 CREATE TABLE IF NOT EXISTS creator_events (
                     event_id TEXT PRIMARY KEY, platform TEXT NOT NULL, creator_id TEXT NOT NULL,
                     action TEXT NOT NULL, previous_status TEXT NOT NULL, new_status TEXT NOT NULL,
-                    actor TEXT NOT NULL, created_at TEXT NOT NULL
+                    actor TEXT NOT NULL, created_at TEXT NOT NULL,
+                    query_version TEXT, relevance_version TEXT,
+                    creator_rule_version TEXT, config_hash TEXT
+                );
+                CREATE TABLE IF NOT EXISTS collection_budgets (
+                    trade_date TEXT NOT NULL, job_key TEXT NOT NULL,
+                    mode TEXT NOT NULL, platform TEXT NOT NULL,
+                    max_contents INTEGER NOT NULL, max_comments_per_content INTEGER NOT NULL,
+                    consumed_contents INTEGER NOT NULL DEFAULT 0,
+                    consumed_comments INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL, config_hash TEXT,
+                    reserved_at TEXT NOT NULL, completed_at TEXT,
+                    PRIMARY KEY(trade_date, job_key)
+                );
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS policy_day_reservations (
+                    trade_date TEXT PRIMARY KEY, config_hash TEXT NOT NULL,
+                    policy_cohort_id TEXT NOT NULL, cohort_start_date TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    reserved_at TEXT NOT NULL, completed_at TEXT
                 );
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_scores)")}
@@ -161,10 +426,21 @@ class SentimentStore:
                 "retrieval_sector_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "author_id": "TEXT",
                 "author_name": "TEXT",
+                "trade_date": "TEXT",
+                "semantic_text": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in migrations.items():
                 if name not in content_columns:
                     conn.execute(f"ALTER TABLE content ADD COLUMN {name} {definition}")
+            conn.execute(
+                """UPDATE content SET trade_date=substr(collected_at,1,10)
+                   WHERE trade_date IS NULL OR trade_date=''"""
+            )
+            conn.execute(
+                """UPDATE content SET semantic_text=text
+                   WHERE semantic_text IS NULL OR semantic_text=''"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_content_trade_date ON content(trade_date)")
             outcome_columns = {row["name"] for row in conn.execute("PRAGMA table_info(outcomes)")}
             for name in ("price_baseline_hit", "heat_baseline_hit"):
                 if name not in outcome_columns:
@@ -172,14 +448,175 @@ class SentimentStore:
             collection_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(collection_runs)")
             }
+            legacy_collection_schema = "config_hash" not in collection_columns
+            missing_search_coverage = "search_coverage" not in collection_columns
+            missing_creator_coverage = "creator_coverage" not in collection_columns
             collection_migrations = {
-                "search_coverage": "REAL NOT NULL DEFAULT 0",
-                "creator_coverage": "REAL NOT NULL DEFAULT 0",
-                "funnel_json": "TEXT NOT NULL DEFAULT '{}'",
+                "search_coverage": "REAL",
+                "creator_coverage": "REAL",
+                "funnel_json": "TEXT",
+                "query_version": "TEXT",
+                "relevance_version": "TEXT",
+                "creator_rule_version": "TEXT",
+                "semantic_prompt_version": "TEXT",
+                "config_hash": "TEXT",
+                "policy_cohort_id": "TEXT",
+                "cohort_start_date": "TEXT",
             }
             for name, definition in collection_migrations.items():
                 if name not in collection_columns:
                     conn.execute(f"ALTER TABLE collection_runs ADD COLUMN {name} {definition}")
+            if missing_search_coverage:
+                conn.execute(
+                    """UPDATE collection_runs
+                       SET search_coverage=coverage WHERE search_coverage IS NULL"""
+                )
+            if missing_creator_coverage:
+                conn.execute(
+                    """UPDATE collection_runs
+                       SET creator_coverage=coverage WHERE creator_coverage IS NULL"""
+                )
+            if legacy_collection_schema:
+                conn.execute(
+                    """UPDATE collection_runs
+                       SET search_coverage=coverage, creator_coverage=coverage
+                       WHERE (funnel_json IS NULL OR funnel_json='{}')
+                         AND search_coverage=0 AND creator_coverage=0 AND coverage!=0"""
+                )
+            current_hash = current_cohort_id = current_start = None
+            cohort_rows = conn.execute(
+                """SELECT rowid, trade_date, config_hash, policy_cohort_id,
+                          cohort_start_date
+                   FROM collection_runs WHERE config_hash IS NOT NULL
+                   ORDER BY trade_date, rowid"""
+            ).fetchall()
+            for row in cohort_rows:
+                row_hash = str(row["config_hash"])
+                if row_hash != current_hash:
+                    current_hash = row_hash
+                    current_start = str(row["trade_date"])
+                    current_cohort_id = _policy_cohort_id(row_hash, current_start)
+                if not row["policy_cohort_id"] or not row["cohort_start_date"]:
+                    conn.execute(
+                        """UPDATE collection_runs
+                           SET policy_cohort_id=?, cohort_start_date=? WHERE rowid=?""",
+                        (current_cohort_id, current_start, row["rowid"]),
+                    )
+            for row in conn.execute(
+                """SELECT trade_date, config_hash, policy_cohort_id,
+                          cohort_start_date, status, completed_at
+                   FROM collection_runs WHERE config_hash IS NOT NULL
+                   ORDER BY trade_date, rowid DESC"""
+            ).fetchall():
+                start = str(row["cohort_start_date"] or row["trade_date"])
+                cohort_id = str(
+                    row["policy_cohort_id"]
+                    or _policy_cohort_id(str(row["config_hash"]), start)
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO policy_day_reservations
+                       (trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                        status, reserved_at, completed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row["trade_date"], row["config_hash"], cohort_id, start,
+                     row["status"], row["completed_at"] or _now(), row["completed_at"]),
+                )
+            creator_columns = {row["name"] for row in conn.execute("PRAGMA table_info(creators)")}
+            for name, definition in {
+                "approved_at": "TEXT",
+                "creator_rule_version": "TEXT",
+                "config_hash": "TEXT",
+            }.items():
+                if name not in creator_columns:
+                    conn.execute(f"ALTER TABLE creators ADD COLUMN {name} {definition}")
+            conn.execute(
+                """UPDATE creators SET approved_at=reviewed_at
+                   WHERE status='approved' AND approved_at IS NULL AND reviewed_at IS NOT NULL"""
+            )
+            creator_content_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(creator_content)")
+            }
+            for name, definition in {
+                "query_version": "TEXT",
+                "relevance_decision": "TEXT NOT NULL DEFAULT 'accepted'",
+                "relevance_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+                "relevance_version": "TEXT",
+                "creator_rule_version": "TEXT",
+                "config_hash": "TEXT",
+                "published_at": "TEXT",
+                "evidence_text": "TEXT",
+                "engagement": "REAL NOT NULL DEFAULT 0",
+            }.items():
+                if name not in creator_content_columns:
+                    conn.execute(f"ALTER TABLE creator_content ADD COLUMN {name} {definition}")
+            creator_event_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(creator_events)")
+            }
+            for name in ("query_version", "relevance_version", "creator_rule_version", "config_hash"):
+                if name not in creator_event_columns:
+                    conn.execute(f"ALTER TABLE creator_events ADD COLUMN {name} TEXT")
+            budget_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(collection_budgets)")
+            }
+            for name in ("consumed_contents", "consumed_comments"):
+                if name not in budget_columns:
+                    conn.execute(
+                        f"ALTER TABLE collection_budgets ADD COLUMN {name} "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+            privacy_migration = "sector_evidence_privacy_v1"
+            migrated = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name=?", (privacy_migration,),
+            ).fetchone()
+            if not migrated:
+                for row in conn.execute(
+                    """SELECT id, text, semantic_text, author_name,
+                              relevance_reasons_json FROM content"""
+                ).fetchall():
+                    conn.execute(
+                        """UPDATE content SET text=?, semantic_text=?, author_name=?,
+                                  relevance_reasons_json=? WHERE id=?""",
+                        (_redact_text(row["text"]), _redact_text(row["semantic_text"]),
+                         _redact_text(row["author_name"]) or None,
+                         json.dumps([
+                             _redact_text(reason, 200)
+                             for reason in _json_list(row["relevance_reasons_json"])
+                         ], ensure_ascii=False), row["id"]),
+                    )
+                for row in conn.execute(
+                    """SELECT rowid, evidence_text, relevance_reasons_json
+                       FROM creator_content"""
+                ).fetchall():
+                    conn.execute(
+                        """UPDATE creator_content SET evidence_text=?,
+                                  relevance_reasons_json=? WHERE rowid=?""",
+                        (_redact_text(row["evidence_text"], 200),
+                         json.dumps([
+                             _redact_text(reason, 200)
+                             for reason in _json_list(row["relevance_reasons_json"])
+                         ], ensure_ascii=False), row["rowid"]),
+                    )
+                for row in conn.execute(
+                    "SELECT rowid, display_name, evidence_json FROM creators"
+                ).fetchall():
+                    conn.execute(
+                        """UPDATE creators SET display_name=?, evidence_json=? WHERE rowid=?""",
+                        (_redact_text(row["display_name"]) or None,
+                         json.dumps(_sanitize_creator_evidence(row["evidence_json"]),
+                                    ensure_ascii=False), row["rowid"]),
+                    )
+                for row in conn.execute(
+                    "SELECT rowid, evidence_json FROM daily_scores"
+                ).fetchall():
+                    conn.execute(
+                        "UPDATE daily_scores SET evidence_json=? WHERE rowid=?",
+                        (json.dumps(_sanitize_score_evidence(row["evidence_json"]),
+                                    ensure_ascii=False), row["rowid"]),
+                    )
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                    (privacy_migration, _now()),
+                )
 
     def ingest(
         self, items: Iterable[dict], decisions: list[RelevanceDecision] | None = None,
@@ -194,17 +631,21 @@ class SentimentStore:
                 try:
                     conn.execute(
                         """INSERT INTO content
-                        (platform, content_id, comment_id, published_at, collected_at, text,
+                        (platform, content_id, comment_id, published_at, collected_at, trade_date,
+                         text, semantic_text,
                          engagement, url, batch_id, author_hash, fingerprint, retrieval_source,
                          retrieval_source_id, retrieval_sector_ids_json, author_id, author_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (item["platform"], str(item["content_id"]), str(item.get("comment_id") or ""),
-                         item.get("published_at"), item.get("collected_at") or _now(), item.get("text", ""),
+                         item.get("published_at"), item.get("collected_at") or _now(),
+                         item.get("trade_date") or str(item.get("collected_at") or _now())[:10],
+                         _redact_text(item.get("text", "")),
+                         _semantic_text(item),
                          float(item.get("engagement") or 0), item.get("url"), item.get("batch_id"),
                          item.get("author_hash"), fp, item.get("retrieval_source", "search"),
                          item.get("retrieval_source_id"),
                          json.dumps(item.get("sector_ids", []), ensure_ascii=False),
-                         item.get("author_id"), item.get("author_name")),
+                         item.get("author_id"), _redact_text(item.get("author_name")) or None),
                     )
                     inserted += 1
                     matches = conn.execute(
@@ -216,31 +657,34 @@ class SentimentStore:
                             [(row["id"],) for row in matches[1:]],
                         )
                 except sqlite3.IntegrityError:
-                    duplicates += 1
                     existing = conn.execute(
                         """SELECT retrieval_sector_ids_json FROM content
                            WHERE platform=? AND content_id=? AND comment_id=?""",
                         (item["platform"], str(item["content_id"]),
                          str(item.get("comment_id") or "")),
                     ).fetchone()
-                    if existing:
-                        sector_ids = sorted({
-                            *json.loads(existing["retrieval_sector_ids_json"] or "[]"),
-                            *(str(value) for value in item.get("sector_ids", []) if value),
-                        })
-                        conn.execute(
-                            """UPDATE content SET retrieval_sector_ids_json=?
-                               WHERE platform=? AND content_id=? AND comment_id=?""",
-                            (json.dumps(sector_ids, ensure_ascii=False), item["platform"],
-                             str(item["content_id"]), str(item.get("comment_id") or "")),
-                        )
+                    if existing is None:
+                        raise
+                    duplicates += 1
+                    sector_ids = sorted({
+                        *json.loads(existing["retrieval_sector_ids_json"] or "[]"),
+                        *(str(value) for value in item.get("sector_ids", []) if value),
+                    })
+                    conn.execute(
+                        """UPDATE content SET retrieval_sector_ids_json=?
+                           WHERE platform=? AND content_id=? AND comment_id=?""",
+                        (json.dumps(sector_ids, ensure_ascii=False), item["platform"],
+                         str(item["content_id"]), str(item.get("comment_id") or "")),
+                    )
             for item, decision in zip(records, decisions or []):
                 conn.execute(
                     """UPDATE content SET relevance_score=?, relevance_decision=?,
                        relevance_reasons_json=?, relevance_version=?
                        WHERE platform=? AND content_id=? AND comment_id=?""",
                     (decision.score, decision.decision,
-                     json.dumps(decision.reasons, ensure_ascii=False), decision.version,
+                     json.dumps([_redact_text(reason, 200) for reason in decision.reasons],
+                                ensure_ascii=False),
+                     decision.version,
                      item["platform"], str(item["content_id"]),
                      str(item.get("comment_id") or "")),
                 )
@@ -249,7 +693,7 @@ class SentimentStore:
     def list_content(self, trade_date: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM content WHERE substr(collected_at,1,10)=? ORDER BY id", (trade_date,)
+                "SELECT * FROM content WHERE trade_date=? ORDER BY id", (trade_date,)
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -262,7 +706,9 @@ class SentimentStore:
                    relevance_reasons_json=?, relevance_version=?
                    WHERE platform=? AND content_id=? AND comment_id=?""",
                 (decision.score, decision.decision,
-                 json.dumps(decision.reasons, ensure_ascii=False), decision.version,
+                 json.dumps([_redact_text(reason, 200) for reason in decision.reasons],
+                            ensure_ascii=False),
+                 decision.version,
                  platform, str(content_id), str(comment_id or "")),
             )
 
@@ -270,68 +716,130 @@ class SentimentStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT * FROM content
-                   WHERE substr(collected_at,1,10)=? AND relevance_decision='accepted'
+                   WHERE trade_date=? AND relevance_decision='accepted'
                    ORDER BY id""", (trade_date,)
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def accepted_search_records(self, trade_date: str) -> list[dict]:
-        """Return accepted search discoveries with their retrieval sector scope."""
+    def search_records(self, trade_date: str) -> list[dict]:
+        """Return all classified search rows for creator denominator accounting."""
         with self._connect() as conn:
             rows = conn.execute(
                 """SELECT * FROM content
-                   WHERE substr(collected_at,1,10)=? AND relevance_decision='accepted'
-                     AND retrieval_source='search'
-                   ORDER BY id""", (trade_date,)
+                   WHERE trade_date=? AND relevance_decision!='unclassified'
+                     AND retrieval_source='search' AND comment_id=''
+                   ORDER BY id""", (trade_date,),
             ).fetchall()
         records = [dict(row) for row in rows]
         for record in records:
             record["sector_ids"] = json.loads(record.pop("retrieval_sector_ids_json") or "[]")
+            record["relevance_reasons"] = json.loads(record["relevance_reasons_json"] or "[]")
         return records
 
-    def discover_creator_candidates(self, records: list[dict], settings: dict) -> dict[str, int]:
-        """Persist eligible creator evidence and add, but never approve, candidates.
+    def accepted_search_records(self, trade_date: str) -> list[dict]:
+        """Return accepted search discoveries with their retrieval sector scope."""
+        return [record for record in self.search_records(trade_date)
+                if record["relevance_decision"] == "accepted"]
 
-        Each source content key can count at most once.  Discovery deliberately
-        leaves reviewed records in their current state: approval is a human-only
-        transition performed by :meth:`moderate_creator`.
-        """
+    def retrieval_funnel(self, trade_date: str) -> dict:
+        """Compute idempotent daily funnel counts from unique persisted rows."""
+        with self._connect() as conn:
+            counts = conn.execute(
+                """SELECT count(*) AS raw_recalled,
+                          sum(CASE WHEN relevance_decision='accepted' THEN 1 ELSE 0 END)
+                              AS financial_relevant
+                   FROM content WHERE trade_date=? AND relevance_decision!='unclassified'""",
+                (trade_date,),
+            ).fetchone()
+            sources = conn.execute(
+                """SELECT retrieval_source, count(DISTINCT retrieval_source_id) AS n
+                   FROM content WHERE trade_date=? AND relevance_decision!='unclassified'
+                     AND retrieval_source_id IS NOT NULL
+                   GROUP BY retrieval_source""",
+                (trade_date,),
+            ).fetchall()
+        raw = int(counts["raw_recalled"] or 0)
+        accepted = int(counts["financial_relevant"] or 0)
+        by_source = {row["retrieval_source"]: int(row["n"]) for row in sources}
+        return {
+            "raw_recalled": raw,
+            "financial_relevant": accepted,
+            "filtered": raw - accepted,
+            "search_sources": by_source.get("search", 0),
+            "creator_sources": by_source.get("creator", 0),
+        }
+
+    def discover_creator_candidates(self, records: list[dict], settings: dict) -> dict[str, int]:
+        """Account for all unique author content and create manual-review candidates."""
         minimum = int(settings.get("candidate_min_contents", 3))
         minimum_sectors = int(settings.get("candidate_min_sectors", 2))
         very_high = float(settings.get("very_high_relevance", 0.9))
         thresholds = settings.get(
             "platform_engagement_thresholds", settings.get("high_engagement_thresholds", {})
         )
+        query_version = str(settings.get("query_version") or QUERY_VERSION)
+        relevance_version = str(settings.get("relevance_version") or RELEVANCE_VERSION)
+        creator_rule_version = str(
+            settings.get("creator_rule_version") or CREATOR_RULE_VERSION
+        )
+        config_hash = str(settings.get("config_hash") or "") or None
         created = updated = 0
-        seen_creators: dict[tuple[str, str], list[dict]] = {}
+        seen_creators: dict[tuple[str, str], dict[str, Any]] = {}
         with self._connect() as conn:
             for record in records:
                 platform = str(record.get("platform") or "")
                 creator_id = str(record.get("author_id") or "")
                 content_id = str(record.get("content_id") or "")
                 score = float(record.get("relevance_score") or 0)
-                decision = record.get("relevance_decision")
-                eligible = decision == "accepted" if decision is not None else score >= 0.7
-                if not (platform and creator_id and content_id and eligible):
+                decision = str(record.get("relevance_decision") or (
+                    "accepted" if score >= 0.7 else "filtered_non_financial"
+                ))
+                if not (platform and creator_id and content_id):
                     continue
                 sectors = sorted({str(value) for value in record.get("sector_ids", []) if value})
-                conn.execute(
-                    """INSERT OR IGNORE INTO creator_content
-                    (platform, creator_id, content_id, relevance_score, sector_ids_json)
-                    VALUES (?, ?, ?, ?, ?)""",
-                    (platform, creator_id, content_id, score, json.dumps(sectors, ensure_ascii=False)),
+                reasons = record.get("relevance_reasons") or []
+                existing_content = conn.execute(
+                    """SELECT * FROM creator_content
+                       WHERE platform=? AND creator_id=? AND content_id=?""",
+                    (platform, creator_id, content_id),
+                ).fetchone()
+                new_content = existing_content is None
+                if new_content:
+                    conn.execute(
+                        """INSERT INTO creator_content
+                        (platform, creator_id, content_id, relevance_score, sector_ids_json,
+                         relevance_decision, relevance_reasons_json, query_version,
+                         relevance_version, creator_rule_version, config_hash, published_at,
+                         evidence_text, engagement)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (platform, creator_id, content_id, score,
+                         json.dumps(sectors, ensure_ascii=False), decision,
+                         json.dumps([_redact_text(reason, 200) for reason in reasons],
+                                    ensure_ascii=False),
+                         query_version, relevance_version, creator_rule_version,
+                         config_hash, record.get("published_at"),
+                         _redact_text(record.get("text"), 200),
+                         float(record.get("engagement") or 0)),
+                    )
+                entry = seen_creators.setdefault(
+                    (platform, creator_id), {"records": [], "has_new_content": False},
                 )
-                seen_creators.setdefault((platform, creator_id), []).append(record)
+                entry["records"].append(record)
+                entry["has_new_content"] = entry["has_new_content"] or new_content
 
-            for (platform, creator_id), creator_records in seen_creators.items():
+            for (platform, creator_id), discovery in seen_creators.items():
+                creator_records = discovery["records"]
                 evidence_rows = conn.execute(
-                    """SELECT content_id, relevance_score, sector_ids_json FROM creator_content
-                    WHERE platform=? AND creator_id=? ORDER BY content_id""",
+                    """SELECT rowid, * FROM creator_content
+                    WHERE platform=? AND creator_id=? ORDER BY rowid""",
                     (platform, creator_id),
                 ).fetchall()
-                sector_ids = sorted({sector for row in evidence_rows
+                valid_rows = [row for row in evidence_rows
+                              if row["relevance_decision"] == "accepted"]
+                sector_ids = sorted({sector for row in valid_rows
                                      for sector in json.loads(row["sector_ids_json"])})
-                valid_count = len(evidence_rows)
+                valid_count = len(valid_rows)
+                total_count = len(evidence_rows)
                 configured_threshold = thresholds.get(
                     platform, settings.get("high_engagement_threshold", float("inf"))
                 ) if isinstance(thresholds, dict) else settings.get("high_engagement_threshold", thresholds)
@@ -339,9 +847,9 @@ class SentimentStore:
                     configured_threshold = configured_threshold.get("high_engagement_threshold", float("inf"))
                 platform_threshold = float(configured_threshold)
                 high_signal = any(
-                    float(record.get("relevance_score") or 0) >= very_high and
-                    float(record.get("engagement") or 0) >= platform_threshold
-                    for record in creator_records
+                    float(row["relevance_score"] or 0) >= very_high and
+                    float(row["engagement"] or 0) >= platform_threshold
+                    for row in valid_rows
                 )
                 qualifies = (
                     valid_count >= minimum
@@ -357,19 +865,30 @@ class SentimentStore:
                 now = _now()
                 display_name = next((record.get("author_name") for record in creator_records
                                      if record.get("author_name")), None)
-                evidence = [{"content_id": row["content_id"],
-                             "text": str(next((record.get("text") for record in creator_records
-                                               if str(record.get("content_id")) == row["content_id"]), ""))[:200]}
-                            for row in evidence_rows[-3:]]
+                evidence = [{
+                    "text": _redact_text(row["evidence_text"], 200),
+                    "published_at": row["published_at"],
+                    "relevance_score": float(row["relevance_score"]),
+                    "reasons": json.loads(row["relevance_reasons_json"] or "[]"),
+                    "query_version": row["query_version"] or query_version,
+                    "relevance_version": row["relevance_version"] or relevance_version,
+                    "creator_rule_version": row["creator_rule_version"] or creator_rule_version,
+                    "config_hash": row["config_hash"] or config_hash,
+                } for row in valid_rows[-3:]]
                 if existing:
+                    if not discovery["has_new_content"]:
+                        continue
                     conn.execute(
                         """UPDATE creators SET display_name=COALESCE(?, display_name),
                            last_discovered_at=?, valid_content_count=?, total_content_count=?,
-                           financial_ratio=?, sector_ids_json=?, evidence_json=?
+                           financial_ratio=?, sector_ids_json=?, evidence_json=?,
+                           creator_rule_version=?, config_hash=?
                            WHERE platform=? AND creator_id=?""",
-                        (display_name, now, valid_count, valid_count, 1.0 if valid_count else 0.0,
-                         json.dumps(sector_ids, ensure_ascii=False), json.dumps(evidence, ensure_ascii=False),
-                         platform, creator_id),
+                        (_redact_text(display_name) or None, now, valid_count, total_count,
+                         valid_count / total_count if total_count else 0.0,
+                         json.dumps(sector_ids, ensure_ascii=False),
+                         json.dumps(evidence, ensure_ascii=False), creator_rule_version,
+                         config_hash, platform, creator_id),
                     )
                     updated += 1
                 else:
@@ -377,11 +896,15 @@ class SentimentStore:
                         """INSERT INTO creators
                         (platform, creator_id, display_name, status, first_discovered_at,
                          last_discovered_at, valid_content_count, total_content_count,
-                         financial_ratio, sector_ids_json, evidence_json)
-                        VALUES (?, ?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?)""",
-                        (platform, creator_id, display_name, now, now, valid_count, valid_count,
-                         1.0 if valid_count else 0.0, json.dumps(sector_ids, ensure_ascii=False),
-                         json.dumps(evidence, ensure_ascii=False)),
+                         financial_ratio, sector_ids_json, evidence_json,
+                         creator_rule_version, config_hash)
+                        VALUES (?, ?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (platform, creator_id, _redact_text(display_name) or None, now, now,
+                         valid_count, total_count,
+                         valid_count / total_count if total_count else 0.0,
+                         json.dumps(sector_ids, ensure_ascii=False),
+                         json.dumps(evidence, ensure_ascii=False), creator_rule_version,
+                         config_hash),
                     )
                     created += 1
         return {"created": created, "updated": updated}
@@ -398,7 +921,18 @@ class SentimentStore:
 
     def approved_creators(self, platform: str | None = None) -> list[dict]:
         creators = self.list_creators("approved")
-        return [creator for creator in creators if platform is None or creator["platform"] == platform]
+        selected = [creator for creator in creators
+                    if platform is None or creator["platform"] == platform]
+        with self._connect() as conn:
+            for creator in selected:
+                locator = conn.execute(
+                    """SELECT content_id FROM creator_content
+                       WHERE platform=? AND creator_id=? AND relevance_decision='accepted'
+                       ORDER BY rowid DESC LIMIT 1""",
+                    (creator["platform"], creator["creator_id"]),
+                ).fetchone()
+                creator["crawl_locator"] = str(locator["content_id"]) if locator else None
+        return selected
 
     def set_creator_collection_error(
         self, platform: str, creator_id: str, error: str | None,
@@ -421,18 +955,23 @@ class SentimentStore:
                 "SELECT * FROM creators WHERE platform=? AND creator_id=?", (platform, creator_id)
             ).fetchone()
             if row is None:
-                raise KeyError((platform, creator_id))
+                raise CreatorNotFoundError(platform, creator_id)
             now = _now()
             new_status = transitions[action]
             conn.execute(
-                "UPDATE creators SET status=?, reviewed_at=? WHERE platform=? AND creator_id=?",
-                (new_status, now, platform, creator_id),
+                """UPDATE creators SET status=?, reviewed_at=?,
+                   approved_at=CASE WHEN ?='approve' THEN COALESCE(approved_at, ?) ELSE approved_at END
+                   WHERE platform=? AND creator_id=?""",
+                (new_status, now, action, now, platform, creator_id),
             )
             conn.execute(
                 """INSERT INTO creator_events
-                (event_id, platform, creator_id, action, previous_status, new_status, actor, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (uuid.uuid4().hex, platform, creator_id, action, row["status"], new_status, actor, now),
+                (event_id, platform, creator_id, action, previous_status, new_status, actor,
+                 created_at, query_version, relevance_version, creator_rule_version, config_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (uuid.uuid4().hex, platform, creator_id, action, row["status"], new_status,
+                 actor, now, QUERY_VERSION, RELEVANCE_VERSION,
+                 row["creator_rule_version"] or CREATOR_RULE_VERSION, row["config_hash"]),
             )
             updated = conn.execute(
                 "SELECT * FROM creators WHERE platform=? AND creator_id=?", (platform, creator_id)
@@ -464,7 +1003,8 @@ class SentimentStore:
                  float(score.get("consensus_crowding", 0)), float(score.get("market_divergence", 0)),
                  float(score.get("short_risk", 0)), float(score.get("swing_risk", 0)),
                  json.dumps(score.get("platform_contributions", {}), ensure_ascii=False),
-                 json.dumps(score.get("evidence", []), ensure_ascii=False),
+                 json.dumps(_sanitize_score_evidence(score.get("evidence", [])),
+                            ensure_ascii=False),
                  score.get("model_version", MODEL_VERSION), score.get("rule_version", RULE_VERSION),
                  float(score.get("attention_raw", 0)), float(score.get("sentiment_raw", 0))),
             )
@@ -573,37 +1113,229 @@ class SentimentStore:
             )
 
     def record_collection(self, report: dict) -> None:
+        cohort = None
+        if report.get("config_hash"):
+            cohort = self.reserve_policy_day(
+                report["trade_date"], str(report["config_hash"]),
+            )
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO collection_runs
                 (run_id, trade_date, coverage, search_coverage, creator_coverage,
-                 platforms_json, funnel_json, status, completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 platforms_json, funnel_json, query_version, relevance_version,
+                 creator_rule_version, semantic_prompt_version, config_hash,
+                 policy_cohort_id, cohort_start_date, status, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (uuid.uuid4().hex, report["trade_date"], float(report["coverage"]),
                  float(report.get("search_coverage", report["coverage"])),
                  float(report.get("creator_coverage", report["coverage"])),
                  json.dumps(report.get("platforms", {}), ensure_ascii=False),
-                 json.dumps(report.get("funnel", {}), ensure_ascii=False),
+                 json.dumps(report.get("funnel"), ensure_ascii=False),
+                 report.get("query_version"), report.get("relevance_version"),
+                 report.get("creator_rule_version"), report.get("semantic_prompt_version"),
+                 report.get("config_hash"),
+                 report.get("policy_cohort_id") or (cohort or {}).get("policy_cohort_id"),
+                 report.get("cohort_start_date") or (cohort or {}).get("cohort_start_date"),
                  "ok" if report["coverage"] == 1 else "degraded", _now()),
             )
+            if report.get("config_hash"):
+                conn.execute(
+                    """UPDATE policy_day_reservations SET status=?, completed_at=?
+                       WHERE trade_date=? AND config_hash=?""",
+                    ("ok" if report["coverage"] == 1 else "degraded", _now(),
+                     report["trade_date"], report["config_hash"]),
+                )
+
+    def reserve_policy_day(self, trade_date: str, config_hash: str) -> dict[str, str]:
+        """Bind a date to one policy before budgets, collection or ingest can mutate state."""
+        cohort = self.resolve_policy_cohort(trade_date, config_hash)
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO policy_day_reservations
+                   (trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                    status, reserved_at)
+                   VALUES (?, ?, ?, ?, 'running', ?)""",
+                (trade_date, config_hash, cohort["policy_cohort_id"],
+                 cohort["cohort_start_date"], _now()),
+            )
+            row = conn.execute(
+                """SELECT config_hash, policy_cohort_id, cohort_start_date
+                   FROM policy_day_reservations WHERE trade_date=?""",
+                (trade_date,),
+            ).fetchone()
+        if row is None or row["config_hash"] != config_hash:
+            raise ValueError(
+                "sector sentiment trade date is reserved by a conflicting policy"
+            )
+        return {
+            "policy_cohort_id": str(row["policy_cohort_id"]),
+            "cohort_start_date": str(row["cohort_start_date"]),
+        }
+
+    def resolve_policy_cohort(self, trade_date: str, config_hash: str) -> dict[str, str]:
+        """Resolve the audited cohort while enforcing 60 trading-date freezes."""
+        target = date.fromisoformat(trade_date)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT trade_date, config_hash, policy_cohort_id, cohort_start_date
+                   FROM (
+                       SELECT trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                              0 AS source_priority, rowid AS source_sequence
+                       FROM collection_runs WHERE config_hash IS NOT NULL
+                       UNION ALL
+                       SELECT trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                              1 AS source_priority, rowid AS source_sequence
+                       FROM policy_day_reservations
+                   )
+                   ORDER BY trade_date, source_priority, source_sequence"""
+            ).fetchall()
+        by_date: dict[date, dict[str, str]] = {}
+        for row in rows:
+            try:
+                run_date = date.fromisoformat(str(row["trade_date"]))
+            except ValueError:
+                continue
+            row_hash = str(row["config_hash"])
+            start = str(row["cohort_start_date"] or row["trade_date"])
+            by_date[run_date] = {
+                "config_hash": row_hash,
+                "policy_cohort_id": str(
+                    row["policy_cohort_id"] or _policy_cohort_id(row_hash, start)
+                ),
+                "cohort_start_date": start,
+            }
+        if not by_date:
+            return {
+                "policy_cohort_id": _policy_cohort_id(config_hash, trade_date),
+                "cohort_start_date": trade_date,
+            }
+
+        ordered_dates = sorted(by_date)
+        if target <= ordered_dates[-1]:
+            required_date = next(run_date for run_date in ordered_dates if run_date >= target)
+            required = by_date[required_date]
+            if required["config_hash"] != config_hash:
+                raise ValueError(
+                    "sector sentiment retrieval policy is frozen for this historical cohort"
+                )
+            return {
+                "policy_cohort_id": required["policy_cohort_id"],
+                "cohort_start_date": required["cohort_start_date"],
+            }
+
+        current = by_date[ordered_dates[-1]]
+        current_hash = current["config_hash"]
+        if config_hash == current_hash:
+            return {
+                "policy_cohort_id": current["policy_cohort_id"],
+                "cohort_start_date": current["cohort_start_date"],
+            }
+        cohort_size = sum(
+            value["policy_cohort_id"] == current["policy_cohort_id"]
+            for value in by_date.values()
+        )
+        if cohort_size < 60:
+            raise ValueError(
+                "sector sentiment retrieval policy is frozen until 60 trading dates complete"
+            )
+        return {
+            "policy_cohort_id": _policy_cohort_id(config_hash, trade_date),
+            "cohort_start_date": trade_date,
+        }
+
+    def validate_frozen_policy(self, trade_date: str, config_hash: str) -> None:
+        self.resolve_policy_cohort(trade_date, config_hash)
 
     def collection_summary(self, trade_date: str | None = None) -> dict:
         with self._connect() as conn:
             if trade_date:
                 row = conn.execute(
-                    "SELECT * FROM collection_runs WHERE trade_date=? ORDER BY completed_at DESC LIMIT 1",
+                    """SELECT * FROM collection_runs WHERE trade_date=?
+                       ORDER BY completed_at DESC, rowid DESC LIMIT 1""",
                     (trade_date,),
                 ).fetchone()
             else:
-                row = conn.execute("SELECT * FROM collection_runs ORDER BY trade_date DESC, completed_at DESC LIMIT 1").fetchone()
-            days = conn.execute("SELECT count(DISTINCT trade_date) AS n FROM collection_runs").fetchone()["n"]
+                row = conn.execute(
+                    """SELECT * FROM collection_runs
+                       ORDER BY trade_date DESC, completed_at DESC, rowid DESC LIMIT 1"""
+                ).fetchone()
+            if row and row["policy_cohort_id"]:
+                days = conn.execute(
+                    """SELECT count(DISTINCT trade_date) AS n FROM collection_runs
+                       WHERE policy_cohort_id=?""",
+                    (row["policy_cohort_id"],),
+                ).fetchone()["n"]
+            else:
+                days = conn.execute(
+                    "SELECT count(DISTINCT trade_date) AS n FROM collection_runs"
+                ).fetchone()["n"]
         if not row:
             return {"trading_days": days, "coverage": 0.0, "status": "no_data", "trade_date": trade_date}
         value = dict(row)
         value["trading_days"] = days
         value["platforms"] = json.loads(value.pop("platforms_json"))
-        value["funnel"] = json.loads(value.pop("funnel_json"))
+        funnel = json.loads(value.pop("funnel_json") or "null")
+        value["funnel"] = funnel or None
         return value
+
+    def reserve_collection_budget(
+        self, trade_date: str, job: RetrievalJob, limits: dict,
+    ) -> bool:
+        """Atomically reserve the one allowed invocation for a date/job pair."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO collection_budgets
+                   (trade_date, job_key, mode, platform, max_contents,
+                    max_comments_per_content, status, config_hash, reserved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?)""",
+                (trade_date, job.budget_key, job.mode, job.platform,
+                 max(0, int(limits.get("max_contents", 0))),
+                 max(0, int(limits.get("max_comments", 0))),
+                 job.config_hash, _now()),
+            )
+        return cursor.rowcount == 1
+
+    def complete_collection_budget(
+        self, trade_date: str, job: RetrievalJob, status: str, *,
+        consumed_contents: int = 0, consumed_comments: int = 0,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE collection_budgets SET status=?, completed_at=?,
+                          consumed_contents=?, consumed_comments=?
+                   WHERE trade_date=? AND job_key=?""",
+                (status, _now(), max(0, int(consumed_contents)),
+                 max(0, int(consumed_comments)), trade_date, job.budget_key),
+            )
+
+    def set_collection_budget_status(
+        self, trade_date: str, job_key: str, status: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE collection_budgets SET status=?, completed_at=?
+                   WHERE trade_date=? AND job_key=?""",
+                (status, _now(), trade_date, job_key),
+            )
+
+    def collection_budget(self, trade_date: str, job: RetrievalJob) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM collection_budgets
+                   WHERE trade_date=? AND job_key=?""",
+                (trade_date, job.budget_key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def collection_budgets(self, trade_date: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT trade_date, job_key, mode, platform, max_contents,
+                          max_comments_per_content, status, config_hash
+                   FROM collection_budgets WHERE trade_date=? ORDER BY rowid""",
+                (trade_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def collection_dates(self) -> list[str]:
         with self._connect() as conn:
@@ -611,8 +1343,17 @@ class SentimentStore:
         return [row["trade_date"] for row in rows]
 
     def validation_rows(self) -> list[dict]:
+        current = self.collection_summary()
+        cohort_start = current.get("cohort_start_date")
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM outcomes ORDER BY signal_date").fetchall()
+            if cohort_start:
+                rows = conn.execute(
+                    """SELECT * FROM outcomes WHERE signal_date>=?
+                       ORDER BY signal_date""",
+                    (cohort_start,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM outcomes ORDER BY signal_date").fetchall()
         return [dict(row) for row in rows]
 
 
@@ -620,14 +1361,14 @@ def _decode_score(row: sqlite3.Row) -> dict:
     value = dict(row)
     value["platforms"] = json.loads(value.pop("platforms_json"))
     value["platform_contributions"] = json.loads(value.pop("platform_contributions_json"))
-    value["evidence"] = json.loads(value.pop("evidence_json"))
+    value["evidence"] = _sanitize_score_evidence(value.pop("evidence_json"))
     return value
 
 
 def _decode_creator(row: sqlite3.Row) -> dict:
     value = dict(row)
     value["sector_ids"] = json.loads(value.pop("sector_ids_json"))
-    value["evidence"] = json.loads(value.pop("evidence_json"))
+    value["evidence"] = _sanitize_creator_evidence(value.pop("evidence_json"))
     return value
 
 
@@ -716,7 +1457,7 @@ def build_daily_score(*, trade_date: str, sector_id: str, sector_name: str,
         "consensus_crowding": bullish_consensus, "market_divergence": divergence,
         "short_risk": short_risk, "swing_risk": swing_risk,
         "platform_contributions": contributions,
-        "evidence": [{"platform": row["platform"], "text": str(row.get("text", ""))[:160],
+        "evidence": [{"platform": row["platform"], "text": _redact_text(row.get("text", ""), 160),
                       "stance": row.get("stance", 0)} for row in evidence[:8]],
         "attention_raw": attention_raw,
         "sentiment_raw": max(0.0, net_sentiment) * 0.7 + fomo * 0.3,
@@ -873,21 +1614,52 @@ def default_mediacrawler_runner(
     def run(job: RetrievalJob, destination: Path, timeout: int, limits: dict) -> None:
         if not (root / "main.py").exists():
             raise FileNotFoundError(f"MediaCrawler not found: {root}")
+        if job.mode == "creator" and not job.cutoff:
+            raise ValueError("creator retrieval requires an immutable approval cutoff")
+        if job.mode == "creator" and not job.crawl_locator:
+            raise ValueError("creator retrieval requires a verified content locator")
         if commit:
             actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
                                     text=True, check=True, timeout=10).stdout.strip()
             if actual != commit:
                 raise RuntimeError(f"MediaCrawler commit mismatch: expected {commit}, got {actual}")
-        before = {path: path.stat().st_mtime_ns for path in root.rglob("*.jsonl")}
-        cmd = [str(root / ".venv" / "bin" / "python"), "main.py", "--platform", job.platform,
-               "--type", job.mode]
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=root, capture_output=True, text=True, check=True, timeout=10,
+            ).stdout.strip()
+            if dirty:
+                raise RuntimeError("MediaCrawler working tree is dirty; pinned code is not immutable")
+        max_contents = max(0, int(limits.get("max_contents", 20)))
+        max_comments = max(0, int(limits.get("max_comments", 50)))
+        stage = destination.parent / f".{destination.name}.mediacrawler"
+        stage.mkdir(parents=True, exist_ok=False)
+        entrypoint = (
+            Path(__file__).with_name("mediacrawler_bounded.py")
+            if job.mode == "creator" else Path("main.py")
+        )
+        cmd = [str(root / ".venv" / "bin" / "python"), str(entrypoint),
+               "--platform", job.platform,
+               "--type", job.mode,
+               "--crawler_max_notes_count", str(max_contents),
+               "--max_comments_count_singlenotes", str(max_comments),
+               "--get_comment", "true" if max_comments else "false",
+               "--get_sub_comment", "false",
+               "--max_concurrency_num", "1",
+               "--save_data_option", "jsonl",
+               "--save_data_path", str(stage)]
         if job.mode == "search":
             cmd.extend(["--keywords", job.value])
         else:
-            cmd.extend([creator_id_argument, job.value])
-        subprocess.run(cmd, cwd=root, check=True, timeout=timeout)
-        candidates = [path for path in root.rglob("*.jsonl")
-                      if path.stat().st_mtime_ns > before.get(path, -1)]
+            cmd.extend([creator_id_argument, str(job.crawl_locator)])
+        process_env = None
+        if job.mode == "creator":
+            process_env = os.environ.copy()
+            process_env.update({
+                "APEX_CREATOR_CONTENT_ID": str(job.crawl_locator),
+                "APEX_APPROVED_CREATOR_HASH": job.value,
+            })
+        subprocess.run(cmd, cwd=root, check=True, timeout=timeout, env=process_env)
+        candidates = list(stage.rglob("*.jsonl"))
         if not candidates:
             raise RuntimeError("collector finished without new JSONL output")
         normalized_rows = []
@@ -895,7 +1667,15 @@ def default_mediacrawler_runner(
             for line in source.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
-                normalized = normalize_external_record(json.loads(line), job.platform)
+                try:
+                    raw = json.loads(line)
+                    if not isinstance(raw, dict):
+                        continue
+                    normalized = normalize_external_record(
+                        raw, job.platform, trade_date=job.trade_date,
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
+                    continue
                 if normalized:
                     normalized.update(
                         retrieval_source=job.mode,
@@ -904,8 +1684,21 @@ def default_mediacrawler_runner(
                     )
                     normalized_rows.append(normalized)
 
-        max_contents = max(0, int(limits.get("max_contents", 20)))
-        max_comments = max(0, int(limits.get("max_comments", 50)))
+        if job.mode == "creator":
+            parent_cutoffs = _creator_parent_cutoffs(normalized_rows, job.cutoff)
+            allowed_rows = []
+            for normalized in normalized_rows:
+                reason = _creator_record_cutoff_reason(
+                    normalized, job.cutoff, parent_cutoffs,
+                )
+                if reason:
+                    continue
+                normalized["published_at"] = _normalized_timestamp(
+                    normalized["published_at"]
+                )
+                allowed_rows.append(normalized)
+            normalized_rows = allowed_rows
+
         ordered_content_ids = list(dict.fromkeys(
             row["content_id"] for row in normalized_rows if not row["comment_id"]
         ))
@@ -935,7 +1728,9 @@ def default_mediacrawler_runner(
     return run
 
 
-def normalize_external_record(raw: dict, platform: str) -> dict | None:
+def normalize_external_record(
+    raw: dict, platform: str, *, trade_date: str | None = None,
+) -> dict | None:
     """Map common MediaCrawler content/comment fields into Apex's canonical contract."""
     content_id = next((raw.get(key) for key in
                        ("content_id", "aweme_id", "video_id", "note_id", "id") if raw.get(key)), None)
@@ -944,15 +1739,25 @@ def normalize_external_record(raw: dict, platform: str) -> dict | None:
                  ("text", "content", "comment_content", "title", "desc") if raw.get(key)), "")
     if not content_id or not text:
         return None
-    author = next((raw.get(key) for key in ("user_id", "author_id", "uid") if raw.get(key)), None)
+    author = next((raw.get(key) for key in
+                   ("creator_hash", "user_id", "author_id", "uid") if raw.get(key)), None)
+    raw_engagement = next((
+        raw.get(key) for key in ("engagement", "like_count", "liked_count")
+        if raw.get(key) not in (None, "")
+    ), 0)
+    if isinstance(raw_engagement, bool):
+        raise ValueError("engagement must be a non-negative finite number")
+    engagement = float(raw_engagement)
+    if not math.isfinite(engagement) or engagement < 0:
+        raise ValueError("engagement must be a non-negative finite number")
     return {
         "platform": platform, "content_id": str(content_id), "comment_id": str(comment_id),
         "published_at": raw.get("published_at") or raw.get("create_time"),
-        "collected_at": _now(), "text": str(text),
+        "collected_at": _now(), "trade_date": trade_date, "text": str(text),
         "title": raw.get("title") or "",
         "description": raw.get("description") or raw.get("desc") or "",
         "tags": raw.get("tags") or [],
-        "engagement": float(raw.get("engagement") or raw.get("like_count") or raw.get("liked_count") or 0),
+        "engagement": engagement,
         "url": raw.get("url") or raw.get("note_url") or raw.get("video_url"),
         "batch_id": raw.get("batch_id"),
         "author_hash": hashlib.sha256(str(author).encode()).hexdigest() if author else None,
@@ -984,27 +1789,73 @@ def collect_external(*, platforms: list[str], keywords: list[str], raw_dir: str 
 
 def collect_jobs(jobs: list[RetrievalJob], runner: Callable, raw_dir: str | Path,
                  trade_date: str, limits: dict, timeout: int = 900,
-                 empty_coverage: float = 1.0) -> dict:
+                 empty_coverage: float = 1.0, *,
+                 store: SentimentStore | None = None) -> dict:
     """Run typed retrieval jobs independently and retain every successful output."""
     base = Path(raw_dir) / trade_date
     base.mkdir(parents=True, exist_ok=True)
     statuses = []
     for job in jobs:
+        if job.trade_date is not None and job.trade_date != trade_date:
+            raise ValueError("retrieval job trade_date does not match collection trade_date")
         destination = base / f"{job.platform}-{job.mode}-{uuid.uuid4().hex}.jsonl"
         status = {
             "platform": job.platform, "mode": job.mode, "value": job.value,
             "source_id": job.source_id, "sector_ids": list(job.sector_ids),
+            "trade_date": trade_date, "cutoff": job.cutoff,
+            "config_hash": job.config_hash, "budget_key": job.budget_key,
         }
+        if store is not None and not store.reserve_collection_budget(trade_date, job, limits):
+            prior = store.collection_budget(trade_date, job) or {}
+            expected_contents = max(0, int(limits.get("max_contents", 0)))
+            expected_comments = max(0, int(limits.get("max_comments", 0)))
+            compatible = (
+                prior.get("config_hash") == job.config_hash
+                and prior.get("max_contents") == expected_contents
+                and prior.get("max_comments_per_content") == expected_comments
+            )
+            reused = compatible and prior.get("status") == "completed"
+            conflict = not compatible
+            statuses.append({
+                **status,
+                "status": (
+                    "budget_config_mismatch" if conflict
+                    else "budget_reused" if reused else "budget_exhausted"
+                ),
+                "records": 0,
+            })
+            continue
         try:
             runner(job, destination, timeout, limits)
-            count = sum(1 for line in destination.read_text(encoding="utf-8").splitlines()
-                        if line.strip())
+            lines = [line for line in destination.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+            count = len(lines)
+            content_ids: set[str] = set()
+            comment_count = 0
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("content_id"):
+                    content_ids.add(str(record["content_id"]))
+                if record.get("comment_id"):
+                    comment_count += 1
             statuses.append({**status, "status": "ok", "records": count,
                              "path": str(destination)})
+            if store is not None:
+                store.complete_collection_budget(
+                    trade_date, job, "collected",
+                    consumed_contents=len(content_ids), consumed_comments=comment_count,
+                )
         except Exception as exc:
             statuses.append({**status, "status": "failed", "records": 0,
                              "error": f"{type(exc).__name__}: {exc}"})
-    successful = sum(item["status"] == "ok" for item in statuses)
+            if store is not None:
+                store.complete_collection_budget(trade_date, job, "failed")
+    successful = sum(item["status"] in {"ok", "budget_reused"} for item in statuses)
     return {
         "trade_date": trade_date,
         "jobs": statuses,
@@ -1013,8 +1864,13 @@ def collect_jobs(jobs: list[RetrievalJob], runner: Callable, raw_dir: str | Path
     }
 
 
-def _ingest_and_classify_relevance(report: dict, store: SentimentStore,
-                                   taxonomy: list[dict]) -> dict:
+def _ingest_and_classify_relevance(
+    report: dict, store: SentimentStore, taxonomy: list[dict], *,
+    relevance_llm_classifier: Callable | None = None,
+    relevance_llm_enabled: bool = False,
+    relevance_version: str = RELEVANCE_VERSION,
+    relevance_llm_model: str = "deepseek-chat",
+) -> dict:
     """Ingest successful job outputs, then persist finance relevance decisions."""
     sector_terms = list(dict.fromkeys(
         term for sector in taxonomy
@@ -1024,40 +1880,118 @@ def _ingest_and_classify_relevance(report: dict, store: SentimentStore,
     totals = {"inserted": 0, "duplicates": 0}
     raw_recalled = accepted = 0
     source_ids: set[str] = set()
+    quarantined = 0
+    quarantine_reasons: dict[str, int] = {}
+    if relevance_llm_classifier is None:
+        def relevance_llm_classifier(record: dict, terms: list[str], version: str):
+            return llm_financial_relevance(
+                record, terms, version, model=relevance_llm_model,
+            )
+
+    def quarantine(reason: str) -> None:
+        nonlocal quarantined
+        quarantined += 1
+        quarantine_reasons[reason] = quarantine_reasons.get(reason, 0) + 1
+
     for item in report["jobs"]:
         if item["status"] != "ok":
             continue
         try:
             path = Path(item["path"])
-            records = [
-                json.loads(line)
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
+            records = []
             decisions = []
-            for record in records:
+            candidates = []
+            item_quarantine_start = quarantined
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    quarantine("invalid_json")
+                    continue
+                if not isinstance(record, dict):
+                    quarantine("canonical_record_not_object")
+                    continue
                 missing = [field for field in ("platform", "content_id", "text")
                            if not record.get(field)]
                 if missing:
-                    raise ValueError(f"canonical record missing: {', '.join(missing)}")
+                    quarantine("canonical_missing_" + "_".join(missing))
+                    continue
                 record["retrieval_source"] = item["mode"]
                 record["retrieval_source_id"] = item["source_id"]
                 record["sector_ids"] = item["sector_ids"]
-                decisions.append(classify_financial_relevance(
-                    record, sector_terms, item["mode"] == "creator"))
+                record["trade_date"] = item.get("trade_date") or report.get("trade_date")
+                candidates.append(record)
+            parent_cutoffs = (
+                _creator_parent_cutoffs(candidates, item.get("cutoff"))
+                if item["mode"] == "creator" else {}
+            )
+            for record in candidates:
+                if item["mode"] == "creator":
+                    reason = _creator_record_cutoff_reason(
+                        record, item.get("cutoff"), parent_cutoffs,
+                    )
+                    if reason:
+                        quarantine(reason)
+                        continue
+                    record["published_at"] = _normalized_timestamp(record["published_at"])
+                try:
+                    decision = classify_financial_relevance(
+                        record, sector_terms, item["mode"] == "creator",
+                    )
+                except Exception as exc:
+                    decision = RelevanceDecision(
+                        0.0, "filtered_non_financial",
+                        (f"audit:relevance_rule_error:{type(exc).__name__}",),
+                        relevance_version,
+                    )
+                if decision.decision == "review":
+                    if relevance_llm_enabled:
+                        try:
+                            decision = relevance_llm_classifier(
+                                record, sector_terms, relevance_version,
+                            )
+                        except Exception as exc:
+                            decision = RelevanceDecision(
+                                0.0, "filtered_non_financial",
+                                (*decision.reasons,
+                                 f"audit:relevance_llm_error:{type(exc).__name__}"),
+                                relevance_version,
+                            )
+                    else:
+                        decision = RelevanceDecision(
+                            decision.score, "filtered_non_financial",
+                            (*decision.reasons, "audit:relevance_llm_disabled"),
+                            relevance_version,
+                        )
+                records.append(record)
+                decisions.append(decision)
+            if not records and quarantined > item_quarantine_start:
+                reasons = ",".join(sorted(quarantine_reasons))
+                raise ValueError(f"all canonical records were quarantined: {reasons}")
             ingested = store.ingest(records, decisions)
+            if item.get("budget_key"):
+                store.set_collection_budget_status(
+                    report["trade_date"], item["budget_key"], "completed",
+                )
         except Exception as exc:
             item.update(
                 status="failed", records=0,
                 error=f"{type(exc).__name__}: {exc}",
             )
+            if item.get("budget_key"):
+                store.set_collection_budget_status(
+                    report["trade_date"], item["budget_key"], "failed",
+                )
             continue
+        item["quarantined"] = quarantined - item_quarantine_start
         totals = {key: totals[key] + ingested[key] for key in totals}
         raw_recalled += len(records)
         accepted += sum(decision.decision == "accepted" for decision in decisions)
         if records:
             source_ids.add(item["source_id"])
-    successful = sum(item["status"] == "ok" for item in report["jobs"])
+    successful = sum(item["status"] in {"ok", "budget_reused"} for item in report["jobs"])
     if report["jobs"]:
         report["coverage"] = successful / len(report["jobs"])
     return {
@@ -1065,6 +1999,8 @@ def _ingest_and_classify_relevance(report: dict, store: SentimentStore,
         "raw_recalled": raw_recalled,
         "financial_relevant": accepted,
         "sources": len(source_ids),
+        "quarantined": quarantined,
+        "quarantine_reasons": quarantine_reasons,
     }
 
 
@@ -1078,7 +2014,7 @@ def briefing_changes(store: SentimentStore, trade_date: str, coverage: float = 1
 
 
 def _semantic_evidence(record: dict, taxonomy: list[dict]) -> list[dict]:
-    text = str(record.get("text", ""))
+    text = str(record.get("semantic_text") or _semantic_text(record))
     bullish = ("看多", "起飞", "上车", "加仓", "坚定", "突破", "牛市")
     bearish = ("看空", "跑路", "清仓", "见顶", "暴跌", "退潮", "割肉")
     fomo_words = ("必须", "赶紧", "梭哈", "错过", "上车", "起飞")
@@ -1105,34 +2041,131 @@ def _semantic_evidence(record: dict, taxonomy: list[dict]) -> list[dict]:
     return output
 
 
-def llm_semantic_evidence(record: dict, taxonomy: list[dict]) -> list[dict]:
+def _llm_json(reply: Any, label: str) -> Any:
+    if not isinstance(reply, dict) or not isinstance(reply.get("content"), str):
+        raise ValueError(f"{label} response must contain text content")
+    content = reply["content"].strip()
+    if content.startswith("```json"):
+        content = content[len("```json"):]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    try:
+        return json.loads(content.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} response is not valid JSON") from exc
+
+
+def _strict_finite_number(value: Any, low: float, high: float, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or not low <= result <= high:
+        raise ValueError(f"{label} must be finite and in [{low},{high}]")
+    return result
+
+
+def llm_financial_relevance(
+    record: dict, sector_terms: list[str], version: str, *,
+    model: str = "deepseek-chat",
+) -> RelevanceDecision:
+    """Resolve only the finance gate; the schema cannot emit alert-scoring fields."""
+    from apex import llm
+
+    prompt = (
+        "只返回一个JSON对象，且只能包含 financial_relevant(bool), confidence(0到1), "
+        "reasons(非空字符串数组)。不得输出板块观点、情绪、预警或交易建议。\n"
+        f"候选实体={json.dumps(sector_terms, ensure_ascii=False)}\n"
+        f"已脱敏文本={_semantic_text(record)}"
+    )
+    reply = llm.chat(
+        [{"role": "system", "content": f"relevance_prompt_version={version}"},
+         {"role": "user", "content": prompt}],
+        temperature=0, max_tokens=500, model=model,
+    )
+    value = _llm_json(reply, "relevance LLM")
+    expected = {"financial_relevant", "confidence", "reasons"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("relevance LLM schema contains missing or unknown fields")
+    relevant = value["financial_relevant"]
+    if type(relevant) is not bool:
+        raise ValueError("relevance LLM financial_relevant must be boolean")
+    confidence = _strict_finite_number(
+        value["confidence"], 0.0, 1.0, "relevance LLM confidence",
+    )
+    reasons = value["reasons"]
+    if (not isinstance(reasons, list) or not reasons
+            or any(not isinstance(reason, str) or not reason.strip() for reason in reasons)):
+        raise ValueError("relevance LLM reasons must be a non-empty string array")
+    return RelevanceDecision(
+        confidence if relevant else 1.0 - confidence,
+        "accepted" if relevant else "filtered_non_financial",
+        tuple(f"llm:{reason.strip()}" for reason in reasons),
+        version,
+    )
+
+
+def llm_semantic_evidence(
+    record: dict, taxonomy: list[dict], *, model: str = "deepseek-chat",
+) -> list[dict]:
     """Classify a low-confidence text into the fixed evidence contract."""
     from apex import llm
     allowed = [{"sector_id": item["sector_id"], "sector_name": item["sector_name"],
                 "taxonomy": item["taxonomy"], "aliases": item.get("aliases", [])}
                for item in taxonomy]
+    semantic_text = str(record.get("semantic_text") or _semantic_text(record))
     prompt = (
         "只返回JSON数组。对文本做板块映射与散户情绪分类。每项字段必须为: "
         "sector_id, stance(-1到1), confidence(0到1), fomo(0到1), panic(0到1), "
         "narrative, evidence_span。sector_id只能来自候选。\n"
-        f"候选={json.dumps(allowed, ensure_ascii=False)}\n文本={record.get('text','')}"
+        f"候选={json.dumps(allowed, ensure_ascii=False)}\n文本={semantic_text}"
     )
-    reply = llm.chat([{"role": "system", "content": f"prompt_version={PROMPT_VERSION}"},
-                      {"role": "user", "content": prompt}], temperature=0, max_tokens=1200)
-    content = reply["content"].strip().removeprefix("```json").removesuffix("```").strip()
-    values = json.loads(content)
+    reply = llm.chat(
+        [{"role": "system", "content": f"prompt_version={PROMPT_VERSION}"},
+         {"role": "user", "content": prompt}],
+        temperature=0, max_tokens=1200, model=model,
+    )
+    values = _llm_json(reply, "semantic LLM")
+    if not isinstance(values, list):
+        raise ValueError("semantic LLM root must be an array")
     by_id = {item["sector_id"]: item for item in taxonomy}
     output = []
-    for value in values if isinstance(values, list) else []:
-        meta = by_id.get(value.get("sector_id"))
-        if not meta:
-            continue
+    seen_sector_ids: set[str] = set()
+    expected = {
+        "sector_id", "stance", "confidence", "fomo", "panic",
+        "narrative", "evidence_span",
+    }
+    for value in values:
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("semantic LLM schema contains missing or unknown fields")
+        meta = by_id.get(value["sector_id"])
+        if meta is None:
+            raise ValueError("semantic LLM sector_id is outside the taxonomy whitelist")
+        if value["sector_id"] in seen_sector_ids:
+            raise ValueError("semantic LLM returned a duplicate sector_id")
+        seen_sector_ids.add(value["sector_id"])
+        stance = _strict_finite_number(value["stance"], -1.0, 1.0, "semantic LLM stance")
+        confidence = _strict_finite_number(
+            value["confidence"], 0.0, 1.0, "semantic LLM confidence",
+        )
+        fomo = _strict_finite_number(value["fomo"], 0.0, 1.0, "semantic LLM fomo")
+        panic = _strict_finite_number(value["panic"], 0.0, 1.0, "semantic LLM panic")
+        if not isinstance(value["narrative"], str) or not isinstance(value["evidence_span"], str):
+            raise ValueError("semantic LLM narrative and evidence_span must be strings")
+        if not value["evidence_span"] or value["evidence_span"] not in semantic_text:
+            raise ValueError("semantic LLM evidence_span must be a non-empty source substring")
         output.append({
-            **value, "platform": record["platform"], "content_id": record["content_id"],
+            "sector_id": value["sector_id"], "stance": stance,
+            "confidence": confidence, "fomo": fomo, "panic": panic,
+            "narrative": _redact_text(value["narrative"], 160),
+            "evidence_span": _redact_text(value["evidence_span"], 160),
+            "platform": record["platform"], "content_id": record["content_id"],
             "comment_id": record.get("comment_id", ""), "author_hash": record.get("author_hash"),
-            "text": record.get("text", ""), "engagement": record.get("engagement", 0),
+            "text": _redact_text(value["evidence_span"], 160),
+            "engagement": record.get("engagement", 0),
             "sector_name": meta["sector_name"], "taxonomy": meta["taxonomy"],
-            "mapping_confidence": float(value.get("confidence", 0)),
+            "mapping_confidence": confidence,
             "repost_weight": float(record.get("repost_weight", 1.0)),
         })
     return output
@@ -1162,11 +2195,18 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                     for word in settings.get("keywords", [])]
     platforms = list(settings.get("platforms", ["bili", "dy"]))
     retrieval_settings = dict(settings.get("retrieval") or {})
+    policy_hash = _validate_retrieval_policy(settings, retrieval_settings)
+    retrieval_settings["config_hash"] = policy_hash
     timeout = int(settings.get("timeout_seconds", 900))
     limits = {
         "max_contents": int(retrieval_settings.get("max_contents_per_query", 20)),
         "max_comments": int(retrieval_settings.get("max_comments_per_content", 50)),
     }
+    resolved_date = trade_date or date.today().isoformat()
+    search_jobs = build_search_jobs(
+        taxonomy, platforms, retrieval_settings,
+        trade_date=resolved_date, config_hash=policy_hash,
+    )
     if runner is None:
         external_root = Path(str(settings["mediacrawler_path"])).expanduser()
         runner = default_mediacrawler_runner(
@@ -1174,42 +2214,53 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
             settings.get("mediacrawler_commit"),
             retrieval_settings.get("creator_id_argument", "--creator_id"),
         )
-    resolved_date = trade_date or date.today().isoformat()
     raw_dir = cache_dir / "raw"
     store = open_store(cache_dir)
+    policy_cohort = store.reserve_policy_day(resolved_date, policy_hash)
+    relevance_llm_enabled = bool(retrieval_settings.get(
+        "relevance_llm_enabled", settings.get("llm_enabled", False),
+    ))
 
-    search_jobs = build_search_jobs(taxonomy, platforms, retrieval_settings)
     search_report = collect_jobs(
         search_jobs, runner, raw_dir, resolved_date, limits, timeout,
-        empty_coverage=0.0,
+        empty_coverage=0.0, store=store,
     )
-    search_ingest = _ingest_and_classify_relevance(search_report, store, taxonomy)
-    store.discover_creator_candidates(store.accepted_search_records(resolved_date), retrieval_settings)
-    creator_jobs = build_creator_jobs(store.approved_creators(), platforms)
+    search_ingest = _ingest_and_classify_relevance(
+        search_report, store, taxonomy,
+        relevance_llm_enabled=relevance_llm_enabled,
+        relevance_version=retrieval_settings["relevance_version"],
+        relevance_llm_model=str(settings.get("relevance_llm_model") or "deepseek-chat"),
+    )
+    store.discover_creator_candidates(store.search_records(resolved_date), retrieval_settings)
+    creator_jobs = build_creator_jobs(
+        store.approved_creators(), platforms,
+        trade_date=resolved_date, config_hash=policy_hash,
+    )
     creator_report = collect_jobs(
-        creator_jobs, runner, raw_dir, resolved_date, limits, timeout,
+        creator_jobs, runner, raw_dir, resolved_date, limits, timeout, store=store,
     )
-    creator_ingest = _ingest_and_classify_relevance(creator_report, store, taxonomy)
+    creator_ingest = _ingest_and_classify_relevance(
+        creator_report, store, taxonomy,
+        relevance_llm_enabled=relevance_llm_enabled,
+        relevance_version=retrieval_settings["relevance_version"],
+        relevance_llm_model=str(settings.get("relevance_llm_model") or "deepseek-chat"),
+    )
     for item in creator_report["jobs"]:
-        store.set_creator_collection_error(
-            item["platform"], item["value"], item.get("error") if item["status"] == "failed" else None,
-        )
+        if item["status"] == "failed":
+            store.set_creator_collection_error(
+                item["platform"], item["value"], item.get("error"),
+            )
+        elif item["status"] in {"ok", "budget_reused"}:
+            store.set_creator_collection_error(item["platform"], item["value"], None)
     totals = {
         key: search_ingest[key] + creator_ingest[key]
         for key in ("inserted", "duplicates")
     }
-    funnel = {
-        "raw_recalled": search_ingest["raw_recalled"] + creator_ingest["raw_recalled"],
-        "financial_relevant": (
-            search_ingest["financial_relevant"] + creator_ingest["financial_relevant"]
-        ),
-        "filtered": 0,
-        "search_sources": search_ingest["sources"],
-        "creator_sources": creator_ingest["sources"],
-    }
-    funnel["filtered"] = funnel["raw_recalled"] - funnel["financial_relevant"]
+    funnel = store.retrieval_funnel(resolved_date)
     all_jobs = search_report["jobs"] + creator_report["jobs"]
-    successful_jobs = sum(item["status"] == "ok" for item in all_jobs)
+    successful_jobs = sum(
+        item["status"] in {"ok", "budget_reused"} for item in all_jobs
+    )
     overall_coverage = (
         successful_jobs / len(all_jobs) if all_jobs and search_jobs else 0.0
     )
@@ -1223,6 +2274,12 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
         "creator_jobs": creator_report["jobs"],
         "platforms": {},
         "funnel": funnel,
+        "query_version": retrieval_settings["query_version"],
+        "relevance_version": retrieval_settings["relevance_version"],
+        "creator_rule_version": retrieval_settings["creator_rule_version"],
+        "semantic_prompt_version": settings["semantic_prompt_version"],
+        "config_hash": policy_hash,
+        **policy_cohort,
         "as_of": _now(),
     }
     store.record_collection(report)
@@ -1233,7 +2290,10 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                 baseline = _semantic_evidence(record, taxonomy)
                 if baseline and all(item["stance"] != 0 for item in baseline):
                     return baseline
-                return llm_semantic_evidence(record, taxonomy)
+                return llm_semantic_evidence(
+                    record, taxonomy,
+                    model=str(settings.get("semantic_llm_model") or "deepseek-chat"),
+                )
         else:
             semantic_classifier = _semantic_evidence
     evidence = []

@@ -121,6 +121,9 @@ sector_sentiment:
   market_data_enabled: true    # 用 akshare 板块日线更新背离和成熟事件标签
   llm_enabled: true            # 低置信文本使用 DeepSeek 固定结构分类；false=规则基线
   llm_model_version: "sector-semantic-llm-v1"
+  semantic_llm_model: "deepseek-chat"   # 实际调用模型，60日 cohort 内冻结
+  relevance_llm_model: "deepseek-chat"  # 金融准入裁决模型，60日 cohort 内冻结
+  semantic_prompt_version: "sector-semantic-v1"
   retrieval:
     query_version: "sector-finance-query-v1"
     query_templates: ["{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股", "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情"]
@@ -133,6 +136,7 @@ sector_sentiment:
     very_high_relevance: 0.9
     high_engagement_thresholds: {bili: 1000, dy: 1000}
     relevance_version: "sector-finance-relevance-v1"
+    relevance_llm_enabled: true  # 仅裁决金融相关性，不输出情绪/预警分数
     creator_rule_version: "sector-finance-creator-v1"
   keywords: ["机器人", "算力", "创新药"]
   # 正式运行应扩充为完整的申万行业＋东方财富概念版本化词典。
