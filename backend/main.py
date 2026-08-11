@@ -26,6 +26,7 @@ from backend.routers import (
     postmortem,
     push,
     screener,
+    sector_sentiment,
     system,
     watchlist,
 )
@@ -65,6 +66,7 @@ for rtr in (
     backtest.router,
     chan.router,
     screener.router,
+    sector_sentiment.router,
     calibration.router,
     postmortem.router,
     push.router,

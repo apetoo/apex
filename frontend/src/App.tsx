@@ -1,5 +1,5 @@
 import { NavLink, Route, Routes } from "react-router-dom";
-import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch, History, Target, Activity, GitBranch } from "lucide-react";
+import { LayoutDashboard, Wallet, Search, LineChart, ScanSearch, History, Target, Activity, GitBranch, ThermometerSun } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ChatPanel } from "@/components/base";
 import { ChatContextProvider } from "@/hooks/useChatContext";
@@ -12,6 +12,7 @@ import { ScreenerPage } from "@/routes/screener/ScreenerPage";
 import { SystemPage } from "@/routes/system/SystemPage";
 import { IntradayBoardPage } from "@/routes/intraday/IntradayBoardPage";
 import { ChanPage } from "@/routes/chan/ChanPage";
+import { SectorSentimentPage } from "@/routes/sector-sentiment/SectorSentimentPage";
 
 /**
  * 路由表(ED: 概览首页 + 四 Tab 1:1 平移 + 全局浮动 chat)
@@ -35,6 +36,7 @@ const NAV = [
   { to: "/intraday", label: "分时", icon: Activity, end: false },
   { to: "/chan", label: "缠论", icon: GitBranch, end: false },
   { to: "/screener", label: "筛选", icon: ScanSearch, end: false },
+  { to: "/sector-sentiment", label: "情绪", icon: ThermometerSun, end: false },
   { to: "/system", label: "我的系统", icon: Target, end: false },
 ];
 
@@ -86,6 +88,7 @@ function App() {
               element={<IntradayBoardPage />}
             />
             <Route path="/chan" element={<ChanPage />} />
+            <Route path="/sector-sentiment" element={<SectorSentimentPage />} />
             <Route
               path="/screener"
               element={<ScreenerPage />}

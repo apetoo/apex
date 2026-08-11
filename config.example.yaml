@@ -107,3 +107,32 @@ auto_trade:
   top_n_picks: 5               # 粗筛后分析几只（按 ai_score 降序）
   holding_period_days: 10      # 持有期满强制平仓（exit_reason=expired）
   bullish_verdicts: ["看多", "偏多"]   # 哪些 verdict 入候选（不含"观望偏多"--历史胜率 12.5% 太低）
+
+# 板块散户情绪两层预警（个人研究/影子模式，不触发交易）。
+# MediaCrawler 必须安装在仓库外并固定 commit；其许可证仅允许非商业学习研究。
+# 首次运行前在 MediaCrawler 内人工扫码登录并确认 JSONL 输出正常。
+sector_sentiment:
+  enabled: false
+  cache_dir: "~/.stock-sentiment"
+  mediacrawler_path: "~/workspace/tools/MediaCrawler"
+  mediacrawler_commit: ""       # 必填：`git -C <path> rev-parse HEAD`
+  platforms: ["bili", "dy"]
+  timeout_seconds: 900
+  market_data_enabled: true    # 用 akshare 板块日线更新背离和成熟事件标签
+  llm_enabled: true            # 低置信文本使用 DeepSeek 固定结构分类；false=规则基线
+  llm_model_version: "sector-semantic-llm-v1"
+  keywords: ["机器人", "算力", "创新药"]
+  # 正式运行应扩充为完整的申万行业＋东方财富概念版本化词典。
+  taxonomy:
+    - sector_id: "concept:robot"
+      sector_name: "机器人"
+      taxonomy: "concept"
+      aliases: ["机器人", "人形机器人", "具身智能"]
+    - sector_id: "concept:compute"
+      sector_name: "算力"
+      taxonomy: "concept"
+      aliases: ["算力", "AI服务器", "数据中心"]
+    - sector_id: "concept:innovative-drug"
+      sector_name: "创新药"
+      taxonomy: "concept"
+      aliases: ["创新药", "国产新药", "医药出海"]

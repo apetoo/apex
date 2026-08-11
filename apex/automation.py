@@ -202,6 +202,22 @@ def task_screener() -> str:
         return "screener_fail"
 
 
+def task_sector_sentiment() -> str:
+    """盘后板块情绪影子采集；单平台失败由模块内部降级。"""
+    _clean_proxy()
+    from apex import sector_sentiment
+    print("\n" + "=" * 50)
+    print("  🌡 板块情绪影子预警")
+    print("=" * 50)
+    try:
+        result = sector_sentiment.run_configured()
+        print(f"  → {result.get('status')} coverage={result.get('coverage', 0):.0%}")
+        return f"sector_sentiment_{result.get('status')}"
+    except Exception as e:
+        print(f"  ✗ 情绪采集失败: {e}")
+        return "sector_sentiment_fail"
+
+
 # ── 自动撮合（模拟实盘，--auto-trade 用）─────────────────────────
 
 def _auto_trade_cfg() -> dict:
@@ -450,6 +466,7 @@ SCHEDULE = [
     ("afternoon", task_analyze_one, "盘中分析 #2"),
     ("close", task_analyze_one, "尾盘分析 #3"),
     ("postmarket", task_screener, "盘后筛选"),
+    ("postmarket", task_sector_sentiment, "板块情绪影子预警"),
 ]
 
 

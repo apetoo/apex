@@ -4,7 +4,30 @@ from datetime import date
 from apex import config, data, watchlist, analyze, journal
 
 
+def _print_sector_sentiment() -> None:
+    from apex import sector_sentiment
+    cfg = config.get() or {}
+    settings = cfg.get("sector_sentiment") or {}
+    if not settings.get("enabled", False):
+        return
+    store = sector_sentiment.open_store(settings.get("cache_dir", "~/.stock-sentiment"))
+    latest = store.latest_date()
+    if not latest:
+        print("🌡 板块情绪：尚无数据（影子观察）\n")
+        return
+    scores = store.scores_for_date(latest)
+    present = {p for score in scores for p in score["platforms"]}
+    expected = max(1, len(settings.get("platforms", ["bili", "dy"])))
+    lines = sector_sentiment.briefing_changes(store, latest, min(1, len(present) / expected))
+    if lines:
+        print("🌡 板块情绪变化（研究观察，不触发交易）")
+        for line in lines:
+            print(f"  • {line}")
+        print()
+
+
 def run() -> None:
+    _print_sector_sentiment()
     wl = watchlist.load()
     all_codes = (
         [p["ts_code"] for p in wl["active_positions"]] +
