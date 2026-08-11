@@ -86,3 +86,18 @@ def build_search_jobs(
                         source_id=f"query:{query}",
                     ))
     return jobs
+
+
+def build_creator_jobs(creators: list[dict]) -> list[RetrievalJob]:
+    """Build deterministic creator jobs from the manually approved pool only."""
+    jobs = []
+    for creator in sorted(creators, key=lambda value: (value["platform"], value["creator_id"])):
+        if creator.get("status") != "approved":
+            continue
+        creator_id = str(creator["creator_id"])
+        jobs.append(RetrievalJob(
+            platform=creator["platform"], mode="creator", value=creator_id,
+            sector_ids=tuple(sorted(set(creator.get("sector_ids", [])))),
+            source_id=f"creator:{creator_id}",
+        ))
+    return jobs

@@ -112,6 +112,27 @@ class SentimentStore:
                     run_id TEXT PRIMARY KEY, trade_date TEXT NOT NULL, coverage REAL NOT NULL,
                     platforms_json TEXT NOT NULL, status TEXT NOT NULL, completed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS creators (
+                    platform TEXT NOT NULL, creator_id TEXT NOT NULL, display_name TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('candidate','approved','rejected')),
+                    first_discovered_at TEXT NOT NULL, last_discovered_at TEXT NOT NULL,
+                    valid_content_count INTEGER NOT NULL DEFAULT 0,
+                    total_content_count INTEGER NOT NULL DEFAULT 0,
+                    financial_ratio REAL NOT NULL DEFAULT 0,
+                    sector_ids_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT NOT NULL DEFAULT '[]',
+                    reviewed_at TEXT, last_collection_error TEXT,
+                    PRIMARY KEY(platform, creator_id)
+                );
+                CREATE TABLE IF NOT EXISTS creator_content (
+                    platform TEXT NOT NULL, creator_id TEXT NOT NULL, content_id TEXT NOT NULL,
+                    relevance_score REAL NOT NULL, sector_ids_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY(platform, creator_id, content_id)
+                );
+                CREATE TABLE IF NOT EXISTS creator_events (
+                    event_id TEXT PRIMARY KEY, platform TEXT NOT NULL, creator_id TEXT NOT NULL,
+                    action TEXT NOT NULL, previous_status TEXT NOT NULL, new_status TEXT NOT NULL,
+                    actor TEXT NOT NULL, created_at TEXT NOT NULL
+                );
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_scores)")}
             for name in ("attention_raw", "sentiment_raw", "content_count", "comment_count",
@@ -193,6 +214,148 @@ class SentimentStore:
                 """SELECT * FROM content
                    WHERE substr(collected_at,1,10)=? AND relevance_decision='accepted'
                    ORDER BY id""", (trade_date,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def discover_creator_candidates(self, records: list[dict], settings: dict) -> dict[str, int]:
+        """Persist eligible creator evidence and add, but never approve, candidates.
+
+        Each source content key can count at most once.  Discovery deliberately
+        leaves reviewed records in their current state: approval is a human-only
+        transition performed by :meth:`moderate_creator`.
+        """
+        minimum = int(settings.get("candidate_min_contents", 3))
+        very_high = float(settings.get("very_high_relevance", 0.9))
+        thresholds = settings.get(
+            "platform_engagement_thresholds", settings.get("high_engagement_thresholds", {})
+        )
+        created = updated = 0
+        seen_creators: dict[tuple[str, str], list[dict]] = {}
+        with self._connect() as conn:
+            for record in records:
+                platform = str(record.get("platform") or "")
+                creator_id = str(record.get("author_id") or "")
+                content_id = str(record.get("content_id") or "")
+                score = float(record.get("relevance_score") or 0)
+                decision = record.get("relevance_decision")
+                eligible = decision == "accepted" if decision is not None else score >= 0.7
+                if not (platform and creator_id and content_id and eligible):
+                    continue
+                sectors = sorted({str(value) for value in record.get("sector_ids", []) if value})
+                conn.execute(
+                    """INSERT OR IGNORE INTO creator_content
+                    (platform, creator_id, content_id, relevance_score, sector_ids_json)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    (platform, creator_id, content_id, score, json.dumps(sectors, ensure_ascii=False)),
+                )
+                seen_creators.setdefault((platform, creator_id), []).append(record)
+
+            for (platform, creator_id), creator_records in seen_creators.items():
+                evidence_rows = conn.execute(
+                    """SELECT content_id, relevance_score, sector_ids_json FROM creator_content
+                    WHERE platform=? AND creator_id=? ORDER BY content_id""",
+                    (platform, creator_id),
+                ).fetchall()
+                sector_ids = sorted({sector for row in evidence_rows
+                                     for sector in json.loads(row["sector_ids_json"])})
+                valid_count = len(evidence_rows)
+                configured_threshold = thresholds.get(
+                    platform, settings.get("high_engagement_threshold", float("inf"))
+                ) if isinstance(thresholds, dict) else settings.get("high_engagement_threshold", thresholds)
+                if isinstance(configured_threshold, dict):
+                    configured_threshold = configured_threshold.get("high_engagement_threshold", float("inf"))
+                platform_threshold = float(configured_threshold)
+                high_signal = any(
+                    float(record.get("relevance_score") or 0) >= very_high and
+                    float(record.get("engagement") or 0) >= platform_threshold
+                    for record in creator_records
+                )
+                qualifies = valid_count >= minimum or high_signal or len(sector_ids) >= 2
+                existing = conn.execute(
+                    "SELECT * FROM creators WHERE platform=? AND creator_id=?",
+                    (platform, creator_id),
+                ).fetchone()
+                if not existing and not qualifies:
+                    continue
+                now = _now()
+                display_name = next((record.get("author_name") for record in creator_records
+                                     if record.get("author_name")), None)
+                evidence = [{"content_id": row["content_id"],
+                             "text": str(next((record.get("text") for record in creator_records
+                                               if str(record.get("content_id")) == row["content_id"]), ""))[:200]}
+                            for row in evidence_rows[-3:]]
+                if existing:
+                    conn.execute(
+                        """UPDATE creators SET display_name=COALESCE(?, display_name),
+                           last_discovered_at=?, valid_content_count=?, total_content_count=?,
+                           financial_ratio=?, sector_ids_json=?, evidence_json=?
+                           WHERE platform=? AND creator_id=?""",
+                        (display_name, now, valid_count, valid_count, 1.0 if valid_count else 0.0,
+                         json.dumps(sector_ids, ensure_ascii=False), json.dumps(evidence, ensure_ascii=False),
+                         platform, creator_id),
+                    )
+                    updated += 1
+                else:
+                    conn.execute(
+                        """INSERT INTO creators
+                        (platform, creator_id, display_name, status, first_discovered_at,
+                         last_discovered_at, valid_content_count, total_content_count,
+                         financial_ratio, sector_ids_json, evidence_json)
+                        VALUES (?, ?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?)""",
+                        (platform, creator_id, display_name, now, now, valid_count, valid_count,
+                         1.0 if valid_count else 0.0, json.dumps(sector_ids, ensure_ascii=False),
+                         json.dumps(evidence, ensure_ascii=False)),
+                    )
+                    created += 1
+        return {"created": created, "updated": updated}
+
+    def list_creators(self, status: str | None = None) -> list[dict]:
+        with self._connect() as conn:
+            if status is None:
+                rows = conn.execute("SELECT * FROM creators ORDER BY platform, creator_id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM creators WHERE status=? ORDER BY platform, creator_id", (status,)
+                ).fetchall()
+        return [_decode_creator(row) for row in rows]
+
+    def approved_creators(self, platform: str | None = None) -> list[dict]:
+        creators = self.list_creators("approved")
+        return [creator for creator in creators if platform is None or creator["platform"] == platform]
+
+    def moderate_creator(self, platform: str, creator_id: str, action: str,
+                         actor: str = "local-user") -> dict:
+        transitions = {"approve": "approved", "reject": "rejected", "restore": "candidate"}
+        if action not in transitions:
+            raise ValueError(f"unknown moderation action: {action}")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM creators WHERE platform=? AND creator_id=?", (platform, creator_id)
+            ).fetchone()
+            if row is None:
+                raise KeyError((platform, creator_id))
+            now = _now()
+            new_status = transitions[action]
+            conn.execute(
+                "UPDATE creators SET status=?, reviewed_at=? WHERE platform=? AND creator_id=?",
+                (new_status, now, platform, creator_id),
+            )
+            conn.execute(
+                """INSERT INTO creator_events
+                (event_id, platform, creator_id, action, previous_status, new_status, actor, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (uuid.uuid4().hex, platform, creator_id, action, row["status"], new_status, actor, now),
+            )
+            updated = conn.execute(
+                "SELECT * FROM creators WHERE platform=? AND creator_id=?", (platform, creator_id)
+            ).fetchone()
+        return _decode_creator(updated)
+
+    def creator_events(self, platform: str, creator_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM creator_events WHERE platform=? AND creator_id=?
+                   ORDER BY rowid""", (platform, creator_id)
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -362,6 +525,13 @@ def _decode_score(row: sqlite3.Row) -> dict:
     value = dict(row)
     value["platforms"] = json.loads(value.pop("platforms_json"))
     value["platform_contributions"] = json.loads(value.pop("platform_contributions_json"))
+    value["evidence"] = json.loads(value.pop("evidence_json"))
+    return value
+
+
+def _decode_creator(row: sqlite3.Row) -> dict:
+    value = dict(row)
+    value["sector_ids"] = json.loads(value.pop("sector_ids_json"))
     value["evidence"] = json.loads(value.pop("evidence_json"))
     return value
 

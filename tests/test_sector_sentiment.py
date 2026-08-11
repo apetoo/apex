@@ -307,3 +307,80 @@ def test_filtered_record_is_retained_but_not_eligible(tmp_path):
     row = store.list_content("2026-08-10")[0]
     assert row["relevance_decision"] == "filtered_non_financial"
     assert store.list_eligible_content("2026-08-10") == []
+
+
+def _candidate_records():
+    return [
+        {**_item("bili", f"v{i}", "机器人板块资金流入"),
+         "author_id": "up-1", "author_name": "财经小王",
+         "relevance_score": 0.9, "sector_ids": ["concept:robot"]}
+        for i in range(3)
+    ]
+
+
+def _seeded_candidate_store(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.discover_creator_candidates(_candidate_records(), {"candidate_min_contents": 3})
+    return store
+
+
+def test_creator_becomes_candidate_once_after_three_unique_financial_contents(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    records = _candidate_records()
+
+    assert store.discover_creator_candidates(records, {"candidate_min_contents": 3}) == {
+        "created": 1, "updated": 0,
+    }
+    assert store.discover_creator_candidates(records, {"candidate_min_contents": 3}) == {
+        "created": 0, "updated": 1,
+    }
+    creators = store.list_creators("candidate")
+    assert len(creators) == 1
+    assert creators[0]["valid_content_count"] == 3
+
+
+def test_candidate_requires_manual_approval_and_writes_audit_event(tmp_path):
+    store = _seeded_candidate_store(tmp_path)
+
+    assert store.approved_creators() == []
+    creator = store.moderate_creator("bili", "up-1", "approve")
+
+    assert creator["status"] == "approved"
+    event = store.creator_events("bili", "up-1")[0]
+    assert event["action"] == "approve"
+    assert event["previous_status"] == "candidate"
+    assert event["new_status"] == "approved"
+
+
+def test_discovery_preserves_reviewed_status_and_duplicate_contents(tmp_path):
+    store = _seeded_candidate_store(tmp_path)
+    store.moderate_creator("bili", "up-1", "approve")
+
+    store.discover_creator_candidates(_candidate_records(), {"candidate_min_contents": 3})
+
+    creator = store.approved_creators("bili")[0]
+    assert creator["status"] == "approved"
+    assert creator["valid_content_count"] == 3
+
+
+def test_rejection_restoration_and_invalid_moderation_are_audited(tmp_path):
+    store = _seeded_candidate_store(tmp_path)
+
+    assert store.moderate_creator("bili", "up-1", "reject", actor="reviewer")["status"] == "rejected"
+    assert store.moderate_creator("bili", "up-1", "restore", actor="reviewer")["status"] == "candidate"
+    assert [event["action"] for event in store.creator_events("bili", "up-1")] == ["reject", "restore"]
+    with pytest.raises(ValueError, match="unknown moderation action"):
+        store.moderate_creator("bili", "up-1", "archive")
+    with pytest.raises(KeyError):
+        store.moderate_creator("bili", "missing", "approve")
+
+
+def test_creator_retrieval_jobs_only_use_approved_creators(tmp_path):
+    store = _seeded_candidate_store(tmp_path)
+    store.moderate_creator("bili", "up-1", "approve")
+
+    jobs = retrieval.build_creator_jobs(store.approved_creators())
+
+    assert [(job.platform, job.mode, job.value, job.sector_ids) for job in jobs] == [
+        ("bili", "creator", "up-1", ("concept:robot",)),
+    ]
