@@ -181,10 +181,15 @@ class SentimentStore:
                 if name not in collection_columns:
                     conn.execute(f"ALTER TABLE collection_runs ADD COLUMN {name} {definition}")
 
-    def ingest(self, items: Iterable[dict]) -> dict[str, int]:
+    def ingest(
+        self, items: Iterable[dict], decisions: list[RelevanceDecision] | None = None,
+    ) -> dict[str, int]:
+        records = list(items)
+        if decisions is not None and len(decisions) != len(records):
+            raise ValueError("one relevance decision is required per record")
         inserted = duplicates = 0
         with self._connect() as conn:
-            for item in items:
+            for item in records:
                 fp = _fingerprint(item.get("text", ""))
                 try:
                     conn.execute(
@@ -229,6 +234,16 @@ class SentimentStore:
                             (json.dumps(sector_ids, ensure_ascii=False), item["platform"],
                              str(item["content_id"]), str(item.get("comment_id") or "")),
                         )
+            for item, decision in zip(records, decisions or []):
+                conn.execute(
+                    """UPDATE content SET relevance_score=?, relevance_decision=?,
+                       relevance_reasons_json=?, relevance_version=?
+                       WHERE platform=? AND content_id=? AND comment_id=?""",
+                    (decision.score, decision.decision,
+                     json.dumps(decision.reasons, ensure_ascii=False), decision.version,
+                     item["platform"], str(item["content_id"]),
+                     str(item.get("comment_id") or "")),
+                )
         return {"inserted": inserted, "duplicates": duplicates}
 
     def list_content(self, trade_date: str) -> list[dict]:
@@ -725,6 +740,12 @@ def advance_alerts(store: SentimentStore, trade_date: str) -> list[dict]:
         if not _coverage_ok(score):
             results.append({**score, "state": "insufficient_data", "changed": False})
             continue
+        if previous and previous.get("updated_at", "") >= trade_date:
+            results.append({
+                **score, "state": previous["state"], "changed": False,
+                "event_id": previous.get("event_id"),
+            })
+            continue
         hot = score["sentiment_extreme"] >= 0.90 or score["attention_acceleration"] >= 0.90
         observed_days = 0
         if previous and previous.get("opened_at"):
@@ -869,20 +890,48 @@ def default_mediacrawler_runner(
                       if path.stat().st_mtime_ns > before.get(path, -1)]
         if not candidates:
             raise RuntimeError("collector finished without new JSONL output")
+        normalized_rows = []
+        for source in sorted(candidates):
+            for line in source.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                normalized = normalize_external_record(json.loads(line), job.platform)
+                if normalized:
+                    normalized.update(
+                        retrieval_source=job.mode,
+                        retrieval_source_id=job.source_id,
+                        sector_ids=list(job.sector_ids),
+                    )
+                    normalized_rows.append(normalized)
+
+        max_contents = max(0, int(limits.get("max_contents", 20)))
+        max_comments = max(0, int(limits.get("max_comments", 50)))
+        ordered_content_ids = list(dict.fromkeys(
+            row["content_id"] for row in normalized_rows if not row["comment_id"]
+        ))
+        ordered_content_ids.extend(
+            content_id for content_id in dict.fromkeys(row["content_id"] for row in normalized_rows)
+            if content_id not in ordered_content_ids
+        )
+        allowed_content_ids = set(ordered_content_ids[:max_contents])
+        emitted_contents: set[str] = set()
+        comment_counts: dict[str, int] = {}
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("x", encoding="utf-8") as target:
-            for source in sorted(candidates):
-                for line in source.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
+            for normalized in normalized_rows:
+                content_id = normalized["content_id"]
+                if content_id not in allowed_content_ids:
+                    continue
+                if not normalized["comment_id"]:
+                    if content_id in emitted_contents:
                         continue
-                    normalized = normalize_external_record(json.loads(line), job.platform)
-                    if normalized:
-                        normalized.update(
-                            retrieval_source=job.mode,
-                            retrieval_source_id=job.source_id,
-                            sector_ids=list(job.sector_ids),
-                        )
-                        target.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+                    emitted_contents.add(content_id)
+                else:
+                    count = comment_counts.get(content_id, 0)
+                    if count >= max_comments:
+                        continue
+                    comment_counts[content_id] = count + 1
+                target.write(json.dumps(normalized, ensure_ascii=False) + "\n")
     return run
 
 
@@ -934,7 +983,8 @@ def collect_external(*, platforms: list[str], keywords: list[str], raw_dir: str 
 
 
 def collect_jobs(jobs: list[RetrievalJob], runner: Callable, raw_dir: str | Path,
-                 trade_date: str, limits: dict, timeout: int = 900) -> dict:
+                 trade_date: str, limits: dict, timeout: int = 900,
+                 empty_coverage: float = 1.0) -> dict:
     """Run typed retrieval jobs independently and retain every successful output."""
     base = Path(raw_dir) / trade_date
     base.mkdir(parents=True, exist_ok=True)
@@ -958,7 +1008,7 @@ def collect_jobs(jobs: list[RetrievalJob], runner: Callable, raw_dir: str | Path
     return {
         "trade_date": trade_date,
         "jobs": statuses,
-        "coverage": successful / len(jobs) if jobs else 1.0,
+        "coverage": successful / len(jobs) if jobs else float(empty_coverage),
         "as_of": _now(),
     }
 
@@ -977,24 +1027,39 @@ def _ingest_and_classify_relevance(report: dict, store: SentimentStore,
     for item in report["jobs"]:
         if item["status"] != "ok":
             continue
-        path = Path(item["path"])
-        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
-                   if line.strip()]
+        try:
+            path = Path(item["path"])
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            decisions = []
+            for record in records:
+                missing = [field for field in ("platform", "content_id", "text")
+                           if not record.get(field)]
+                if missing:
+                    raise ValueError(f"canonical record missing: {', '.join(missing)}")
+                record["retrieval_source"] = item["mode"]
+                record["retrieval_source_id"] = item["source_id"]
+                record["sector_ids"] = item["sector_ids"]
+                decisions.append(classify_financial_relevance(
+                    record, sector_terms, item["mode"] == "creator"))
+            ingested = store.ingest(records, decisions)
+        except Exception as exc:
+            item.update(
+                status="failed", records=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        totals = {key: totals[key] + ingested[key] for key in totals}
         raw_recalled += len(records)
+        accepted += sum(decision.decision == "accepted" for decision in decisions)
         if records:
             source_ids.add(item["source_id"])
-        for record in records:
-            record["retrieval_source"] = item["mode"]
-            record["retrieval_source_id"] = item["source_id"]
-            record["sector_ids"] = item["sector_ids"]
-        ingested = store.ingest(records)
-        totals = {key: totals[key] + ingested[key] for key in totals}
-        for record in records:
-            relevance = classify_financial_relevance(
-                record, sector_terms, item["mode"] == "creator")
-            accepted += relevance.decision == "accepted"
-            store.save_relevance(
-                record["platform"], record["content_id"], record.get("comment_id", ""), relevance)
+    successful = sum(item["status"] == "ok" for item in report["jobs"])
+    if report["jobs"]:
+        report["coverage"] = successful / len(report["jobs"])
     return {
         **totals,
         "raw_recalled": raw_recalled,
@@ -1116,6 +1181,7 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     search_jobs = build_search_jobs(taxonomy, platforms, retrieval_settings)
     search_report = collect_jobs(
         search_jobs, runner, raw_dir, resolved_date, limits, timeout,
+        empty_coverage=0.0,
     )
     search_ingest = _ingest_and_classify_relevance(search_report, store, taxonomy)
     store.discover_creator_candidates(store.accepted_search_records(resolved_date), retrieval_settings)
@@ -1123,11 +1189,11 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     creator_report = collect_jobs(
         creator_jobs, runner, raw_dir, resolved_date, limits, timeout,
     )
+    creator_ingest = _ingest_and_classify_relevance(creator_report, store, taxonomy)
     for item in creator_report["jobs"]:
         store.set_creator_collection_error(
             item["platform"], item["value"], item.get("error") if item["status"] == "failed" else None,
         )
-    creator_ingest = _ingest_and_classify_relevance(creator_report, store, taxonomy)
     totals = {
         key: search_ingest[key] + creator_ingest[key]
         for key in ("inserted", "duplicates")
@@ -1144,11 +1210,14 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     funnel["filtered"] = funnel["raw_recalled"] - funnel["financial_relevant"]
     all_jobs = search_report["jobs"] + creator_report["jobs"]
     successful_jobs = sum(item["status"] == "ok" for item in all_jobs)
+    overall_coverage = (
+        successful_jobs / len(all_jobs) if all_jobs and search_jobs else 0.0
+    )
     report = {
         "trade_date": resolved_date,
         "search_coverage": search_report["coverage"],
         "creator_coverage": creator_report["coverage"],
-        "coverage": successful_jobs / len(all_jobs) if all_jobs else 1.0,
+        "coverage": overall_coverage,
         "jobs": all_jobs,
         "search_jobs": search_report["jobs"],
         "creator_jobs": creator_report["jobs"],
@@ -1181,7 +1250,10 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     market_metrics = settings.get("market_metrics") or {}
     for sector_id, rows in by_sector.items():
         meta = rows[0]
-        history = store.scores_for_sector(sector_id)
+        history = [
+            row for row in store.scores_for_sector(sector_id)
+            if row["trade_date"] < resolved_date
+        ]
         market = market_metrics.get(sector_id, {})
         if market_provider:
             try:
