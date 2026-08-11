@@ -134,6 +134,20 @@ test("shows an empty state for a creator status without rows", async () => {
   expect(await screen.findByText("暂无候选作者")).toBeInTheDocument();
 });
 
+test("shows a retryable error instead of the empty state when loading creators fails", async () => {
+  getSectorSentimentCreators
+    .mockRejectedValueOnce(new Error("作者池加载失败"))
+    .mockResolvedValueOnce({ creators: [creator()] });
+  renderPage();
+
+  fireEvent.click(screen.getByRole("button", { name: "作者池" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("作者池加载失败");
+  expect(screen.queryByText("暂无候选作者")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "重试加载作者池" }));
+  expect(await screen.findByText("财经小王")).toBeInTheDocument();
+});
+
 test("restores a rejected creator to candidate status", async () => {
   getSectorSentimentCreators.mockResolvedValue({ creators: [creator({ status: "rejected", display_name: "财经小李" })] });
   moderateSectorSentimentCreator.mockResolvedValue(undefined);

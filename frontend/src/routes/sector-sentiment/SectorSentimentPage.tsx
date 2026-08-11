@@ -101,6 +101,7 @@ function CreatorPool({ status, onStatusChange }: { status: CreatorStatus; onStat
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sector-sentiment", "creators"] }),
   });
   const error = moderation.error instanceof Error ? moderation.error.message : moderation.error ? "操作失败，请重试" : null;
+  const creatorLoadError = creators.error instanceof Error ? creators.error.message : "作者池加载失败，请重试";
   const emptyLabel: Record<CreatorStatus, string> = {
     candidate: "暂无候选作者",
     approved: "暂无已批准作者",
@@ -118,7 +119,12 @@ function CreatorPool({ status, onStatusChange }: { status: CreatorStatus; onStat
         ))}
       </div>
       {error && <p role="alert" className="rounded-md border border-down/30 bg-down/5 p-3 text-sm text-down">{error}</p>}
-      {creators.isLoading ? <p className="text-sm text-text-secondary">加载中…</p> : (creators.data?.creators ?? []).length === 0 ? (
+      {creators.isLoading ? <p className="text-sm text-text-secondary">加载中…</p> : creators.isError ? (
+        <div role="alert" className="rounded-md border border-down/30 bg-down/5 p-3 text-sm text-down">
+          <p>{creatorLoadError}</p>
+          <button type="button" onClick={() => creators.refetch()} className="mt-2 rounded-md border border-down/30 px-3 py-1.5 text-sm">重试加载作者池</button>
+        </div>
+      ) : (creators.data?.creators ?? []).length === 0 ? (
         <Card><CardContent className="py-10 text-center text-sm text-text-secondary">{emptyLabel[status]}</CardContent></Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
