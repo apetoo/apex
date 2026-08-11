@@ -379,8 +379,26 @@ def test_creator_retrieval_jobs_only_use_approved_creators(tmp_path):
     store = _seeded_candidate_store(tmp_path)
     store.moderate_creator("bili", "up-1", "approve")
 
-    jobs = retrieval.build_creator_jobs(store.approved_creators())
+    jobs = retrieval.build_creator_jobs(store.approved_creators(), ["bili"])
 
     assert [(job.platform, job.mode, job.value, job.sector_ids) for job in jobs] == [
         ("bili", "creator", "up-1", ("concept:robot",)),
+    ]
+
+
+def test_creator_retrieval_jobs_scope_platforms_and_disambiguate_source_ids():
+    creators = [
+        {"platform": "bili", "creator_id": "up-1", "status": "approved",
+         "sector_ids": ["concept:robot"]},
+        {"platform": "eastmoney", "creator_id": "up-1", "status": "approved",
+         "sector_ids": ["concept:robot"]},
+        {"platform": "douyin", "creator_id": "up-2", "status": "approved",
+         "sector_ids": ["concept:ai"]},
+    ]
+
+    jobs = retrieval.build_creator_jobs(creators, ["bili", "eastmoney"])
+
+    assert [(job.platform, job.source_id) for job in jobs] == [
+        ("bili", "creator:bili:up-1"),
+        ("eastmoney", "creator:eastmoney:up-1"),
     ]

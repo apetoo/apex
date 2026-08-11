@@ -45,3 +45,13 @@ deterministic creator retrieval jobs.
 Creator evidence is intentionally limited to accepted records supplied by the
 caller; callers must pass sector IDs with the accepted content where
 cross-sector qualification is desired.
+
+## Fix round 1 evidence
+
+- RED: creator retrieval tests failed with the previous one-argument API.
+- GREEN: `build_creator_jobs(creators, platforms)` now filters to configured
+  platforms while retaining the approved-only guard; source IDs are stable and
+  unique as `creator:{platform}:{creator_id}`.
+- Added regression coverage for the same creator ID on two platforms and an
+  approved creator on a disabled platform. Focused tests passed (2 passed) and
+  the full sector-sentiment suite passed (28 passed).
