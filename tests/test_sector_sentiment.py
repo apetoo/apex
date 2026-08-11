@@ -6,6 +6,7 @@ from datetime import date
 import pytest
 
 from apex import sector_sentiment as ss
+from apex import sector_retrieval as retrieval
 
 
 def _item(platform: str, content_id: str, text: str, **extra) -> dict:
@@ -232,3 +233,29 @@ def test_validation_go_requires_30_events_uplift_and_positive_cluster_ci():
     assert result["uplift"] == pytest.approx(0.5)
     assert result["ci_low"] > 0
     assert result["verdict"] == "GO"
+
+
+def test_financial_search_jobs_never_emit_bare_sector_terms():
+    jobs = retrieval.build_search_jobs(
+        [{"sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
+          "aliases": ["机器人", "具身智能"]}],
+        ["bili", "dy"],
+        {"query_templates": ["{term} 股票", "{term} ETF"], "max_queries_per_sector": 3},
+    )
+
+    assert len(jobs) == 6
+    assert {job.value for job in jobs} <= {"机器人 股票", "机器人 ETF", "具身智能 股票"}
+    assert all(job.value not in {"机器人", "具身智能"} for job in jobs)
+    assert all(job.mode == "search" for job in jobs)
+
+
+def test_query_planning_is_stable_and_deduplicated():
+    taxonomy = [{"sector_id": "concept:robot", "sector_name": "机器人",
+                 "taxonomy": "concept", "aliases": ["机器人", "机器人"]}]
+    first = retrieval.build_search_jobs(taxonomy, ["bili"], {
+        "query_templates": ["{term} 股票", "{term} 股票"], "max_queries_per_sector": 8})
+    second = retrieval.build_search_jobs(taxonomy, ["bili"], {
+        "query_templates": ["{term} 股票", "{term} 股票"], "max_queries_per_sector": 8})
+
+    assert first == second
+    assert [job.value for job in first] == ["机器人 股票"]

@@ -121,6 +121,12 @@ sector_sentiment:
   market_data_enabled: true    # 用 akshare 板块日线更新背离和成熟事件标签
   llm_enabled: true            # 低置信文本使用 DeepSeek 固定结构分类；false=规则基线
   llm_model_version: "sector-semantic-llm-v1"
+  retrieval:
+    query_version: "sector-finance-query-v1"
+    query_templates: ["{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股", "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情"]
+    max_queries_per_sector: 8
+    max_contents_per_query: 20
+    max_comments_per_content: 50
   keywords: ["机器人", "算力", "创新药"]
   # 正式运行应扩充为完整的申万行业＋东方财富概念版本化词典。
   taxonomy:
