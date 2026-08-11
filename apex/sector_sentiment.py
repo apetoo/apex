@@ -18,6 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from apex.sector_retrieval import RelevanceDecision, classify_financial_relevance
+
 
 MODEL_VERSION = "sector-sentiment-heuristic-v1"
 RULE_VERSION = "sector-alert-v1"
@@ -60,6 +62,13 @@ class SentimentStore:
                     engagement REAL NOT NULL DEFAULT 0, url TEXT, batch_id TEXT,
                     author_hash TEXT, fingerprint TEXT NOT NULL,
                     repost_weight REAL NOT NULL DEFAULT 1.0,
+                    relevance_score REAL,
+                    relevance_decision TEXT NOT NULL DEFAULT 'unclassified',
+                    relevance_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    relevance_version TEXT,
+                    retrieval_source TEXT NOT NULL DEFAULT 'search',
+                    author_id TEXT,
+                    author_name TEXT,
                     UNIQUE(platform, content_id, comment_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_content_day ON content(substr(collected_at, 1, 10));
@@ -109,6 +118,19 @@ class SentimentStore:
                          "engagement_raw", "author_count", "market_data_complete"):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE daily_scores ADD COLUMN {name} REAL NOT NULL DEFAULT 0")
+            content_columns = {row["name"] for row in conn.execute("PRAGMA table_info(content)")}
+            migrations = {
+                "relevance_score": "REAL",
+                "relevance_decision": "TEXT NOT NULL DEFAULT 'unclassified'",
+                "relevance_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+                "relevance_version": "TEXT",
+                "retrieval_source": "TEXT NOT NULL DEFAULT 'search'",
+                "author_id": "TEXT",
+                "author_name": "TEXT",
+            }
+            for name, definition in migrations.items():
+                if name not in content_columns:
+                    conn.execute(f"ALTER TABLE content ADD COLUMN {name} {definition}")
             outcome_columns = {row["name"] for row in conn.execute("PRAGMA table_info(outcomes)")}
             for name in ("price_baseline_hit", "heat_baseline_hit"):
                 if name not in outcome_columns:
@@ -123,12 +145,14 @@ class SentimentStore:
                     conn.execute(
                         """INSERT INTO content
                         (platform, content_id, comment_id, published_at, collected_at, text,
-                         engagement, url, batch_id, author_hash, fingerprint)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         engagement, url, batch_id, author_hash, fingerprint, retrieval_source,
+                         author_id, author_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (item["platform"], str(item["content_id"]), str(item.get("comment_id") or ""),
                          item.get("published_at"), item.get("collected_at") or _now(), item.get("text", ""),
                          float(item.get("engagement") or 0), item.get("url"), item.get("batch_id"),
-                         item.get("author_hash"), fp),
+                         item.get("author_hash"), fp, item.get("retrieval_source", "search"),
+                         item.get("author_id"), item.get("author_name")),
                     )
                     inserted += 1
                     matches = conn.execute(
@@ -147,6 +171,28 @@ class SentimentStore:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM content WHERE substr(collected_at,1,10)=? ORDER BY id", (trade_date,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_relevance(self, platform: str, content_id: str, comment_id: str,
+                       decision: RelevanceDecision) -> None:
+        """Persist a relevance decision against the canonical content key."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE content SET relevance_score=?, relevance_decision=?,
+                   relevance_reasons_json=?, relevance_version=?
+                   WHERE platform=? AND content_id=? AND comment_id=?""",
+                (decision.score, decision.decision,
+                 json.dumps(decision.reasons, ensure_ascii=False), decision.version,
+                 platform, str(content_id), str(comment_id or "")),
+            )
+
+    def list_eligible_content(self, trade_date: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM content
+                   WHERE substr(collected_at,1,10)=? AND relevance_decision='accepted'
+                   ORDER BY id""", (trade_date,)
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -593,10 +639,16 @@ def normalize_external_record(raw: dict, platform: str) -> dict | None:
         "platform": platform, "content_id": str(content_id), "comment_id": str(comment_id),
         "published_at": raw.get("published_at") or raw.get("create_time"),
         "collected_at": _now(), "text": str(text),
+        "title": raw.get("title") or "",
+        "description": raw.get("description") or raw.get("desc") or "",
+        "tags": raw.get("tags") or [],
         "engagement": float(raw.get("engagement") or raw.get("like_count") or raw.get("liked_count") or 0),
         "url": raw.get("url") or raw.get("note_url") or raw.get("video_url"),
         "batch_id": raw.get("batch_id"),
         "author_hash": hashlib.sha256(str(author).encode()).hexdigest() if author else None,
+        "author_id": str(author) if author else None,
+        "author_name": raw.get("author_name") or raw.get("nickname"),
+        "retrieval_source": raw.get("retrieval_source") or "search",
     }
 
 
@@ -727,12 +779,21 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
         all_records.extend(records)
         result = store.ingest(records)
         totals = {key: totals[key] + result[key] for key in totals}
-    all_records = store.list_content(report["trade_date"])
     taxonomy = list(settings.get("taxonomy", []))
     if not taxonomy:
         taxonomy = [{"sector_id": f"concept:{word}", "sector_name": word,
                      "taxonomy": "concept", "aliases": [word]}
                     for word in settings.get("keywords", [])]
+    sector_terms = list(dict.fromkeys(
+        term for sector in taxonomy
+        for term in [sector.get("sector_name", ""), *(sector.get("aliases") or [])]
+        if term
+    ))
+    for record in all_records:
+        relevance = classify_financial_relevance(
+            record, sector_terms, bool(record.get("approved_author")))
+        store.save_relevance(record["platform"], record["content_id"], record.get("comment_id", ""), relevance)
+    all_records = store.list_eligible_content(report["trade_date"])
     if semantic_classifier is None:
         if settings.get("llm_enabled", False):
             def semantic_classifier(record, taxonomy):

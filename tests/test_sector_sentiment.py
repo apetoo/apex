@@ -171,7 +171,7 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
     def runner(platform, _keywords, destination, _timeout):
         rows = [
             _item(platform, f"{platform}-{i}", "机器人必须起飞，赶紧上车，坚定看多",
-                  author_hash=f"{platform}-author-{i}", engagement=100)
+                  title="机器人板块资金流入", author_hash=f"{platform}-author-{i}", engagement=100)
             for i in range(12)
         ]
         destination.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
@@ -222,6 +222,17 @@ def test_mediacrawler_runner_exports_new_jsonl_to_canonical_destination(tmp_path
     assert row["text"] == "机器人起飞"
 
 
+def test_normalization_preserves_headline_fields_for_relevance_gate():
+    row = ss.normalize_external_record({
+        "video_id": "BV1", "title": "机器人板块资金流入", "desc": "继续看多，准备加仓",
+        "tags": ["A股"],
+    }, "bili")
+
+    assert row["title"] == "机器人板块资金流入"
+    assert row["description"] == "继续看多，准备加仓"
+    assert row["tags"] == ["A股"]
+
+
 def test_validation_go_requires_30_events_uplift_and_positive_cluster_ci():
     rows = [
         {"signal_date": f"2026-07-{i + 1:02d}", "short_hit": 1,
@@ -268,3 +279,31 @@ def test_query_planning_rejects_unanchored_templates():
     with pytest.raises(ValueError, match="financial anchor"):
         retrieval.build_search_jobs(taxonomy, ["bili"], {
             "query_templates": ["{term}"], "max_queries_per_sector": 8})
+
+
+@pytest.mark.parametrize("text", ["机器人产品测评", "机械臂安装教程", "机器人编程比赛"])
+def test_physical_robot_content_is_filtered(text):
+    decision = retrieval.classify_financial_relevance(
+        {"title": text, "text": text}, ["机器人"], False)
+
+    assert decision.decision == "filtered_non_financial"
+    assert decision.reasons
+
+
+def test_financial_robot_content_is_accepted():
+    decision = retrieval.classify_financial_relevance(
+        {"title": "机器人板块资金流入", "text": "继续看多，准备加仓"}, ["机器人"], False)
+
+    assert decision.decision == "accepted"
+    assert decision.score >= 0.7
+
+
+def test_filtered_record_is_retained_but_not_eligible(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.ingest([_item("bili", "physical", "机械臂安装教程")])
+    store.save_relevance("bili", "physical", "", retrieval.RelevanceDecision(
+        0.05, "filtered_non_financial", ("exclude:教程",), retrieval.RELEVANCE_VERSION))
+
+    row = store.list_content("2026-08-10")[0]
+    assert row["relevance_decision"] == "filtered_non_financial"
+    assert store.list_eligible_content("2026-08-10") == []
