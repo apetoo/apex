@@ -1,12 +1,17 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Eye, ShieldAlert, ThermometerSun } from "lucide-react";
 
 import {
   getSectorSentimentOverview,
   getSectorSentimentDetail,
+  getSectorSentimentCreators,
   getSectorSentimentValidation,
+  moderateSectorSentimentCreator,
   type AlertState,
+  type CreatorStatus,
+  type FinanceCreator,
+  type RetrievalFunnel,
   type SectorSentimentScore,
 } from "@/api/sector-sentiment";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/base/card";
@@ -22,6 +27,8 @@ const STATE_META: Record<AlertState, { label: string; className: string }> = {
 
 export function SectorSentimentPage() {
   const [taxonomy, setTaxonomy] = useState<"industry" | "concept">("concept");
+  const [view, setView] = useState<"alerts" | "creators">("alerts");
+  const [creatorStatus, setCreatorStatus] = useState<CreatorStatus>("candidate");
   const overview = useQuery({ queryKey: ["sector-sentiment", "overview"], queryFn: () => getSectorSentimentOverview() });
   const validation = useQuery({ queryKey: ["sector-sentiment", "validation"], queryFn: getSectorSentimentValidation });
   const sectors = (overview.data?.sectors ?? []).filter((item) => item.taxonomy === taxonomy);
@@ -49,6 +56,16 @@ export function SectorSentimentPage() {
         </div>
       )}
 
+      <div className="flex gap-2" aria-label="情绪预警视图">
+        {(["alerts", "creators"] as const).map((value) => (
+          <button key={value} type="button" aria-pressed={view === value} onClick={() => setView(value)}
+            className={cn("rounded-md border px-3 py-1.5 text-sm", view === value ? "border-text-primary bg-bg-card" : "border-border text-text-secondary")}>
+            {value === "alerts" ? "预警" : "作者池"}
+          </button>
+        ))}
+      </div>
+
+      {view === "alerts" && <>
       <div className="flex gap-2">
         {(["concept", "industry"] as const).map((value) => (
           <button key={value} onClick={() => setTaxonomy(value)}
@@ -65,8 +82,79 @@ export function SectorSentimentPage() {
           {sectors.map((sector) => <SectorCard key={sector.sector_id} sector={sector} />)}
         </div>
       )}
+      </>}
+
+      {view === "creators" && <CreatorPool status={creatorStatus} onStatusChange={setCreatorStatus} />}
     </div>
   );
+}
+
+function CreatorPool({ status, onStatusChange }: { status: CreatorStatus; onStatusChange: (status: CreatorStatus) => void }) {
+  const queryClient = useQueryClient();
+  const creators = useQuery({
+    queryKey: ["sector-sentiment", "creators", status],
+    queryFn: () => getSectorSentimentCreators(status),
+  });
+  const moderation = useMutation({
+    mutationFn: ({ creator, action }: { creator: FinanceCreator; action: "approve" | "reject" | "restore" }) =>
+      moderateSectorSentimentCreator(creator.platform, creator.creator_id, action),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sector-sentiment", "creators"] }),
+  });
+  const error = moderation.error instanceof Error ? moderation.error.message : moderation.error ? "操作失败，请重试" : null;
+  const emptyLabel: Record<CreatorStatus, string> = {
+    candidate: "暂无候选作者",
+    approved: "暂无已批准作者",
+    rejected: "暂无已拒绝作者",
+  };
+
+  return (
+    <section aria-label="作者池" className="space-y-4">
+      <div className="flex gap-2" aria-label="作者状态">
+        {(["candidate", "approved", "rejected"] as const).map((value) => (
+          <button key={value} type="button" aria-pressed={status === value} onClick={() => onStatusChange(value)}
+            className={cn("rounded-md border px-3 py-1.5 text-sm", status === value ? "border-text-primary bg-bg-card" : "border-border text-text-secondary")}>
+            {{ candidate: "候选", approved: "已批准", rejected: "已拒绝" }[value]}
+          </button>
+        ))}
+      </div>
+      {error && <p role="alert" className="rounded-md border border-down/30 bg-down/5 p-3 text-sm text-down">{error}</p>}
+      {creators.isLoading ? <p className="text-sm text-text-secondary">加载中…</p> : (creators.data?.creators ?? []).length === 0 ? (
+        <Card><CardContent className="py-10 text-center text-sm text-text-secondary">{emptyLabel[status]}</CardContent></Card>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2">
+          {(creators.data?.creators ?? []).map((creator) => (
+            <Card key={`${creator.platform}-${creator.creator_id}`}>
+              <CardContent className="space-y-3 pt-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-medium">{creator.display_name || "未公开显示名"}</p>
+                    <p className="mt-1 text-xs text-text-secondary">{creator.platform} · 财经内容 {(creator.financial_ratio * 100).toFixed(0)}% · 有效内容 {creator.valid_content_count}</p>
+                  </div>
+                  <span className="text-xs text-text-secondary">{creator.status === "candidate" ? "候选" : creator.status === "approved" ? "已批准" : "已拒绝"}</span>
+                </div>
+                <p className="text-xs text-text-secondary">板块：{creator.sector_ids.length ? creator.sector_ids.join(" · ") : "暂无"}</p>
+                <p className="text-xs text-text-secondary">最近发现：{creator.last_discovered_at || "暂无"}</p>
+                {creator.evidence[0]?.text && <blockquote className="border-l-2 border-border pl-2 text-xs text-text-secondary">{creator.evidence[0].text}</blockquote>}
+                {creator.last_collection_error && <p role="alert" className="text-xs text-down">采集异常：{creator.last_collection_error}</p>}
+                <CreatorControls creator={creator} pending={moderation.isPending} onModerate={(action) => moderation.mutate({ creator, action })} />
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function CreatorControls({ creator, pending, onModerate }: { creator: FinanceCreator; pending: boolean; onModerate: (action: "approve" | "reject" | "restore") => void }) {
+  const name = creator.display_name || "该作者";
+  const action = (value: "approve" | "reject" | "restore", label: string) => (
+    <button type="button" disabled={pending} onClick={() => onModerate(value)} aria-label={label}
+      className="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary disabled:opacity-50">{label.replace(name, "")}</button>
+  );
+  if (creator.status === "candidate") return <div className="flex gap-2">{action("approve", `批准${name}`)}{action("reject", `拒绝${name}`)}</div>;
+  if (creator.status === "approved") return <div className="flex gap-2">{action("reject", `拒绝${name}`)}</div>;
+  return <div className="flex gap-2">{action("restore", `恢复${name}为候选`)}</div>;
 }
 
 function SectorCard({ sector }: { sector: SectorSentimentScore }) {
@@ -129,10 +217,25 @@ function SectorCard({ sector }: { sector: SectorSentimentScore }) {
                 </blockquote>
               ))}
             </div>
+            <RetrievalFunnelSummary funnel={detail.data?.retrieval_funnel} />
           </div>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function RetrievalFunnelSummary({ funnel }: { funnel: RetrievalFunnel | undefined }) {
+  if (!funnel) return <p className="text-xs text-text-secondary">暂无检索漏斗数据</p>;
+  return (
+    <div>
+      <p className="text-xs font-medium">检索漏斗</p>
+      <div className="mt-1 grid grid-cols-2 gap-1 text-xs text-text-secondary">
+        <p>原始召回 {funnel.raw_recalled}</p><p>金融相关 {funnel.financial_relevant}</p>
+        <p>已过滤 {funnel.filtered}</p><p>搜索来源 {funnel.search_sources}</p>
+        <p>作者来源 {funnel.creator_sources}</p>
+      </div>
+    </div>
   );
 }
 
