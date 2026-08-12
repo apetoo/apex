@@ -31,12 +31,13 @@ class CollectionResult:
 
 class QuotaBudget:
     def __init__(self, max_requests: int, requests_per_target: int | None = None):
-        if isinstance(max_requests, bool) or max_requests < 0:
+        if isinstance(max_requests, bool) or not isinstance(max_requests, int) or max_requests < 0:
             raise ValueError("max_requests must be a non-negative integer")
-        self.max_requests = int(max_requests)
-        self.requests_per_target = int(max_requests if requests_per_target is None else requests_per_target)
-        if self.requests_per_target < 0:
+        self.max_requests = max_requests
+        per_target = max_requests if requests_per_target is None else requests_per_target
+        if isinstance(per_target, bool) or not isinstance(per_target, int) or per_target < 0:
             raise ValueError("requests_per_target must be a non-negative integer")
+        self.requests_per_target = per_target
         self.request_count = 0
         self.target_requests: dict[str, int] = {}
         self.denied = False

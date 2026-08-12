@@ -137,3 +137,28 @@ GREEN verification was split to stay below the desktop command's 30-second bound
 - Bounded two-page/50-comment pagination: `1 passed`.
 - Duplicate-URL multi-sector mapping: `1 passed`.
 - Completed-batch rerun idempotency: `1 passed`.
+
+## Review round 3 remediation
+
+- A failed shared request now marks every merged target mapping failed, rather than
+  attributing failure only to the first mapping.
+- `QuotaBudget` itself rejects booleans, strings, fractional values, and negatives for
+  both total and per-target limits; callers cannot bypass manifest validation.
+- Comment pagination carries a set of already-seen comment identities. Overlapping pages
+  neither duplicate JSONL nor consume the 50-comment cap twice.
+- Merged mappings must share source type, stock code, and pool version, preventing the
+  first mapping from silently classifying heterogeneous evidence.
+- The real process test returns HTTP 500, verifies one bounded retry consumes the final
+  request allowance, checks `quota_exhausted`, and confirms both merged targets fail.
+
+### Review round 3 RED/GREEN
+
+RED command: `.venv/bin/python -m pytest -q tests/test_eastmoney_guba.py -k 'quota_budget_strictly or mixed_mapping'`
+
+Result: expected failures for string/fraction budgets and mixed classification.
+
+GREEN commands/results:
+
+- Strict quota and mapping validation: `5 passed, 25 deselected`.
+- Shared 500/retry quota plus unique comment pagination process tests:
+  `2 passed, 28 deselected`.

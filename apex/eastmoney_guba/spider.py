@@ -90,6 +90,10 @@ def _validate_manifest(value: object) -> dict:
         if any(any(not item.get(name) for name in
                    ("target_id", "sector_id", "source_type", "pool_version")) for item in mappings):
             raise ValueError("every job mapping requires target, sector, source type, and version")
+        classifications = {(item["source_type"], item.get("stock_code"), item["pool_version"])
+                           for item in mappings}
+        if len(classifications) != 1:
+            raise ValueError("merged mappings must share one source classification")
         if key not in merged:
             merged[key] = dict(job, mappings=list(mappings))
         else:
@@ -189,15 +193,17 @@ class EastmoneySpider(scrapy.Spider):
             if job["kind"] == "comments":
                 page = self.parser.parse_comment_page(response.body, content_type,
                                                       window_start=job.get("window_start"))
-                used = int(job.get("comments_collected", 0))
-                records = page.records[: max(0, self.comments_per_post - used)]
+                seen = set(job.get("seen_comment_ids") or [])
+                unique = [record for record in page.records
+                          if record["comment_id"] not in seen]
+                records = unique[: max(0, self.comments_per_post - len(seen))]
                 self._export(records, job)
-                used += len(records)
-                if (page.has_more and page.next_cursor and used < self.comments_per_post
+                seen.update(record["comment_id"] for record in records)
+                if (page.has_more and page.next_cursor and len(seen) < self.comments_per_post
                         and job.get("comments_next_url_template")):
                     child = dict(job, url=job["comments_next_url_template"].format(
                         content_id=job.get("content_id", ""), cursor=page.next_cursor),
-                                 cursor=page.next_cursor, comments_collected=used)
+                                 cursor=page.next_cursor, seen_comment_ids=sorted(seen))
                     request = self._request(child)
                     if request is not None:
                         yield request
@@ -249,7 +255,8 @@ class EastmoneySpider(scrapy.Spider):
     def request_failed(self, failure):
         request = failure.request
         job = request.cb_kwargs.get("job", {})
-        self.failed_targets.add(str(job.get("target_id") or "unknown"))
+        for mapping in job.get("mappings") or [job]:
+            self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
 
     def closed(self, reason):
         report = {

@@ -127,6 +127,12 @@ def test_quota_and_runner_return_explicit_partial_and_empty_states(tmp_path: Pat
     assert empty.status == "empty_valid"
 
 
+@pytest.mark.parametrize("value", [True, "2", 1.5, -1])
+def test_quota_budget_strictly_rejects_invalid_constructor_values(value):
+    with pytest.raises(ValueError):
+        QuotaBudget(value)
+
+
 @pytest.mark.parametrize(
     ("reason", "status"),
     [("blocked", "blocked"), ("schema_changed", "schema_changed"), ("failed", "failed")],
@@ -140,8 +146,10 @@ def test_runner_preserves_terminal_failure_reason(reason: str, status: str):
 
 class _CollectorHandler(BaseHTTPRequestHandler):
     routes: dict[str, tuple[int, str, bytes]] = {}
+    hits: dict[str, int] = {}
 
     def do_GET(self):
+        self.hits[self.path] = self.hits.get(self.path, 0) + 1
         status, content_type, body = self.routes[self.path]
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -160,11 +168,16 @@ def collector_server(monkeypatch):
                          "comment_like_count": 0, "user_id": f"u{index}",
                          "reply_to_comment_id": ""} for index in range(30)],
                 "has_more": True, "next_cursor": "two"}
-    page_two = {"re": [{"comment_id": f"p2-{index}", "post_id": "1001",
+    page_two = {"re": [{"comment_id": f"p1-{index}", "post_id": "1001",
+                         "comment_content": "重复", "comment_publish_time": "2026-08-11 16:10:00",
+                         "comment_like_count": 0, "user_id": f"u{index}",
+                         "reply_to_comment_id": ""} for index in range(10)] +
+                       [{"comment_id": f"p2-{index}", "post_id": "1001",
                          "comment_content": "谨慎", "comment_publish_time": "2026-08-11 16:10:00",
                          "comment_like_count": 0, "user_id": f"v{index}",
-                         "reply_to_comment_id": ""} for index in range(30)],
+                         "reply_to_comment_id": ""} for index in range(20)],
                 "has_more": True, "next_cursor": "three"}
+    _CollectorHandler.hits = {}
     _CollectorHandler.routes = {
         "/list": (200, "application/json", fixture("posts.json")),
         "/detail/1001": (200, "application/json", fixture("posts.json")),
@@ -174,6 +187,7 @@ def collector_server(monkeypatch):
         "/schema": (200, "application/json", b'{"changed": []}'),
         "/comment-pages/1001?cursor=one": (200, "application/json", json.dumps(page_one).encode()),
         "/comment-pages/1001?cursor=two": (200, "application/json", json.dumps(page_two).encode()),
+        "/server-error": (500, "application/json", b'{"error": true}'),
     }
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CollectorHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -330,6 +344,36 @@ def test_duplicate_url_jobs_preserve_all_sector_mappings(tmp_path: Path, collect
     records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
     assert result.status == "ok"
     assert all(set(record["sector_ids"]) == {"robot", "compute"} for record in records)
+
+
+def test_shared_url_failure_marks_every_mapping_and_retry_consumes_quota(
+        tmp_path: Path, collector_server: str):
+    manifest = _manifest(tmp_path, collector_server, path="/server-error", max_requests=2)
+    manifest["settings"].update({"retry_times": 3, "retry_backoff_base_seconds": 0,
+                                 "retry_backoff_max_seconds": 0})
+    manifest["jobs"][0].pop("detail_url_template")
+    manifest["jobs"][0].pop("comments_url_template")
+    manifest["jobs"].append(dict(manifest["jobs"][0], sector_id="compute",
+                                 target_id="bk-compute"))
+    result, report = _run_manifest(tmp_path, manifest)
+    payload = json.loads(report.read_text())
+    assert result.status == "partial" and result.quota_exhausted is True
+    assert payload["failed_targets"] == 2
+    assert payload["request_count"] == 2
+    assert _CollectorHandler.hits["/server-error"] == 2
+
+
+def test_manifest_rejects_mixed_mapping_classification(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APEX_EASTMONEY_TESTING", "1")
+    manifest = _manifest(tmp_path, "http://127.0.0.1")
+    manifest["jobs"][0]["mappings"] = [
+        {"target_id": "a", "sector_id": "robot", "source_type": "sector_forum",
+         "stock_code": None, "pool_version": "v1"},
+        {"target_id": "b", "sector_id": "robot", "source_type": "constituent_forum",
+         "stock_code": "000001", "pool_version": "v1"},
+    ]
+    with pytest.raises(ValueError, match="classification"):
+        _validate_manifest(manifest)
 
 
 def test_completed_batch_rerun_is_idempotent(tmp_path: Path, collector_server: str):
