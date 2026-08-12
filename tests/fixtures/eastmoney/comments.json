@@ -1,0 +1,22 @@
+{
+  "re": [
+    {
+      "comment_id": "c-1",
+      "post_id": "1001",
+      "comment_content": "短期太热了，注意回撤",
+      "comment_publish_time": "2026-08-11 16:00:00",
+      "comment_like_count": 3,
+      "user_id": "user-2",
+      "reply_to_comment_id": ""
+    },
+    {
+      "comment_id": "nested",
+      "post_id": "1001",
+      "comment_content": "这是嵌套回复",
+      "comment_publish_time": "2026-08-11 16:01:00",
+      "comment_like_count": 0,
+      "user_id": "user-3",
+      "reply_to_comment_id": "c-1"
+    }
+  ]
+}

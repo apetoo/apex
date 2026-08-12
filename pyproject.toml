@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.110",
     "pytest>=8.0.0",
+    "scrapy>=2.13,<2.14",
     "sse-starlette>=2.0",
     "uvicorn>=0.27",
 ]
