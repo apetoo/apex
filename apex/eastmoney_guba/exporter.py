@@ -11,13 +11,29 @@ class EastmoneyExporter:
             raise ValueError("author_salt is required")
         self.output = Path(output)
         self.author_salt = author_salt
+        self._seen: set[tuple] = set()
+        if self.output.exists():
+            for line in self.output.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                    self._seen.add((item.get("batch_id"), item.get("content_id"),
+                                    item.get("comment_id", ""), tuple(sorted(item.get("sector_ids", [])))))
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
     def export(self, records: list[dict], *, trade_date: str, batch_id: str, sector_id: str,
                source_type: str, stock_code: str | None, pool_version: str,
-               collected_at: str) -> int:
+               collected_at: str, sector_ids: list[str] | None = None,
+               target_mappings: list[dict] | None = None) -> int:
         self.output.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        sectors = sorted(set(sector_ids or [sector_id]))
         with self.output.open("a", encoding="utf-8") as stream:
             for item in records:
+                identity = (batch_id, str(item["content_id"]), str(item.get("comment_id") or ""),
+                            tuple(sectors))
+                if identity in self._seen:
+                    continue
                 author = str(item.get("author_id") or "")
                 record = {
                     "platform": "eastmoney", "content_id": str(item["content_id"]),
@@ -34,8 +50,11 @@ class EastmoneyExporter:
                     ).hexdigest() if author else None,
                     "source_type": source_type, "retrieval_source": "eastmoney_guba",
                     "retrieval_source_id": f"{source_type}:{stock_code or sector_id}",
-                    "sector_ids": [sector_id], "stock_code": stock_code,
+                    "sector_ids": sectors, "stock_code": stock_code,
+                    "target_mappings": target_mappings or [],
                     "target_pool_version": pool_version,
                 }
                 stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        return len(records)
+                self._seen.add(identity)
+                written += 1
+        return written

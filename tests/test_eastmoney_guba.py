@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +17,7 @@ from apex.eastmoney_guba import (
     QuotaBudget,
     SchemaChanged,
 )
+from apex.eastmoney_guba.spider import ExponentialRetryMiddleware, _validate_manifest
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "eastmoney"
@@ -151,7 +153,18 @@ class _CollectorHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def collector_server():
+def collector_server(monkeypatch):
+    monkeypatch.setenv("APEX_EASTMONEY_TESTING", "1")
+    page_one = {"re": [{"comment_id": f"p1-{index}", "post_id": "1001",
+                         "comment_content": "看多", "comment_publish_time": "2026-08-11 16:00:00",
+                         "comment_like_count": 0, "user_id": f"u{index}",
+                         "reply_to_comment_id": ""} for index in range(30)],
+                "has_more": True, "next_cursor": "two"}
+    page_two = {"re": [{"comment_id": f"p2-{index}", "post_id": "1001",
+                         "comment_content": "谨慎", "comment_publish_time": "2026-08-11 16:10:00",
+                         "comment_like_count": 0, "user_id": f"v{index}",
+                         "reply_to_comment_id": ""} for index in range(30)],
+                "has_more": True, "next_cursor": "three"}
     _CollectorHandler.routes = {
         "/list": (200, "application/json", fixture("posts.json")),
         "/detail/1001": (200, "application/json", fixture("posts.json")),
@@ -159,6 +172,8 @@ def collector_server():
         "/blocked": (403, "text/html", b"forbidden"),
         "/captcha": (200, "text/html; charset=utf-8", "<html>请输入验证码</html>".encode()),
         "/schema": (200, "application/json", b'{"changed": []}'),
+        "/comment-pages/1001?cursor=one": (200, "application/json", json.dumps(page_one).encode()),
+        "/comment-pages/1001?cursor=two": (200, "application/json", json.dumps(page_two).encode()),
     }
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CollectorHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -176,6 +191,7 @@ def _manifest(tmp_path: Path, base: str, path: str = "/list", max_requests: int 
         "collected_at": "2026-08-12T16:00:00+08:00",
         "output_file": str(tmp_path / "records.jsonl"), "author_salt": "test-salt",
         "jobdir": str(tmp_path / "jobdir"),
+        "test_hosts": ["127.0.0.1"],
         "settings": {"max_requests": max_requests, "requests_per_target": 10,
                      "posts_per_target": 10, "comments_per_post": 10,
                      "download_delay_seconds": 0, "timeout_seconds": 3, "retry_times": 1},
@@ -230,3 +246,96 @@ def test_runner_never_reuses_stale_or_malformed_report(tmp_path: Path):
 
     with pytest.raises(ValueError):
         EastmoneyRunner.classify_result({"records": "not-an-int"})
+
+
+def test_manifest_rejects_non_https_or_non_eastmoney_hosts_without_test_switch(tmp_path: Path,
+                                                                               monkeypatch):
+    monkeypatch.delenv("APEX_EASTMONEY_TESTING", raising=False)
+    base = _manifest(tmp_path, "http://evil.example")
+    base.pop("test_hosts")
+    with pytest.raises(ValueError, match="HTTPS Eastmoney"):
+        _validate_manifest(base)
+
+    injected = _manifest(tmp_path, "http://127.0.0.1")
+    with pytest.raises(ValueError, match="APEX_EASTMONEY_TESTING"):
+        _validate_manifest(injected)
+    base["jobs"][0]["url"] = "https://evil.example/list"
+    with pytest.raises(ValueError, match="HTTPS Eastmoney"):
+        _validate_manifest(base)
+
+
+def test_test_host_injection_only_allows_loopback(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APEX_EASTMONEY_TESTING", "1")
+    manifest = _manifest(tmp_path, "http://evil.example")
+    manifest["test_hosts"] = ["evil.example"]
+    with pytest.raises(ValueError, match="loopback"):
+        _validate_manifest(manifest)
+
+
+def test_retry_backoff_is_bounded_exponential():
+    assert [ExponentialRetryMiddleware.delay_for(n, base=0.5, cap=2) for n in range(1, 6)] == [
+        0.5, 1.0, 2.0, 2.0, 2.0,
+    ]
+
+
+def test_manifest_rejects_bool_fractional_negative_and_unknown_budget_values(tmp_path: Path,
+                                                                            monkeypatch):
+    monkeypatch.setenv("APEX_EASTMONEY_TESTING", "1")
+    collector_server = "http://127.0.0.1"
+    for value in (True, 1.5, -1, "10"):
+        manifest = _manifest(tmp_path, collector_server)
+        manifest["settings"]["max_requests"] = value
+        with pytest.raises(ValueError, match="max_requests"):
+            _validate_manifest(manifest)
+    manifest = _manifest(tmp_path, collector_server, max_requests=0)
+    assert _validate_manifest(manifest)["settings"]["max_requests"] == 0
+
+
+def test_known_empty_html_contract_is_valid_empty():
+    parser = EastmoneyParser()
+    assert parser.parse_posts(b'<div class="articlelist"></div>', "text/html") == []
+    assert parser.parse_comments(b'<div class="comment_list"></div>', "text/html") == []
+
+
+def test_comment_page_exposes_typed_cursor_and_filters_window():
+    payload = json.loads(fixture("comments.json"))
+    payload["has_more"] = True
+    payload["next_cursor"] = "cursor-2"
+    page = EastmoneyParser().parse_comment_page(
+        json.dumps(payload).encode(), "application/json",
+        window_start="2026-08-11 15:30:00",
+    )
+    assert [record["comment_id"] for record in page.records] == ["c-1"]
+    assert page.next_cursor == "cursor-2" and page.has_more is True
+
+
+def test_process_comment_pagination_stops_at_fifty(tmp_path: Path, collector_server: str):
+    manifest = _manifest(tmp_path, collector_server)
+    manifest["settings"]["comments_per_post"] = 50
+    job = manifest["jobs"][0]
+    job["comments_url_template"] = collector_server + "/comment-pages/{content_id}?cursor=one"
+    job["comments_next_url_template"] = collector_server + "/comment-pages/{content_id}?cursor={cursor}"
+    result, report = _run_manifest(tmp_path, manifest)
+    records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
+    assert result.status == "ok"
+    assert sum(bool(record["comment_id"]) for record in records) == 50
+    assert json.loads(report.read_text())["request_count"] == 4
+
+
+def test_duplicate_url_jobs_preserve_all_sector_mappings(tmp_path: Path, collector_server: str):
+    manifest = _manifest(tmp_path, collector_server)
+    duplicate = dict(manifest["jobs"][0], sector_id="compute", target_id="bk-compute")
+    manifest["jobs"].append(duplicate)
+    result, _ = _run_manifest(tmp_path, manifest)
+    records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
+    assert result.status == "ok"
+    assert all(set(record["sector_ids"]) == {"robot", "compute"} for record in records)
+
+
+def test_completed_batch_rerun_is_idempotent(tmp_path: Path, collector_server: str):
+    manifest = _manifest(tmp_path, collector_server)
+    first, _ = _run_manifest(tmp_path, manifest)
+    second, _ = _run_manifest(tmp_path, manifest)
+    lines = (tmp_path / "records.jsonl").read_text().splitlines()
+    assert first.status == second.status == "ok"
+    assert len(lines) == 2

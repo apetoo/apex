@@ -18,5 +18,7 @@
       "user_id": "user-3",
       "reply_to_comment_id": "c-1"
     }
-  ]
+  ],
+  "has_more": false,
+  "next_cursor": null
 }

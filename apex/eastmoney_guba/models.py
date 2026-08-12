@@ -34,7 +34,9 @@ class QuotaBudget:
         if isinstance(max_requests, bool) or max_requests < 0:
             raise ValueError("max_requests must be a non-negative integer")
         self.max_requests = int(max_requests)
-        self.requests_per_target = int(requests_per_target or max_requests)
+        self.requests_per_target = int(max_requests if requests_per_target is None else requests_per_target)
+        if self.requests_per_target < 0:
+            raise ValueError("requests_per_target must be a non-negative integer")
         self.request_count = 0
         self.target_requests: dict[str, int] = {}
         self.denied = False

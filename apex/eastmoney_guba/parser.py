@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 
 
@@ -13,6 +15,36 @@ class SchemaChanged(ValueError):
 
 
 _BLOCK_MARKERS = ("验证码", "访问过于频繁", "请登录", "安全验证")
+
+
+@dataclass(frozen=True)
+class CommentPage:
+    records: list[dict]
+    has_more: bool
+    next_cursor: str | None
+    window_exhausted: bool = False
+
+
+def _count(value) -> int:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, bool):
+        raise SchemaChanged("numeric count cannot be boolean")
+    if isinstance(value, (int, float)):
+        if value < 0:
+            raise SchemaChanged("numeric count cannot be negative")
+        return int(value)
+    text = str(value).strip().replace(",", "")
+    multiplier = 10000 if text.endswith("万") else 1
+    if multiplier != 1:
+        text = text[:-1]
+    try:
+        number = float(text)
+    except ValueError as exc:
+        raise SchemaChanged("invalid numeric count") from exc
+    if number < 0:
+        raise SchemaChanged("numeric count cannot be negative")
+    return int(number * multiplier)
 
 
 class _PostHTMLParser(HTMLParser):
@@ -52,7 +84,7 @@ class _PostHTMLParser(HTMLParser):
         value = data.strip()
         if not value:
             return
-        self.current[self.field] = int(value) if self.field.endswith("_count") else value
+        self.current[self.field] = _count(value) if self.field.endswith("_count") else value
 
 
 class _CommentHTMLParser(HTMLParser):
@@ -93,7 +125,7 @@ class _CommentHTMLParser(HTMLParser):
             return
         value = data.strip()
         if value:
-            self.current[self.field] = int(value) if self.field == "like_count" else value
+            self.current[self.field] = _count(value) if self.field == "like_count" else value
 
 
 class EastmoneyParser:
@@ -109,23 +141,42 @@ class EastmoneyParser:
         parser = _PostHTMLParser()
         parser.feed(text)
         if not parser.posts:
+            if re.search(r'class=["\'][^"\']*\barticlelist\b', text):
+                return []
             raise SchemaChanged("post HTML contains no recognized rows")
         return parser.posts
 
     def parse_comments(self, body: bytes, content_type: str) -> list[dict]:
+        return self.parse_comment_page(body, content_type).records
+
+    def parse_comment_page(self, body: bytes, content_type: str, *,
+                           window_start: str | None = None) -> CommentPage:
         text = body.decode("utf-8", errors="replace")
         self._ensure_not_blocked(text)
         if "json" not in content_type.lower():
             parser = _CommentHTMLParser()
             parser.feed(text)
             if not parser.comments:
+                if re.search(r'class=["\'][^"\']*\bcomment_list\b', text):
+                    return CommentPage([], False, None)
                 raise SchemaChanged("comment HTML contains no recognized rows")
-            return parser.comments
+            records = parser.comments
+            filtered = [row for row in records if not window_start or row["published_at"] >= window_start]
+            return CommentPage(filtered, False, None,
+                               bool(window_start and len(filtered) < len(records)))
         payload = self._json(text)
         rows = payload.get("re")
         if not isinstance(rows, list):
             raise SchemaChanged("comment response missing re list")
-        return [self._comment(row) for row in rows if not row.get("reply_to_comment_id")]
+        records = [self._comment(row) for row in rows if not row.get("reply_to_comment_id")]
+        filtered = [row for row in records if not window_start or row["published_at"] >= window_start]
+        has_more = payload.get("has_more", False)
+        cursor = payload.get("next_cursor")
+        if not isinstance(has_more, bool) or (cursor is not None and not isinstance(cursor, (str, int))):
+            raise SchemaChanged("invalid comment pagination contract")
+        exhausted = bool(window_start and len(filtered) < len(records))
+        return CommentPage(filtered, has_more and not exhausted, str(cursor) if cursor is not None else None,
+                           exhausted)
 
     @staticmethod
     def _ensure_not_blocked(text: str) -> None:
@@ -155,9 +206,9 @@ class EastmoneyParser:
             "content_id": str(row["post_id"]), "comment_id": "",
             "title": str(row.get("post_title") or ""), "text": str(row.get("post_content") or ""),
             "published_at": row["post_publish_time"], "author_id": row.get("user_id"),
-            "read_count": int(row.get("post_click_count") or 0),
-            "reply_count": int(row.get("post_comment_count") or 0),
-            "like_count": int(row.get("post_like_count") or 0),
+            "read_count": _count(row.get("post_click_count")),
+            "reply_count": _count(row.get("post_comment_count")),
+            "like_count": _count(row.get("post_like_count")),
         }
 
     @staticmethod
@@ -170,5 +221,5 @@ class EastmoneyParser:
             "text": str(row.get("comment_content") or ""),
             "published_at": row["comment_publish_time"], "author_id": row.get("user_id"),
             "read_count": 0, "reply_count": 0,
-            "like_count": int(row.get("comment_like_count") or 0),
+            "like_count": _count(row.get("comment_like_count")),
         }

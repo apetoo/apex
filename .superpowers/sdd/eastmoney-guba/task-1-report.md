@@ -100,3 +100,40 @@ Result: `86 passed`. These existing tests use the project's dependency-complete 
 environment; the new lock-derived minimal environment does not include the pre-existing
 undeclared `httpx` dependency used by `apex.llm`, so combining those suites inside that
 minimal environment produces dependency errors unrelated to this collector change.
+
+## Review round 2 remediation
+
+- Production manifests now accept HTTPS URLs only on the fixed
+  `guba.eastmoney.com` / `gbapi.eastmoney.com` allowlist. Local HTTP fixtures require
+  both `APEX_EASTMONEY_TESTING=1` and a loopback-only `test_hosts` declaration;
+  `allowed_domains` is never derived from arbitrary manifest hosts.
+- The custom retry middleware applies a non-blocking bounded exponential delay and
+  counts retry requests against the same total/per-target quota.
+- Comment pages expose typed `has_more`/`next_cursor` state, filter at the frozen time
+  window, and stop scheduling at the configured maximum (hard-capped at 50).
+- Duplicate typed URLs are premerged and carry every target/sector mapping into one
+  canonical record. The configured per-domain concurrency now takes effect because the
+  dead spider-level override was removed.
+- Counts accept comma and Chinese ten-thousand forms while rejecting invalid/negative
+  values. Budgets reject booleans, strings, fractional and negative values; zero remains
+  an explicit valid stop budget. Recognized empty HTML containers are valid empty pages.
+- Exporting is idempotent per batch/content/comment/sector set. A successfully completed
+  `JOBDIR` is marked and cleared before an intentional rerun, while interrupted job state
+  remains resumable. Reports remain atomic and stale-safe.
+
+### Review round 2 RED/GREEN
+
+Initial command: `.venv/bin/python -m pytest -q tests/test_eastmoney_guba.py`
+
+RED: collection failed because `ExponentialRetryMiddleware` did not exist. Subsequent
+focused RED exposed lost mappings after a manifest was validated twice and a completed
+rerun reporting `empty_valid` instead of the stable batch result.
+
+GREEN verification was split to stay below the desktop command's 30-second boundary:
+
+- Non-network collector tests: `16 passed, 8 deselected`.
+- Successful process/export and quota paths: `2 passed, 22 deselected`.
+- Blocked/CAPTCHA/schema process paths: `3 passed, 21 deselected`.
+- Bounded two-page/50-comment pagination: `1 passed`.
+- Duplicate-URL multi-sector mapping: `1 passed`.
+- Completed-batch rerun idempotency: `1 passed`.
