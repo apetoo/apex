@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -132,3 +134,99 @@ def test_runner_preserves_terminal_failure_reason(reason: str, status: str):
         {"records": 0, "request_count": 1, "failed_targets": 1, "terminal_reason": reason}
     )
     assert result.status == status
+
+
+class _CollectorHandler(BaseHTTPRequestHandler):
+    routes: dict[str, tuple[int, str, bytes]] = {}
+
+    def do_GET(self):
+        status, content_type, body = self.routes[self.path]
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+@pytest.fixture
+def collector_server():
+    _CollectorHandler.routes = {
+        "/list": (200, "application/json", fixture("posts.json")),
+        "/detail/1001": (200, "application/json", fixture("posts.json")),
+        "/comments/1001": (200, "application/json", fixture("comments.json")),
+        "/blocked": (403, "text/html", b"forbidden"),
+        "/captcha": (200, "text/html; charset=utf-8", "<html>请输入验证码</html>".encode()),
+        "/schema": (200, "application/json", b'{"changed": []}'),
+    }
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CollectorHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+def _manifest(tmp_path: Path, base: str, path: str = "/list", max_requests: int = 10):
+    return {
+        "trade_date": "2026-08-12", "batch_id": "batch-process",
+        "collected_at": "2026-08-12T16:00:00+08:00",
+        "output_file": str(tmp_path / "records.jsonl"), "author_salt": "test-salt",
+        "jobdir": str(tmp_path / "jobdir"),
+        "settings": {"max_requests": max_requests, "requests_per_target": 10,
+                     "posts_per_target": 10, "comments_per_post": 10,
+                     "download_delay_seconds": 0, "timeout_seconds": 3, "retry_times": 1},
+        "jobs": [{
+            "kind": "list", "url": base + path, "target_id": "bk0910",
+            "sector_id": "robot", "source_type": "sector_forum", "stock_code": None,
+            "pool_version": "pool-v1", "detail_url_template": base + "/detail/{content_id}",
+            "comments_url_template": base + "/comments/{content_id}",
+        }],
+    }
+
+
+def _run_manifest(tmp_path: Path, manifest: dict):
+    job_file = tmp_path / "manifest.json"
+    report_file = tmp_path / "report.json"
+    job_file.write_text(json.dumps(manifest), encoding="utf-8")
+    return EastmoneyRunner().run(job_file, report_file, timeout_seconds=15), report_file
+
+
+def test_process_path_exports_detail_and_first_level_comments(tmp_path: Path, collector_server: str):
+    result, report_file = _run_manifest(tmp_path, _manifest(tmp_path, collector_server))
+    records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
+
+    assert result.status == "ok"
+    assert {(r["content_id"], r["comment_id"]) for r in records} == {("1001", ""), ("1001", "c-1")}
+    assert all(r["platform"] == "eastmoney" for r in records)
+    assert json.loads(report_file.read_text())["request_count"] == 3
+
+
+@pytest.mark.parametrize(("path", "status"), [
+    ("/blocked", "blocked"), ("/captcha", "blocked"), ("/schema", "schema_changed"),
+])
+def test_process_path_classifies_block_and_schema(tmp_path: Path, collector_server: str,
+                                                  path: str, status: str):
+    result, _ = _run_manifest(tmp_path, _manifest(tmp_path, collector_server, path=path))
+    assert result.status == status
+
+
+def test_process_path_enforces_total_request_quota(tmp_path: Path, collector_server: str):
+    result, _ = _run_manifest(tmp_path, _manifest(tmp_path, collector_server, max_requests=1))
+    assert result.status == "partial"
+    assert result.quota_exhausted is True
+
+
+def test_runner_never_reuses_stale_or_malformed_report(tmp_path: Path):
+    report = tmp_path / "report.json"
+    report.write_text('{"records": 99, "request_count": 1, "failed_targets": 0}', encoding="utf-8")
+    missing_manifest = tmp_path / "missing.json"
+    result = EastmoneyRunner().run(missing_manifest, report, timeout_seconds=5)
+    assert result.status == "failed" and result.records == 0
+    assert not report.exists()
+
+    with pytest.raises(ValueError):
+        EastmoneyRunner.classify_result({"records": "not-an-int"})

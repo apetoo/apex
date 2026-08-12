@@ -59,3 +59,44 @@ Result: `9 passed`.
 - HTML selectors are contractual fixtures and should trigger `schema_changed`, not an
   empty-market interpretation, when Eastmoney changes markup.
 - The target provider requires an explicit `eastmoney_forum_id`; it never guesses one.
+
+## Review round 1 remediation
+
+The initial spider only exposed a subprocess shell and was not acceptable as an
+executable collector. The remediation wires the whole runtime path:
+
+- A validated typed manifest supports `list`, `detail`, and `comments` jobs. List
+  responses schedule detail and first-level comment requests, and every parsed record
+  goes through `EastmoneyParser` and `EastmoneyExporter` into canonical JSONL.
+- `QuotaBudget` now enforces total and per-target request limits; the spider also caps
+  posts per target and comments per post. Denied scheduling sets `quota_exhausted`.
+- 403, CAPTCHA markers, schema drift, and request failures are tracked separately.
+  Reports are atomically replaced and never contain response bodies or author identity.
+- Scrapy receives bounded retries, retry status codes, lower retry priority, timeout,
+  randomized delay, AutoThrottle, and a manifest-scoped `JOBDIR`.
+- Runner deletes stale reports before launch and fails closed on missing or malformed
+  output.
+- HTML nested replies are excluded using explicit parent-comment metadata.
+
+### Review RED
+
+Command: `.venv/bin/python -m pytest -q tests/test_eastmoney_guba.py`
+
+Result: expected nested-comment and stale-report failures; process tests could not bind
+localhost inside the filesystem sandbox. The process tests were then run with localhost
+permission and continued to fail until the runtime wiring was implemented.
+
+### Review GREEN
+
+Command: `.venv/bin/python -m pytest -q tests/test_eastmoney_guba.py`
+
+Result: `15 passed`, including successful list → detail/comments subprocess collection,
+canonical JSONL, 403/CAPTCHA `blocked`, `schema_changed`, quota exhaustion, and stale
+report fail-safe scenarios.
+
+Command: `python -m pytest -q tests/test_sector_sentiment.py tests/test_sector_sentiment_hardening.py`
+
+Result: `86 passed`. These existing tests use the project's dependency-complete system
+environment; the new lock-derived minimal environment does not include the pre-existing
+undeclared `httpx` dependency used by `apex.llm`, so combining those suites inside that
+minimal environment produces dependency errors unrelated to this collector change.

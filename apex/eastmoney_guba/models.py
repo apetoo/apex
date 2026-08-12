@@ -30,18 +30,24 @@ class CollectionResult:
 
 
 class QuotaBudget:
-    def __init__(self, max_requests: int):
+    def __init__(self, max_requests: int, requests_per_target: int | None = None):
         if isinstance(max_requests, bool) or max_requests < 0:
             raise ValueError("max_requests must be a non-negative integer")
         self.max_requests = int(max_requests)
+        self.requests_per_target = int(requests_per_target or max_requests)
         self.request_count = 0
+        self.target_requests: dict[str, int] = {}
+        self.denied = False
 
-    def consume(self) -> bool:
-        if self.request_count >= self.max_requests:
+    def consume(self, target_id: str = "default") -> bool:
+        if (self.request_count >= self.max_requests
+                or self.target_requests.get(target_id, 0) >= self.requests_per_target):
+            self.denied = True
             return False
         self.request_count += 1
+        self.target_requests[target_id] = self.target_requests.get(target_id, 0) + 1
         return True
 
     @property
     def exhausted(self) -> bool:
-        return self.request_count >= self.max_requests
+        return self.denied or self.request_count >= self.max_requests

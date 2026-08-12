@@ -66,6 +66,9 @@ class _CommentHTMLParser(HTMLParser):
         values = dict(attrs)
         classes = set(values.get("class", "").split())
         if "comment_item" in classes and values.get("data-comment-id") and values.get("data-post-id"):
+            if values.get("data-parent-comment-id"):
+                self.current = None
+                return
             post_id = values["data-post-id"]
             self.current = {
                 "content_id": post_id, "comment_id": values["data-comment-id"],
