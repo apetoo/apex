@@ -376,6 +376,17 @@ def test_manifest_rejects_mixed_mapping_classification(tmp_path: Path, monkeypat
         _validate_manifest(manifest)
 
 
+def test_manifest_rejects_separate_duplicate_jobs_with_mixed_classification(
+        tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("APEX_EASTMONEY_TESTING", "1")
+    manifest = _manifest(tmp_path, "http://127.0.0.1")
+    duplicate = dict(manifest["jobs"][0], target_id="stock-1", source_type="constituent_forum",
+                     stock_code="000001")
+    manifest["jobs"].append(duplicate)
+    with pytest.raises(ValueError, match="classification"):
+        _validate_manifest(manifest)
+
+
 def test_completed_batch_rerun_is_idempotent(tmp_path: Path, collector_server: str):
     manifest = _manifest(tmp_path, collector_server)
     first, _ = _run_manifest(tmp_path, manifest)

@@ -162,3 +162,12 @@ GREEN commands/results:
 - Strict quota and mapping validation: `5 passed, 25 deselected`.
 - Shared 500/retry quota plus unique comment pagination process tests:
   `2 passed, 28 deselected`.
+
+### Minor duplicate-job classification follow-up
+
+A new RED proved two separate jobs with the same typed URL could merge after their
+individual mapping checks and bypass heterogeneous source classification validation.
+Post-merge validation now rechecks the full mapping set.
+
+- RED: `1 failed, 30 deselected` (`DID NOT RAISE ValueError`).
+- GREEN focused mapping suite: `3 passed, 28 deselected`.

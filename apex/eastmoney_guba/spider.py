@@ -100,6 +100,11 @@ def _validate_manifest(value: object) -> dict:
             merged[key]["mappings"].extend(mappings)
     value = dict(value)
     value["jobs"] = list(merged.values())
+    for job in value["jobs"]:
+        classifications = {(item["source_type"], item.get("stock_code"), item["pool_version"])
+                           for item in job["mappings"]}
+        if len(classifications) != 1:
+            raise ValueError("merged mappings must share one source classification")
     return value
 
 
