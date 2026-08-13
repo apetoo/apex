@@ -148,6 +148,10 @@ def _sanitize_score_evidence(value: Any) -> list[dict]:
         sanitized = {
             key: item[key] for key in ("platform", "text", "stance") if key in item
         }
+        url = str(item.get("url") or "")
+        if (item.get("platform") == "eastmoney"
+                and url.startswith("https://guba.eastmoney.com/")):
+            sanitized["url"] = url
         if "text" in sanitized:
             sanitized["text"] = _redact_text(sanitized["text"], 160)
         output.append(sanitized)
@@ -249,10 +253,15 @@ def _validate_retrieval_policy(settings: dict, retrieval_settings: dict) -> str:
         raise ValueError("sector_sentiment.relevance_llm_model is required when enabled")
     if settings.get("llm_enabled", False) and not settings.get("semantic_llm_model"):
         raise ValueError("sector_sentiment.semantic_llm_model is required when enabled")
+    eastmoney = settings.get("eastmoney") or {}
+    eastmoney_promoted = bool(eastmoney.get("enabled") and
+                              eastmoney.get("phase", "shadow") == "promoted")
+    frozen_platforms = [value for value in settings.get("platforms", ["bili", "dy"])
+                        if value != "eastmoney" or eastmoney_promoted]
     frozen = {
         **expected,
         "mediacrawler_commit": commit.lower(),
-        "platforms": settings.get("platforms", ["bili", "dy"]),
+        "platforms": frozen_platforms,
         "taxonomy": settings.get("taxonomy"),
         "fallback_keywords": settings.get("keywords"),
         "llm_enabled": bool(settings.get("llm_enabled", False)),
@@ -277,6 +286,8 @@ def _validate_retrieval_policy(settings: dict, retrieval_settings: dict) -> str:
         "finance_terms": list(FINANCE_TERMS),
         "exclude_terms": list(EXCLUDE_TERMS),
     }
+    if eastmoney_promoted:
+        frozen["eastmoney"] = eastmoney
     payload = json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -330,6 +341,7 @@ class SentimentStore:
                     sentiment_raw REAL NOT NULL DEFAULT 0, content_count REAL NOT NULL DEFAULT 0,
                     comment_count REAL NOT NULL DEFAULT 0, engagement_raw REAL NOT NULL DEFAULT 0,
                     author_count REAL NOT NULL DEFAULT 0, market_data_complete INTEGER NOT NULL DEFAULT 1,
+                    coverage_quality_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY(trade_date, sector_id)
                 );
                 CREATE TABLE IF NOT EXISTS alert_state (
@@ -448,6 +460,9 @@ class SentimentStore:
             collection_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(collection_runs)")
             }
+            score_columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_scores)")}
+            if "coverage_quality_json" not in score_columns:
+                conn.execute("ALTER TABLE daily_scores ADD COLUMN coverage_quality_json TEXT NOT NULL DEFAULT '{}'")
             legacy_collection_schema = "config_hash" not in collection_columns
             missing_search_coverage = "search_coverage" not in collection_columns
             missing_creator_coverage = "creator_coverage" not in collection_columns
@@ -1010,12 +1025,14 @@ class SentimentStore:
             )
             conn.execute(
                 """UPDATE daily_scores SET content_count=?, comment_count=?, engagement_raw=?,
-                   author_count=?, market_data_complete=?
+                   author_count=?, market_data_complete=?, coverage_quality_json=?
                    WHERE trade_date=? AND sector_id=?""",
                 (float(score.get("content_count", 0)), float(score.get("comment_count", 0)),
                  float(score.get("engagement_raw", 0)),
                  float(score.get("author_count", score.get("independent_authors", 0))),
                  int(bool(score.get("market_data_complete", True))),
+                 json.dumps(score.get("coverage_quality", score.get("coverage_groups", {})),
+                            ensure_ascii=False, sort_keys=True),
                  score["trade_date"], score["sector_id"]),
             )
 
@@ -1278,6 +1295,26 @@ class SentimentStore:
         value["funnel"] = funnel or None
         return value
 
+    def eastmoney_shadow_progress(self) -> dict[str, int]:
+        """Count distinct Eastmoney shadow attempts and quality-qualified dates."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT trade_date, platforms_json FROM collection_runs ORDER BY trade_date"
+            ).fetchall()
+        attempts: set[str] = set()
+        qualified: set[str] = set()
+        for row in rows:
+            try:
+                eastmoney = json.loads(row["platforms_json"] or "{}").get("eastmoney")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if not isinstance(eastmoney, dict) or eastmoney.get("phase", "shadow") != "shadow":
+                continue
+            attempts.add(str(row["trade_date"]))
+            if eastmoney.get("shadow_qualified") is True:
+                qualified.add(str(row["trade_date"]))
+        return {"attempt_days": len(attempts), "qualified_days": len(qualified)}
+
     def reserve_collection_budget(
         self, trade_date: str, job: RetrievalJob, limits: dict,
     ) -> bool:
@@ -1362,6 +1399,11 @@ def _decode_score(row: sqlite3.Row) -> dict:
     value["platforms"] = json.loads(value.pop("platforms_json"))
     value["platform_contributions"] = json.loads(value.pop("platform_contributions_json"))
     value["evidence"] = _sanitize_score_evidence(value.pop("evidence_json"))
+    value["coverage_quality"] = json.loads(value.pop("coverage_quality_json", "{}") or "{}")
+    value["coverage_groups"] = {
+        key: value["coverage_quality"].get(key, False)
+        for key in ("short_video", "finance_community", "qualified")
+    }
     return value
 
 
@@ -1377,14 +1419,16 @@ def _bool_int(value: bool | None) -> int | None:
 
 
 def _coverage_ok(score: dict) -> bool:
-    return (len(score["platforms"]) >= MIN_PLATFORMS
+    groups = score.get("coverage_quality") or score.get("coverage_groups") or {}
+    return (groups.get("qualified") is True
+            and len(score["platforms"]) >= MIN_PLATFORMS
             and score["independent_authors"] >= MIN_AUTHORS
             and score["mapping_confidence"] >= MIN_MAPPING_CONFIDENCE)
 
 
 def build_daily_score(*, trade_date: str, sector_id: str, sector_name: str,
                       taxonomy: str, evidence: list[dict], history: list[dict],
-                      market: dict) -> dict:
+                      market: dict, coverage_quality: dict | None = None) -> dict:
     """Aggregate each platform first, then combine platforms equally."""
     grouped: dict[str, list[dict]] = {}
     for row in evidence:
@@ -1393,26 +1437,76 @@ def build_daily_score(*, trade_date: str, sector_id: str, sector_name: str,
     for platform, rows in grouped.items():
         weights = [max(0.05, float(row.get("confidence", 0))) * float(row.get("repost_weight", 1.0))
                    for row in rows]
+        original_weights = list(weights)
         total = sum(weights) or 1.0
+        stock_shares = {}
+        if platform == "eastmoney":
+            by_stock: dict[str, list[int]] = {}
+            for index, row in enumerate(rows):
+                if row.get("source_type") == "constituent_forum" and row.get("stock_code"):
+                    by_stock.setdefault(str(row["stock_code"]), []).append(index)
+            for stock_code, indexes in by_stock.items():
+                stock_total = sum(weights[index] for index in indexes)
+                allowed = min(stock_total, total * 0.30)
+                if stock_total > 0 and allowed < stock_total:
+                    scale = allowed / stock_total
+                    for index in indexes:
+                        weights[index] *= scale
+                stock_shares[stock_code] = allowed / total
+        multipliers = [weight / original if original else 0.0
+                       for weight, original in zip(weights, original_weights)]
+        author_weights: dict[str, float] = {}
+        fingerprint_weights: dict[str, float] = {}
+        for row, multiplier in zip(rows, multipliers):
+            if row.get("author_hash"):
+                author = str(row["author_hash"])
+                author_weights[author] = max(author_weights.get(author, 0.0), multiplier)
+            fingerprint = _fingerprint(str(row.get("text", "")))
+            fingerprint_weights[fingerprint] = max(
+                fingerprint_weights.get(fingerprint, 0.0), multiplier
+            )
+        effective_records = sum(multipliers) or 1.0
+        suppressed_mass = max(0.0, float(len(rows)) - effective_records)
         net = sum(float(row.get("stance", 0)) * weight for row, weight in zip(rows, weights)) / total
         contributions[platform] = {
             "records": len(rows),
+            "posts": sum(multiplier for row, multiplier in zip(rows, multipliers)
+                         if not row.get("comment_id")),
+            "comments": sum(multiplier for row, multiplier in zip(rows, multipliers)
+                            if row.get("comment_id")),
             "net_sentiment": net,
             "fomo": sum(float(row.get("fomo", 0)) * weight for row, weight in zip(rows, weights)) / total,
             "panic": sum(float(row.get("panic", 0)) * weight for row, weight in zip(rows, weights)) / total,
+            "constituent_stock_shares": stock_shares,
+            "engagement_raw": sum((1 + float(row.get("engagement", 0))) ** 0.5
+                                  * multiplier for row, multiplier in zip(rows, multipliers)),
+            "authors": sum(author_weights.values()),
+            # Capped-away constituent mass is neutral/non-crowding evidence. Without this,
+            # 100 identical comments capped to 30% still look 100% identical and inflate crowding.
+            "diversity": ((sum(fingerprint_weights.values()) + suppressed_mass)
+                          / max(1.0, float(len(rows)))),
         }
     platform_values = list(contributions.values())
+    coverage_groups = {
+        "short_video": any(platform in grouped for platform in ("bili", "dy")),
+        "finance_community": "eastmoney" in grouped,
+    }
+    coverage_groups["qualified"] = all(coverage_groups.values())
+    coverage_quality = dict(coverage_quality or coverage_groups)
     net_sentiment = (sum(row["net_sentiment"] for row in platform_values) / len(platform_values)
                      if platform_values else 0.0)
     fomo = sum(row["fomo"] for row in platform_values) / len(platform_values) if platform_values else 0.0
-    normalized_texts = [_fingerprint(str(row.get("text", ""))) for row in evidence]
-    diversity = len(set(normalized_texts)) / len(normalized_texts) if normalized_texts else 1.0
+    diversity = (sum(row["diversity"] for row in platform_values) / len(platform_values)
+                 if platform_values else 1.0)
     bullish_consensus = min(1.0, 0.7 * abs(net_sentiment) + 0.3 * (1 - diversity))
-    content_count = sum(float(row.get("repost_weight", 1.0)) for row in evidence if not row.get("comment_id"))
-    comment_count = sum(float(row.get("repost_weight", 1.0)) for row in evidence if row.get("comment_id"))
-    engagement_raw = sum((1 + float(row.get("engagement", 0))) ** 0.5
-                         * float(row.get("repost_weight", 1.0)) for row in evidence)
-    author_count = len({row.get("author_hash") for row in evidence if row.get("author_hash")})
+    content_count = (sum(row["posts"] for row in platform_values) / len(platform_values)
+                     if platform_values else 0.0)
+    comment_count = (sum(row["comments"] for row in platform_values) / len(platform_values)
+                     if platform_values else 0.0)
+    engagement_raw = (sum(row["engagement_raw"] for row in platform_values) / len(platform_values)
+                      if platform_values else 0.0)
+    author_count = (sum(row["authors"] for row in platform_values) / len(platform_values)
+                    if platform_values else 0.0)
     recent5 = history[-5:]
     recent20 = history[-20:]
     def relative_growth(key: str, current: float) -> float:
@@ -1457,8 +1551,14 @@ def build_daily_score(*, trade_date: str, sector_id: str, sector_name: str,
         "consensus_crowding": bullish_consensus, "market_divergence": divergence,
         "short_risk": short_risk, "swing_risk": swing_risk,
         "platform_contributions": contributions,
+        "coverage_groups": coverage_groups,
+        "coverage_quality": coverage_quality,
         "evidence": [{"platform": row["platform"], "text": _redact_text(row.get("text", ""), 160),
-                      "stance": row.get("stance", 0)} for row in evidence[:8]],
+                      "stance": row.get("stance", 0),
+                      **({"url": row["url"]} if row.get("platform") == "eastmoney"
+                         and str(row.get("url") or "").startswith(
+                             "https://guba.eastmoney.com/"
+                         ) else {})} for row in evidence[:8]],
         "attention_raw": attention_raw,
         "sentiment_raw": max(0.0, net_sentiment) * 0.7 + fomo * 0.3,
         "content_count": content_count, "comment_count": comment_count, "engagement_raw": engagement_raw,
@@ -1920,7 +2020,8 @@ def _ingest_and_classify_relevance(
                     continue
                 record["retrieval_source"] = item["mode"]
                 record["retrieval_source_id"] = item["source_id"]
-                record["sector_ids"] = item["sector_ids"]
+                if item.get("sector_ids"):
+                    record["sector_ids"] = item["sector_ids"]
                 record["trade_date"] = item.get("trade_date") or report.get("trade_date")
                 candidates.append(record)
             parent_cutoffs = (
@@ -2024,7 +2125,11 @@ def _semantic_evidence(record: dict, taxonomy: list[dict]) -> list[dict]:
     output = []
     for sector in taxonomy:
         aliases = sector.get("aliases") or [sector.get("sector_name", "")]
-        if not any(alias and alias in text for alias in aliases):
+        explicit_mapping = (
+            record.get("platform") == "eastmoney"
+            and sector["sector_id"] in (record.get("sector_ids") or [])
+        )
+        if not explicit_mapping and not any(alias and alias in text for alias in aliases):
             continue
         output.append({
             "platform": record["platform"], "content_id": record["content_id"],
@@ -2034,9 +2139,13 @@ def _semantic_evidence(record: dict, taxonomy: list[dict]) -> list[dict]:
             "taxonomy": sector["taxonomy"], "stance": stance, "confidence": confidence,
             "fomo": float(any(word in text for word in fomo_words)),
             "panic": float(any(word in text for word in panic_words)),
-            "mapping_confidence": 0.95, "narrative": next((a for a in aliases if a in text), ""),
+            "mapping_confidence": 0.99 if explicit_mapping else 0.95,
+            "narrative": next((a for a in aliases if a in text), sector["sector_name"]),
             "evidence_span": text[:160],
             "repost_weight": float(record.get("repost_weight", 1.0)),
+            "source_type": record.get("source_type"),
+            "stock_code": record.get("stock_code"),
+            "url": record.get("url"),
         })
     return output
 
@@ -2167,11 +2276,19 @@ def llm_semantic_evidence(
             "sector_name": meta["sector_name"], "taxonomy": meta["taxonomy"],
             "mapping_confidence": confidence,
             "repost_weight": float(record.get("repost_weight", 1.0)),
+            "source_type": record.get("source_type"),
+            "stock_code": record.get("stock_code"),
+            "url": (record.get("url") if record.get("platform") == "eastmoney"
+                    and str(record.get("url") or "").startswith(
+                        "https://guba.eastmoney.com/"
+                    ) else None),
         })
     return output
 
 
 def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
+                   eastmoney_runner: Callable | None = None,
+                   eastmoney_constituent_provider: Callable | None = None,
                    trade_date: str | None = None, market_provider: Callable | None = None,
                    semantic_classifier: Callable | None = None) -> dict:
     """Run external collection and normalized ingestion from application config.
@@ -2194,6 +2311,14 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                      "taxonomy": "concept", "aliases": [word]}
                     for word in settings.get("keywords", [])]
     platforms = list(settings.get("platforms", ["bili", "dy"]))
+    eastmoney_settings = dict(settings.get("eastmoney") or {})
+    eastmoney_enabled = bool(eastmoney_settings.get("enabled", False))
+    eastmoney_phase = str(eastmoney_settings.get("phase", "shadow"))
+    eastmoney_promoted = eastmoney_enabled and eastmoney_phase == "promoted"
+    media_platforms = [platform for platform in platforms if platform != "eastmoney"]
+    if eastmoney_enabled:
+        from apex.eastmoney_guba.pipeline import validate_eastmoney_config
+        validate_eastmoney_config(eastmoney_settings)
     retrieval_settings = dict(settings.get("retrieval") or {})
     policy_hash = _validate_retrieval_policy(settings, retrieval_settings)
     retrieval_settings["config_hash"] = policy_hash
@@ -2204,7 +2329,7 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     }
     resolved_date = trade_date or date.today().isoformat()
     search_jobs = build_search_jobs(
-        taxonomy, platforms, retrieval_settings,
+        taxonomy, media_platforms, retrieval_settings,
         trade_date=resolved_date, config_hash=policy_hash,
     )
     if runner is None:
@@ -2233,7 +2358,7 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     )
     store.discover_creator_candidates(store.search_records(resolved_date), retrieval_settings)
     creator_jobs = build_creator_jobs(
-        store.approved_creators(), platforms,
+        store.approved_creators(), media_platforms,
         trade_date=resolved_date, config_hash=policy_hash,
     )
     creator_report = collect_jobs(
@@ -2256,14 +2381,75 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
         key: search_ingest[key] + creator_ingest[key]
         for key in ("inserted", "duplicates")
     }
+    eastmoney_telemetry = {
+        "platform": "eastmoney", "status": "disabled", "posts": 0,
+        "comments": 0, "independent_authors": 0, "parse_success_rate": 0.0,
+    }
+    eastmoney_report = {"trade_date": resolved_date, "jobs": []}
+    if eastmoney_enabled:
+        from apex.eastmoney_guba import EastmoneyRunner
+        from apex.eastmoney_guba.pipeline import collect_eastmoney
+        if eastmoney_runner is None:
+            eastmoney_runner = EastmoneyRunner().run
+        try:
+            constituents = (
+                eastmoney_constituent_provider(taxonomy, resolved_date)
+                if eastmoney_constituent_provider is not None
+                else dict(eastmoney_settings.get("constituents") or {})
+            )
+            if not isinstance(constituents, dict):
+                raise ValueError("eastmoney constituent provider must return a sector mapping")
+            eastmoney_telemetry, eastmoney_report = collect_eastmoney(
+                cache_dir=cache_dir, config=eastmoney_settings, taxonomy=taxonomy,
+                constituents=constituents,
+                trade_date=resolved_date, collected_at=_now(), runner=eastmoney_runner,
+            )
+            eastmoney_telemetry["phase"] = eastmoney_phase
+            eastmoney_ingest = _ingest_and_classify_relevance(
+                eastmoney_report, store, taxonomy,
+                relevance_llm_enabled=relevance_llm_enabled,
+                relevance_version=retrieval_settings["relevance_version"],
+                relevance_llm_model=str(settings.get("relevance_llm_model") or "deepseek-chat"),
+            )
+            for key in totals:
+                totals[key] += eastmoney_ingest[key]
+        except Exception as exc:
+            eastmoney_telemetry.update(
+                status="failed", phase=eastmoney_phase,
+                message=f"{type(exc).__name__}: {exc}",
+            )
+    if eastmoney_enabled:
+        eastmoney_telemetry["phase"] = eastmoney_phase
+        eastmoney_telemetry["shadow_qualified"] = bool(
+            eastmoney_telemetry.get("status") in {"ok", "empty_valid"}
+            and int(eastmoney_telemetry.get("posts") or 0)
+            >= int(eastmoney_settings.get("minimum_posts", 1))
+            and int(eastmoney_telemetry.get("independent_authors") or 0)
+            >= int(eastmoney_settings.get("minimum_authors", 1))
+            and float(eastmoney_telemetry.get("parse_success_rate") or 0)
+            >= float(eastmoney_settings.get("minimum_parse_success_rate", 1.0))
+        )
     funnel = store.retrieval_funnel(resolved_date)
-    all_jobs = search_report["jobs"] + creator_report["jobs"]
+    all_jobs = search_report["jobs"] + creator_report["jobs"] + eastmoney_report["jobs"]
     successful_jobs = sum(
         item["status"] in {"ok", "budget_reused"} for item in all_jobs
     )
-    overall_coverage = (
-        successful_jobs / len(all_jobs) if all_jobs and search_jobs else 0.0
-    )
+    if eastmoney_promoted:
+        from apex.eastmoney_guba.pipeline import grouped_coverage
+        coverage_groups = grouped_coverage(
+            search_report["jobs"] + creator_report["jobs"],
+            eastmoney_telemetry, eastmoney_settings,
+        )
+        overall_coverage = 1.0 if coverage_groups["qualified"] else 0.0
+    else:
+        media_jobs = search_report["jobs"] + creator_report["jobs"]
+        media_successes = sum(item.get("status") in {"ok", "budget_reused"}
+                              for item in media_jobs)
+        coverage_groups = {"short_video": bool(media_successes),
+                           "finance_community": False, "qualified": False}
+        overall_coverage = (
+            media_successes / len(media_jobs) if media_jobs and search_jobs else 0.0
+        )
     report = {
         "trade_date": resolved_date,
         "search_coverage": search_report["coverage"],
@@ -2272,7 +2458,18 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
         "jobs": all_jobs,
         "search_jobs": search_report["jobs"],
         "creator_jobs": creator_report["jobs"],
-        "platforms": {},
+        "platforms": {
+            platform: {
+                "status": ("ok" if any(
+                    job.get("platform") == platform
+                    and job.get("status") in {"ok", "budget_reused"}
+                    for job in all_jobs
+                ) else "failed")
+            }
+            for platform in media_platforms
+        } | ({"eastmoney": eastmoney_telemetry} if eastmoney_enabled else {}),
+        "eastmoney": eastmoney_telemetry,
+        "coverage_groups": coverage_groups,
         "funnel": funnel,
         "query_version": retrieval_settings["query_version"],
         "relevance_version": retrieval_settings["relevance_version"],
@@ -2284,6 +2481,9 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     }
     store.record_collection(report)
     all_records = store.list_eligible_content(resolved_date)
+    scoring_records = (all_records if eastmoney_promoted else
+                       [record for record in all_records
+                        if record.get("platform") != "eastmoney"])
     if semantic_classifier is None:
         if settings.get("llm_enabled", False):
             def semantic_classifier(record, taxonomy):
@@ -2298,7 +2498,7 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
             semantic_classifier = _semantic_evidence
     evidence = []
     classification_errors = 0
-    for record in all_records:
+    for record in scoring_records:
         try:
             evidence.extend(semantic_classifier(record, taxonomy))
         except Exception:
@@ -2323,10 +2523,39 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                     market = series[-1]
             except Exception:
                 market = {}
+        short_ok = any(row.get("platform") in {"bili", "dy"} for row in rows)
+        east_rows = [row for row in rows if row.get("platform") == "eastmoney"]
+        east_posts = sum(not row.get("comment_id") for row in east_rows)
+        east_authors = len({row.get("author_hash") for row in east_rows if row.get("author_hash")})
+        finance_ok = (eastmoney_promoted
+                      and eastmoney_telemetry.get("status") in {"ok", "empty_valid"}
+                      and east_posts >= int(eastmoney_settings.get("minimum_posts", 1))
+                      and east_authors >= int(eastmoney_settings.get("minimum_authors", 1))
+                      and float(eastmoney_telemetry.get("parse_success_rate") or 0)
+                      >= float(eastmoney_settings.get("minimum_parse_success_rate", 1.0)))
+        quality = {
+            "short_video": short_ok, "finance_community": finance_ok,
+            # Shadow must preserve the pre-promotion short-video state behavior.
+            # It cannot satisfy or newly fail the finance-community gate.
+            "qualified": short_ok and finance_ok if eastmoney_promoted else False,
+            "eastmoney_status": eastmoney_telemetry.get("status"),
+            "eastmoney_posts": east_posts, "eastmoney_authors": east_authors,
+            "eastmoney_parse_success_rate": float(
+                eastmoney_telemetry.get("parse_success_rate") or 0
+            ),
+        }
+        if not eastmoney_promoted:
+            quality = {
+                "short_video": short_ok,
+                "finance_community": False,
+                # Preserve the legacy gate: the existing platform/author/mapping checks
+                # in _coverage_ok remain authoritative until explicit promotion.
+                "qualified": True,
+            }
         score = build_daily_score(
             trade_date=resolved_date, sector_id=sector_id, sector_name=meta["sector_name"],
             taxonomy=meta["taxonomy"], evidence=rows, history=history,
-            market=market,
+            market=market, coverage_quality=quality,
         )
         score["model_version"] = (settings.get("llm_model_version", "sector-semantic-llm-v1")
                                   if settings.get("llm_enabled", False) else MODEL_VERSION)

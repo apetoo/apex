@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import math
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -24,7 +26,8 @@ from .parser import BlockedResponse, EastmoneyParser, SchemaChanged
 _KINDS = {"list", "detail", "comments"}
 _PRODUCTION_HOSTS = {"guba.eastmoney.com", "gbapi.eastmoney.com"}
 _BUDGETS = ("max_requests", "requests_per_target", "posts_per_target", "comments_per_post",
-            "retry_times", "timeout_seconds", "concurrent_requests_per_domain")
+            "retry_times", "timeout_seconds", "concurrent_requests_per_domain",
+            "circuit_breaker_failures")
 
 
 def _strict_nonnegative(settings: dict, key: str, default: int, *, positive: bool = False) -> int:
@@ -56,8 +59,10 @@ def _validate_manifest(value: object) -> dict:
         _strict_nonnegative(settings, key, {"max_requests": 1000, "requests_per_target": 100,
                                             "posts_per_target": 100, "comments_per_post": 50,
                                             "retry_times": 3, "timeout_seconds": 20,
-                                            "concurrent_requests_per_domain": 1}[key],
-                            positive=key in {"timeout_seconds", "concurrent_requests_per_domain"})
+                                            "concurrent_requests_per_domain": 1,
+                                            "circuit_breaker_failures": 5}[key],
+                            positive=key in {"timeout_seconds", "concurrent_requests_per_domain",
+                                             "circuit_breaker_failures"})
     if _strict_nonnegative(settings, "comments_per_post", 50) > 50:
         raise ValueError("comments_per_post must not exceed 50")
     injected = value.get("test_hosts") or []
@@ -170,6 +175,13 @@ class EastmoneySpider(scrapy.Spider):
         self.failed_targets: set[str] = set()
         self.terminal_reason: str | None = None
         self.seen_posts: dict[str, int] = {}
+        self.parser_successes = 0
+        self.parser_errors = 0
+        self.request_successes = 0
+        self.request_errors = 0
+        self.circuit_breaker_failures = _strict_nonnegative(
+            settings, "circuit_breaker_failures", 5, positive=True,
+        )
 
     def start_requests(self):
         for job in self.manifest["jobs"]:
@@ -190,14 +202,18 @@ class EastmoneySpider(scrapy.Spider):
                               dont_filter=True)
 
     def parse_job(self, response, job: dict):
+        self._snapshot_response(response, job)
         if response.status == 403:
+            self.request_errors += 1
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
+        self.request_successes += 1
         content_type = response.headers.get(b"Content-Type", b"").decode("latin1")
         try:
             if job["kind"] == "comments":
                 page = self.parser.parse_comment_page(response.body, content_type,
                                                       window_start=job.get("window_start"))
+                self.parser_successes += 1
                 seen = set(job.get("seen_comment_ids") or [])
                 unique = [record for record in page.records
                           if record["comment_id"] not in seen]
@@ -218,14 +234,41 @@ class EastmoneySpider(scrapy.Spider):
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
         except SchemaChanged:
-            self.terminal_reason = "schema_changed"
-            raise CloseSpider("schema_changed")
+            self.parser_errors += 1
+            if self.parser_errors >= self.circuit_breaker_failures:
+                self.terminal_reason = "schema_changed"
+                raise CloseSpider("schema_changed")
+            for mapping in job.get("mappings") or [job]:
+                self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
+            return
+        self.parser_successes += 1
 
         if job["kind"] == "detail":
             self._export(posts[:1], job)
             return
 
-        selected = posts[: self.posts_per_target]
+        window_start = job.get("window_start")
+        if window_start:
+            try:
+                lower = datetime.fromisoformat(str(window_start).replace("Z", "+00:00"))
+                selected_window = []
+                for post in posts:
+                    if not post.get("published_at"):
+                        continue
+                    published = datetime.fromisoformat(
+                        str(post["published_at"]).replace("Z", "+00:00")
+                    )
+                    if published.tzinfo is None and lower.tzinfo is not None:
+                        published = published.replace(tzinfo=lower.tzinfo)
+                    if published >= lower:
+                        selected_window.append(post)
+                posts = selected_window
+            except (TypeError, ValueError):
+                raise CloseSpider("invalid_window_timestamp")
+        posts_limit = job.get("posts_limit", self.posts_per_target)
+        if isinstance(posts_limit, bool) or not isinstance(posts_limit, int) or posts_limit < 0:
+            raise CloseSpider("invalid_posts_limit")
+        selected = posts[: min(self.posts_per_target, posts_limit)]
         self.seen_posts[job["target_id"]] = len(selected)
         for post in selected:
             content_id = post["content_id"]
@@ -257,7 +300,24 @@ class EastmoneySpider(scrapy.Spider):
         )
         self.records += len(records)
 
+    def _snapshot_response(self, response, job: dict) -> None:
+        raw_dir = self.manifest.get("raw_response_dir")
+        if not raw_dir:
+            return
+        identity = hashlib.sha256(
+            (str(job.get("kind")) + "\0" + response.url + "\0").encode("utf-8")
+            + response.body
+        ).hexdigest()
+        path = Path(raw_dir) / f"{identity}.body"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with path.open("xb") as stream:
+                stream.write(response.body)
+        except FileExistsError:
+            pass
+
     def request_failed(self, failure):
+        self.request_errors += 1
         request = failure.request
         job = request.cb_kwargs.get("job", {})
         for mapping in job.get("mappings") or [job]:
@@ -268,6 +328,10 @@ class EastmoneySpider(scrapy.Spider):
             "records": self.records, "request_count": self.quota.request_count,
             "failed_targets": len(self.failed_targets),
             "quota_exhausted": self.quota.exhausted,
+            "parser_successes": self.parser_successes,
+            "parser_errors": self.parser_errors,
+            "request_successes": self.request_successes,
+            "request_errors": self.request_errors,
         }
         if self.terminal_reason:
             report["terminal_reason"] = self.terminal_reason

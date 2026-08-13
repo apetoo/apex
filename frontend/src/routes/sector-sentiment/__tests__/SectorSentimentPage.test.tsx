@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, test, vi } from "vitest";
 
 import { SectorSentimentPage } from "../SectorSentimentPage";
+import { getSectorSentimentOverview, getSectorSentimentValidation } from "@/api/sector-sentiment";
 
 const { getSectorSentimentCreators, getSectorSentimentDetail, moderateSectorSentimentCreator } = vi.hoisted(() => ({
   getSectorSentimentCreators: vi.fn(),
@@ -39,6 +40,15 @@ vi.mock("@/api/sector-sentiment", () => ({
       },
     ],
     changes: [],
+    eastmoney: {
+      current_status: "blocked", display_status: "stale", posts: 12,
+      first_level_comments: 34, independent_authors: 9,
+      sector_forum_records: 30, constituent_forum_records: 16,
+      request_success_rate: 0.98, parse_success_rate: 0.96,
+      quota_exhausted: false, circuit_open: false, schema_changed: false,
+      blocked: true, stale: true, current_attempt_at: "2026-08-10T10:00:00Z",
+      latest_success_at: "2026-08-09T10:00:00Z", shadow_days: 5, shadow_target_days: 14,
+    },
   }),
   getSectorSentimentValidation: vi.fn().mockResolvedValue({
     status: "accumulating",
@@ -55,7 +65,16 @@ vi.mock("@/api/sector-sentiment", () => ({
 
 getSectorSentimentDetail.mockResolvedValue({
   history: [{ trade_date: "2026-08-10", short_risk: 88, swing_risk: 71 }],
-  sector: { evidence: [{ platform: "bili", text: "机器人必须起飞", stance: 1 }] },
+  sector: { evidence: [{ platform: "eastmoney", text: "机器人必须起飞", stance: 1, url: "https://guba.eastmoney.com/news,bk0910,1.html" }] },
+  eastmoney: {
+    current_status: "blocked", display_status: "stale", posts: 12,
+    first_level_comments: 34, independent_authors: 9,
+    sector_forum_records: 30, constituent_forum_records: 16,
+    request_success_rate: 0.98, parse_success_rate: 0.96,
+    quota_exhausted: false, circuit_open: false, schema_changed: false,
+    blocked: true, stale: true, current_attempt_at: "2026-08-10T10:00:00Z",
+    latest_success_at: "2026-08-09T10:00:00Z", shadow_days: 5, shadow_target_days: 14,
+  },
   retrieval_funnel: {
     raw_recalled: 10,
     financial_relevant: 4,
@@ -201,4 +220,52 @@ test("renders warning sector with two horizons and shadow disclaimer", async () 
   fireEvent.click(screen.getByRole("button", { name: "查看机器人证据" }));
   expect(await screen.findByText("机器人必须起飞")).toBeInTheDocument();
   expect(screen.getByText("60日风险轨迹")).toBeInTheDocument();
+});
+
+test("shows Eastmoney stale telemetry and 14-day shadow progress", async () => {
+  renderPage();
+
+  expect(await screen.findByText("东方财富股吧")).toBeInTheDocument();
+  expect(screen.getByText(/当前采集受限/)).toBeInTheDocument();
+  expect(screen.getByText(/展示上一成功批次/)).toBeInTheDocument();
+  expect(screen.getByText("帖子 12")).toBeInTheDocument();
+  expect(screen.getByText("一级评论 34")).toBeInTheDocument();
+  expect(screen.getByText("独立作者 9")).toBeInTheDocument();
+  expect(screen.getByText("影子采集 5 / 14 个交易日")).toBeInTheDocument();
+});
+
+test("renders safe Eastmoney evidence as an external link", async () => {
+  renderPage();
+  fireEvent.click(await screen.findByRole("button", { name: "查看机器人证据" }));
+
+  const link = await screen.findByRole("link", { name: "查看东方财富原文" });
+  expect(link).toHaveAttribute("href", "https://guba.eastmoney.com/news,bk0910,1.html");
+  expect(link).toHaveAttribute("rel", "noreferrer");
+});
+
+test("shows explicit retry controls when overview and validation fail", async () => {
+  vi.mocked(getSectorSentimentOverview).mockRejectedValueOnce(new Error("overview failed"));
+  vi.mocked(getSectorSentimentValidation).mockRejectedValueOnce(new Error("validation failed"));
+  renderPage();
+
+  expect(await screen.findByText("情绪预警数据加载失败")).toBeInTheDocument();
+  expect(screen.getAllByText("验证进度加载失败").length).toBeGreaterThan(0);
+  expect(screen.queryByText("暂无该分类的有效情绪数据")).not.toBeInTheDocument();
+  expect(screen.queryByText(/平台覆盖不足或报告尚未生成/)).not.toBeInTheDocument();
+  expect(screen.queryByText("验证进度加载中")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重试加载情绪预警" }));
+  fireEvent.click(screen.getByRole("button", { name: "重试加载验证进度" }));
+  expect(await screen.findByText("机器人")).toBeInTheDocument();
+});
+
+test("shows an explicit retry when sector detail fails", async () => {
+  getSectorSentimentDetail.mockRejectedValueOnce(new Error("detail failed"));
+  renderPage();
+  fireEvent.click(await screen.findByRole("button", { name: "查看机器人证据" }));
+  expect(await screen.findByText("板块详情加载失败")).toBeInTheDocument();
+  expect(screen.queryByText("60日风险轨迹")).not.toBeInTheDocument();
+  expect(screen.queryByText("脱敏证据")).not.toBeInTheDocument();
+  expect(screen.queryByText("暂无检索漏斗数据")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重试加载机器人详情" }));
+  expect(await screen.findByText("机器人必须起飞")).toBeInTheDocument();
 });

@@ -61,6 +61,43 @@ def _retrieval_funnel(store: ss.SentimentStore, date: str | None) -> dict | None
     return store.collection_summary(date).get("funnel")
 
 
+def _eastmoney_telemetry(store: ss.SentimentStore, date: str | None) -> dict | None:
+    """Return an allowlisted operational view; never expose paths or collector payloads."""
+    run = store.collection_summary(date)
+    raw = (run.get("platforms") or {}).get("eastmoney")
+    if not isinstance(raw, dict):
+        return None
+    current = str(raw.get("current_status") or raw.get("status") or "failed")
+    display = str(raw.get("display_status") or current)
+    last_success = raw.get("last_success") if isinstance(raw.get("last_success"), dict) else {}
+    shown = last_success if display == "stale" and last_success else raw
+    progress = store.eastmoney_shadow_progress()
+    return {
+        "current_status": current,
+        "display_status": display,
+        "posts": int(shown.get("posts") or 0),
+        "first_level_comments": int(shown.get("comments") or 0),
+        "independent_authors": int(shown.get("independent_authors") or 0),
+        "sector_forum_records": int(shown.get("sector_forum_records") or 0),
+        "constituent_forum_records": int(shown.get("constituent_forum_records") or 0),
+        "request_success_rate": float(shown.get("request_success_rate") or 0),
+        "parse_success_rate": float(shown.get("parse_success_rate") or 0),
+        "quota_exhausted": bool(raw.get("quota_exhausted")),
+        "circuit_open": bool(raw.get("circuit_open")),
+        "schema_changed": current == "schema_changed",
+        "blocked": current == "blocked",
+        "stale": display == "stale" or bool(raw.get("stale")),
+        "current_attempt_at": raw.get("as_of"),
+        "latest_success_at": (raw.get("last_success_at") or last_success.get("as_of")
+                              or (raw.get("as_of") if current in {"ok", "empty_valid"} else None)),
+        "phase": str(raw.get("phase") or "shadow"),
+        "shadow_attempt_days": progress["attempt_days"],
+        "shadow_qualified_days": progress["qualified_days"],
+        "shadow_days": min(progress["qualified_days"], 14),
+        "shadow_target_days": 14,
+    }
+
+
 def _public_creator(creator: dict) -> dict:
     """Limit reviewer responses to the public creator contract and content evidence."""
     fields = (
@@ -89,7 +126,8 @@ def overview(date: str | None = Query(None)):
     meta = _quality_meta(store, resolved)
     return {**meta,
             "sectors": sectors, "changes": events, "shadow_mode": True,
-            "retrieval_funnel": _retrieval_funnel(store, resolved)}
+            "retrieval_funnel": _retrieval_funnel(store, resolved),
+            "eastmoney": _eastmoney_telemetry(store, resolved)}
 
 
 @router.get("/events")
@@ -157,7 +195,8 @@ def detail(sector_id: str, date: str | None = Query(None)):
     quality = "ok" if meta["data_quality"] == "ok" and _detail_ok(latest) else "degraded"
     return {**meta, "data_quality": quality, "sector": latest,
             "state": state, "history": history[-60:],
-            "retrieval_funnel": _retrieval_funnel(store, latest["trade_date"])}
+            "retrieval_funnel": _retrieval_funnel(store, latest["trade_date"]),
+            "eastmoney": _eastmoney_telemetry(store, latest["trade_date"])}
 
 
 def _detail_ok(score: dict) -> bool:

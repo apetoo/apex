@@ -11,6 +11,7 @@ import {
   type AlertState,
   type CreatorStatus,
   type FinanceCreator,
+  type EastmoneyTelemetry,
   type RetrievalFunnel,
   type SectorSentimentScore,
 } from "@/api/sector-sentiment";
@@ -45,16 +46,33 @@ export function SectorSentimentPage() {
         </div>
         <div className="rounded-md border border-border bg-bg-card px-4 py-2 text-right text-xs text-text-secondary">
           <p>数据覆盖 {(100 * (overview.data?.coverage ?? 0)).toFixed(0)}%</p>
-          <p>{validation.data ? `${validation.data.trading_days} / ${validation.data.target_days} 个交易日` : "验证进度加载中"}</p>
+          <p>{validation.isError ? "验证进度加载失败" : validation.data ? `${validation.data.trading_days} / ${validation.data.target_days} 个交易日` : "验证进度加载中"}</p>
         </div>
       </div>
 
-      {overview.data?.data_quality !== "ok" && (
+      {overview.isSuccess && overview.data.data_quality !== "ok" && (
         <div className="flex gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700">
           <AlertTriangle className="h-4 w-4 shrink-0" />
           平台覆盖不足或报告尚未生成；缺失数据不会显示为低风险。
         </div>
       )}
+
+      {overview.isError && (
+        <div role="alert" className="rounded-md border border-down/30 bg-down/5 p-3 text-sm text-down">
+          <p>情绪预警数据加载失败</p>
+          <button type="button" aria-label="重试加载情绪预警" onClick={() => overview.refetch()}
+            className="mt-2 rounded-md border border-down/30 px-3 py-1.5">重试</button>
+        </div>
+      )}
+      {validation.isError && (
+        <div role="alert" className="rounded-md border border-down/30 bg-down/5 p-3 text-sm text-down">
+          <p>验证进度加载失败</p>
+          <button type="button" aria-label="重试加载验证进度" onClick={() => validation.refetch()}
+            className="mt-2 rounded-md border border-down/30 px-3 py-1.5">重试</button>
+        </div>
+      )}
+
+      {overview.data?.eastmoney && <EastmoneyStatus telemetry={overview.data.eastmoney} />}
 
       <div className="flex gap-2" aria-label="情绪预警视图">
         {(["alerts", "creators"] as const).map((value) => (
@@ -65,7 +83,7 @@ export function SectorSentimentPage() {
         ))}
       </div>
 
-      {view === "alerts" && <>
+      {view === "alerts" && !overview.isError && <>
       <div className="flex gap-2">
         {(["concept", "industry"] as const).map((value) => (
           <button key={value} onClick={() => setTaxonomy(value)}
@@ -198,7 +216,14 @@ function SectorCard({ sector }: { sector: SectorSentimentScore }) {
         </button>
         {expanded && (
           <div className="space-y-3 border-t border-border pt-3">
-            <div>
+            {detail.isError && (
+              <div role="alert" className="rounded-md border border-down/30 bg-down/5 p-2 text-xs text-down">
+                <p>板块详情加载失败</p>
+                <button type="button" aria-label={`重试加载${sector.sector_name}详情`}
+                  onClick={() => detail.refetch()} className="mt-1 rounded border border-down/30 px-2 py-1">重试</button>
+              </div>
+            )}
+            {!detail.isError && <div>
               <p className="text-xs font-medium">60日风险轨迹</p>
               <div className="mt-2 flex h-12 items-end gap-1">
                 {(detail.data?.history ?? []).map((point) => (
@@ -206,25 +231,60 @@ function SectorCard({ sector }: { sector: SectorSentimentScore }) {
                     className="min-w-1 flex-1 bg-amber-500/60" style={{ height: `${Math.max(4, point.short_risk)}%` }} />
                 ))}
               </div>
-            </div>
-            <div>
+            </div>}
+            {!detail.isError && <div>
               <p className="text-xs font-medium">平台贡献</p>
               <div className="mt-1 text-xs text-text-secondary">
                 {Object.entries(sector.platform_contributions).map(([platform, value]) => (
                   <p key={platform}>{platform} · {value.records}条 · 净情绪{value.net_sentiment.toFixed(2)}</p>
                 ))}
               </div>
-            </div>
-            <div>
+            </div>}
+            {!detail.isError && <div>
               <p className="text-xs font-medium">脱敏证据</p>
               {(detail.data?.sector.evidence ?? sector.evidence).map((item, index) => (
                 <blockquote key={`${item.platform}-${index}`} className="mt-1 border-l-2 border-border pl-2 text-xs text-text-secondary">
-                  {item.text || "—"}
+                  <p>{item.text || "—"}</p>
+                  {item.platform === "eastmoney" && item.url?.startsWith("https://guba.eastmoney.com/") && (
+                    <a href={item.url} target="_blank" rel="noreferrer" className="mt-1 inline-block text-amber-700 underline">查看东方财富原文</a>
+                  )}
                 </blockquote>
               ))}
-            </div>
-            <RetrievalFunnelSummary funnel={detail.data?.retrieval_funnel} />
+            </div>}
+            {!detail.isError && <RetrievalFunnelSummary funnel={detail.data?.retrieval_funnel} />}
           </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EastmoneyStatus({ telemetry }: { telemetry: EastmoneyTelemetry }) {
+  const currentLabel: Record<string, string> = {
+    ok: "采集正常", empty_valid: "窗口内无新增内容", partial: "部分目标采集失败",
+    blocked: "当前采集受限", schema_changed: "页面结构发生变化", failed: "当前采集失败",
+  };
+  return (
+    <Card>
+      <CardContent className="space-y-2 pt-5 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="font-medium">东方财富股吧</p>
+          <p className={telemetry.current_status === "ok" ? "text-up" : "text-amber-700"}>
+            {currentLabel[telemetry.current_status] ?? telemetry.current_status}
+            {telemetry.display_status === "stale" ? " · 展示上一成功批次" : ""}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-secondary">
+          <span>帖子 {telemetry.posts}</span><span>一级评论 {telemetry.first_level_comments}</span>
+          <span>独立作者 {telemetry.independent_authors}</span>
+          <span>板块吧 {telemetry.sector_forum_records}</span><span>成分股吧 {telemetry.constituent_forum_records}</span>
+          <span>请求成功率 {(telemetry.request_success_rate * 100).toFixed(0)}%</span>
+          <span>解析成功率 {(telemetry.parse_success_rate * 100).toFixed(0)}%</span>
+        </div>
+        <p className="text-xs text-text-secondary">影子采集 {telemetry.shadow_days} / {telemetry.shadow_target_days} 个交易日</p>
+        {telemetry.phase === "shadow" && <p className="text-xs text-text-secondary">尝试 {telemetry.shadow_attempt_days} 日 · 质量达标 {telemetry.shadow_qualified_days} 日；当前不参与评分</p>}
+        {(telemetry.quota_exhausted || telemetry.circuit_open) && (
+          <p className="text-xs text-amber-700">{telemetry.quota_exhausted ? "已达到当日采集配额" : "采集熔断已触发"}</p>
         )}
       </CardContent>
     </Card>

@@ -100,6 +100,8 @@ def test_alert_state_moves_observe_warn_then_resolves_without_duplicate_events(t
         "mapping_confidence": 0.9, "sentiment_extreme": 0.95,
         "attention_acceleration": 0.92, "consensus_crowding": 0.80,
         "market_divergence": 0.20, "short_risk": 66, "swing_risk": 48,
+        "coverage_quality": {"short_video": True, "finance_community": True,
+                             "qualified": True},
     }
     store.save_daily_score({**base, "trade_date": "2026-08-10"})
     assert ss.advance_alerts(store, "2026-08-10")[0]["state"] == "observe"
@@ -214,7 +216,7 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
         destination.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
 
     result = ss.run_configured({"sector_sentiment": {
-        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili", "eastmoney"],
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili", "dy"],
         "mediacrawler_commit": PINNED_COMMIT,
         "semantic_prompt_version": ss.PROMPT_VERSION,
         "keywords": ["机器人"], "taxonomy": [
@@ -228,6 +230,7 @@ def test_configured_pipeline_maps_classifies_scores_and_opens_alert(tmp_path):
     assert result["status"] == "ok"
     assert store.scores_for_date("2026-08-10")[0]["sector_id"] == "concept:robot"
     assert store.get_state("concept:robot")["state"] == "observe"
+    assert result["alerts"][0]["state"] == "observe"
 
 
 def financial_config(tmp_path):
@@ -236,7 +239,7 @@ def financial_config(tmp_path):
         "cache_dir": str(tmp_path),
         "mediacrawler_commit": PINNED_COMMIT,
         "semantic_prompt_version": ss.PROMPT_VERSION,
-        "platforms": ["bili", "eastmoney"],
+        "platforms": ["bili", "dy"],
         "taxonomy": [{
             "sector_id": "concept:robot",
             "sector_name": "机器人",
@@ -360,7 +363,7 @@ def test_same_trade_date_rerun_keeps_score_events_and_alert_state_deterministic(
         "enabled": True, "cache_dir": str(tmp_path),
         "mediacrawler_commit": PINNED_COMMIT,
         "semantic_prompt_version": ss.PROMPT_VERSION,
-        "platforms": ["bili", "eastmoney"],
+        "platforms": ["bili", "dy"],
         "taxonomy": [{
             "sector_id": "concept:robot", "sector_name": "机器人", "taxonomy": "concept",
             "aliases": ["机器人"],

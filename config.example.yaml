@@ -116,7 +116,7 @@ sector_sentiment:
   cache_dir: "~/.stock-sentiment"
   mediacrawler_path: "~/workspace/tools/MediaCrawler"
   mediacrawler_commit: ""       # 必填：`git -C <path> rev-parse HEAD`
-  platforms: ["bili", "dy"]
+  platforms: ["bili", "dy"]  # eastmoney 在 phase=shadow 时不属于活跃评分平台
   timeout_seconds: 900
   market_data_enabled: true    # 用 akshare 板块日线更新背离和成熟事件标签
   llm_enabled: true            # 低置信文本使用 DeepSeek 固定结构分类；false=规则基线
@@ -124,6 +124,36 @@ sector_sentiment:
   semantic_llm_model: "deepseek-chat"   # 实际调用模型，60日 cohort 内冻结
   relevance_llm_model: "deepseek-chat"  # 金融准入裁决模型，60日 cohort 内冻结
   semantic_prompt_version: "sector-semantic-v1"
+  # 东方财富股吧：Apex 自研 Scrapy 采集器，仅访问公开免登录页面。
+  # author_salt 请在本机替换为随机值；不要提交真实盐值、Cookie 或账号信息。
+  eastmoney:
+    enabled: false
+    phase: shadow              # shadow只采集审计；完成14个质量达标日后人工改promoted
+    access_mode: public
+    lookback_hours: 24
+    overlap_hours: 2
+    constituent_count: 5
+    posts_per_sector_forum: 100
+    posts_per_constituent_forum: 50
+    comments_per_post: 50
+    concurrent_requests_per_domain: 1
+    download_delay_seconds: 2
+    timeout_seconds: 20
+    collection_timeout_seconds: 900
+    retry_times: 3
+    circuit_breaker_failures: 5
+    max_requests: 500
+    requests_per_target: 100
+    minimum_posts: 1
+    minimum_authors: 1
+    minimum_parse_success_rate: 0.8
+    schema_version: "eastmoney-public-v1"
+    target_pool_version: "eastmoney-target-v1"
+    author_salt: "CHANGE-ME-LOCAL-ONLY"
+    endpoints:
+      list_url_template: "https://guba.eastmoney.com/list,{forum_id}.html"
+      detail_url_template: "https://guba.eastmoney.com/news,{forum_id},{content_id}.html"
+      comments_url_template: "https://guba.eastmoney.com/comments/{content_id}"
   retrieval:
     query_version: "sector-finance-query-v1"
     query_templates: ["{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股", "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情"]
@@ -145,6 +175,7 @@ sector_sentiment:
       sector_name: "机器人"
       taxonomy: "concept"
       aliases: ["机器人", "人形机器人", "具身智能"]
+      eastmoney_forum_id: ""  # 人工核验后填写；采集器不会猜测吧ID
     - sector_id: "concept:compute"
       sector_name: "算力"
       taxonomy: "concept"

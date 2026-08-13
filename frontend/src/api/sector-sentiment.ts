@@ -18,7 +18,31 @@ export interface SectorSentimentScore {
   swing_risk: number;
   state: AlertState;
   platform_contributions: Record<string, { records: number; net_sentiment: number; fomo: number; panic: number }>;
-  evidence: Array<{ platform?: string; text?: string; stance?: number }>;
+  evidence: Array<{ platform?: string; text?: string; stance?: number; url?: string }>;
+}
+
+export interface EastmoneyTelemetry {
+  phase: "shadow" | "promoted";
+  current_status: string;
+  display_status: string;
+  posts: number;
+  first_level_comments: number;
+  independent_authors: number;
+  sector_forum_records: number;
+  constituent_forum_records: number;
+  request_success_rate: number;
+  parse_success_rate: number;
+  quota_exhausted: boolean;
+  circuit_open: boolean;
+  schema_changed: boolean;
+  blocked: boolean;
+  stale: boolean;
+  current_attempt_at: string | null;
+  latest_success_at: string | null;
+  shadow_days: number;
+  shadow_attempt_days: number;
+  shadow_qualified_days: number;
+  shadow_target_days: number;
 }
 
 export interface SectorSentimentOverview {
@@ -31,6 +55,7 @@ export interface SectorSentimentOverview {
   sectors: SectorSentimentScore[];
   changes: Array<{ event_id: string; sector_name: string; event_type: string; trade_date: string }>;
   retrieval_funnel: RetrievalFunnel | null;
+  eastmoney: EastmoneyTelemetry | null;
 }
 
 export interface SectorSentimentValidation {
@@ -46,6 +71,7 @@ export interface SectorSentimentDetail {
   history: SectorSentimentScore[];
   sector: SectorSentimentScore;
   retrieval_funnel: RetrievalFunnel | null;
+  eastmoney: EastmoneyTelemetry | null;
 }
 
 export type CreatorStatus = "candidate" | "approved" | "rejected";

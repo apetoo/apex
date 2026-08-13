@@ -199,16 +199,19 @@ def collector_server(monkeypatch):
         thread.join()
 
 
-def _manifest(tmp_path: Path, base: str, path: str = "/list", max_requests: int = 10):
+def _manifest(tmp_path: Path, base: str, path: str = "/list", max_requests: int = 10,
+              settings_override: dict | None = None):
+    settings = {"max_requests": max_requests, "requests_per_target": 10,
+                "posts_per_target": 10, "comments_per_post": 10,
+                "download_delay_seconds": 0, "timeout_seconds": 3, "retry_times": 1}
+    settings.update(settings_override or {})
     return {
         "trade_date": "2026-08-12", "batch_id": "batch-process",
         "collected_at": "2026-08-12T16:00:00+08:00",
         "output_file": str(tmp_path / "records.jsonl"), "author_salt": "test-salt",
         "jobdir": str(tmp_path / "jobdir"),
         "test_hosts": ["127.0.0.1"],
-        "settings": {"max_requests": max_requests, "requests_per_target": 10,
-                     "posts_per_target": 10, "comments_per_post": 10,
-                     "download_delay_seconds": 0, "timeout_seconds": 3, "retry_times": 1},
+        "settings": settings,
         "jobs": [{
             "kind": "list", "url": base + path, "target_id": "bk0910",
             "sector_id": "robot", "source_type": "sector_forum", "stock_code": None,
@@ -235,12 +238,16 @@ def test_process_path_exports_detail_and_first_level_comments(tmp_path: Path, co
     assert json.loads(report_file.read_text())["request_count"] == 3
 
 
-@pytest.mark.parametrize(("path", "status"), [
-    ("/blocked", "blocked"), ("/captcha", "blocked"), ("/schema", "schema_changed"),
+@pytest.mark.parametrize(("path", "status", "override"), [
+    ("/blocked", "blocked", None), ("/captcha", "blocked", None),
+    ("/schema", "schema_changed", {"circuit_breaker_failures": 1}),
 ])
 def test_process_path_classifies_block_and_schema(tmp_path: Path, collector_server: str,
-                                                  path: str, status: str):
-    result, _ = _run_manifest(tmp_path, _manifest(tmp_path, collector_server, path=path))
+                                                  path: str, status: str,
+                                                  override: dict | None):
+    result, _ = _run_manifest(tmp_path, _manifest(
+        tmp_path, collector_server, path=path, settings_override=override,
+    ))
     assert result.status == status
 
 

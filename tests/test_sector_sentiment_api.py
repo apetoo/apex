@@ -25,6 +25,7 @@ def test_overview_exposes_quality_versions_and_event_changes(tmp_path):
         "mapping_confidence": 0.9, "sentiment_extreme": 0.95,
         "attention_acceleration": 0.92, "consensus_crowding": 0.8,
         "market_divergence": 0.2, "short_risk": 66, "swing_risk": 48,
+        "coverage_quality": {"qualified": True},
     })
     ss.advance_alerts(store, "2026-08-10")
 
@@ -219,3 +220,100 @@ def test_validation_resets_to_one_day_when_a_new_policy_cohort_starts(tmp_path):
     assert payload["status"] == "accumulating"
     assert payload["short"]["verdict"] == "PENDING"
     assert payload["swing"]["verdict"] == "PENDING"
+
+
+def test_overview_exposes_safe_eastmoney_telemetry_and_shadow_progress(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    for day in ("2026-08-10", "2026-08-11"):
+        store.record_collection({
+            "trade_date": day, "coverage": 1.0, "search_coverage": 1.0,
+            "creator_coverage": 1.0, "config_hash": "eastmoney-policy-v1",
+                "platforms": {"eastmoney": {
+                    "phase": "shadow", "shadow_qualified": True,
+                "current_status": "ok", "display_status": "ok", "posts": 12,
+                "comments": 34, "independent_authors": 9,
+                "sector_forum_records": 30, "constituent_forum_records": 16,
+                "request_success_rate": 0.98, "parse_success_rate": 0.96,
+                "quota_exhausted": False, "circuit_open": False,
+                "as_of": f"{day}T10:00:00Z", "last_success_at": f"{day}T10:00:00Z",
+                "path": "/Users/private/records.jsonl", "manifest_path": "/tmp/secret.json",
+                "collector": {"cookies": "secret"},
+            }}, "funnel": {},
+        })
+    store.save_daily_score({
+        "trade_date": "2026-08-11", "sector_id": "concept:robot",
+        "sector_name": "机器人", "taxonomy": "concept",
+        "platforms": ["bili", "eastmoney"], "independent_authors": 20,
+        "mapping_confidence": 0.9, "sentiment_extreme": 0.8,
+        "attention_acceleration": 0.8, "consensus_crowding": 0.8,
+        "market_divergence": 0.2, "short_risk": 60, "swing_risk": 50,
+    })
+
+    payload = _client(store).get("/api/sector-sentiment/overview").json()
+
+    assert payload["eastmoney"] == {
+        "current_status": "ok", "display_status": "ok", "posts": 12,
+        "first_level_comments": 34, "independent_authors": 9,
+        "sector_forum_records": 30, "constituent_forum_records": 16,
+        "request_success_rate": 0.98, "parse_success_rate": 0.96,
+        "quota_exhausted": False, "circuit_open": False,
+        "schema_changed": False, "blocked": False, "stale": False,
+        "current_attempt_at": "2026-08-11T10:00:00Z",
+        "latest_success_at": "2026-08-11T10:00:00Z",
+        "phase": "shadow", "shadow_attempt_days": 2, "shadow_qualified_days": 2,
+        "shadow_days": 2, "shadow_target_days": 14,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False)
+    assert "/Users/private" not in encoded
+    assert "cookies" not in encoded
+
+
+def test_detail_uses_stale_display_status_but_keeps_current_failure_audit(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.record_collection({
+        "trade_date": "2026-08-11", "coverage": 0.5, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "current_status": "blocked", "display_status": "stale", "stale": True,
+            "posts": 0, "comments": 0, "independent_authors": 0,
+            "request_success_rate": 0.2, "parse_success_rate": 0.0,
+            "as_of": "2026-08-11T10:00:00Z",
+            "last_success": {"as_of": "2026-08-10T10:00:00Z"},
+            "message": "Cookie secret at /Users/private/cache",
+        }}, "funnel": {},
+    })
+    store.save_daily_score({
+        "trade_date": "2026-08-11", "sector_id": "concept:robot",
+        "sector_name": "机器人", "taxonomy": "concept",
+        "platforms": ["bili", "eastmoney"], "independent_authors": 20,
+        "mapping_confidence": 0.9, "sentiment_extreme": 0.8,
+        "attention_acceleration": 0.8, "consensus_crowding": 0.8,
+        "market_divergence": 0.2, "short_risk": 60, "swing_risk": 50,
+        "evidence": [{"platform": "eastmoney", "text": "联系13800138000 看多机器人",
+                      "stance": 1, "url": "https://guba.eastmoney.com/news,bk0910,1.html"}],
+    })
+
+    payload = _client(store).get("/api/sector-sentiment/concept:robot").json()
+
+    assert payload["eastmoney"]["display_status"] == "stale"
+    assert payload["eastmoney"]["current_status"] == "blocked"
+    assert payload["eastmoney"]["latest_success_at"] == "2026-08-10T10:00:00Z"
+    assert payload["data_quality"] == "degraded"
+    assert payload["sector"]["evidence"][0]["text"] == "联系[电话已脱敏] 看多机器人"
+    assert payload["sector"]["evidence"][0]["url"].startswith("https://guba.eastmoney.com/")
+    assert "private" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_eastmoney_shadow_progress_counts_its_own_attempt_and_qualified_dates(tmp_path):
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    for day, qualified in (("2026-08-10", True), ("2026-08-11", False)):
+        store.record_collection({"trade_date": day, "coverage": 1,
+            "search_coverage": 1, "creator_coverage": 1,
+            "platforms": {"eastmoney": {"phase": "shadow",
+                "current_status": "ok" if qualified else "blocked",
+                "display_status": "ok" if qualified else "blocked",
+                "shadow_qualified": qualified}}, "funnel": {}})
+    payload = _client(store).get("/api/sector-sentiment/overview").json()["eastmoney"]
+    assert payload["phase"] == "shadow"
+    assert payload["shadow_attempt_days"] == 2
+    assert payload["shadow_qualified_days"] == 1
+    assert payload["shadow_days"] == 1
