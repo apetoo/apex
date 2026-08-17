@@ -1,4 +1,5 @@
 import { api } from "./client";
+import type { ScreenerMode } from "@/routes/screener/screenerPresets";
 
 /**
  * Screener API
@@ -221,7 +222,7 @@ export async function runFactorIc(noBenchmark = true): Promise<FactorIcPayload> 
   );
 }
 
-export function screenerFetchFn(weights: ScreenerWeights) {
+export function screenerFetchFn(weights?: ScreenerWeights) {
   return async (params: {
     path: string;
     method: string;
@@ -232,7 +233,7 @@ export function screenerFetchFn(weights: ScreenerWeights) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        strategy_weights: weights,
+        ...(weights ? { strategy_weights: weights } : {}),
         skip_ai: false,
         skip_selector: false,
       }),
@@ -243,6 +244,68 @@ export function screenerFetchFn(weights: ScreenerWeights) {
 
 /** ED16: 权重持久化到 localStorage */
 const WEIGHTS_KEY = "apex.screener.weights";
+const PREFERENCES_KEY = "apex.screener.preferences";
+
+export interface ScreenerPreferences {
+  mode: ScreenerMode;
+  weights: ScreenerWeights;
+}
+
+const SCREENER_MODES: ReadonlySet<string> = new Set([
+  "auto",
+  "steady",
+  "balanced",
+  "aggressive",
+]);
+
+function isScreenerMode(value: unknown): value is ScreenerMode {
+  return typeof value === "string" && SCREENER_MODES.has(value);
+}
+
+export function loadScreenerPreferences(
+  defaultWeights: ScreenerWeights,
+): ScreenerPreferences {
+  if (typeof window === "undefined") {
+    return { mode: "auto", weights: defaultWeights };
+  }
+  try {
+    const rawPreferences = window.localStorage.getItem(PREFERENCES_KEY);
+    if (rawPreferences) {
+      const parsed = JSON.parse(rawPreferences) as Partial<ScreenerPreferences>;
+      if (isScreenerMode(parsed.mode)) {
+        return {
+          mode: parsed.mode,
+          weights: { ...defaultWeights, ...(parsed.weights ?? {}) },
+        };
+      }
+    }
+
+    const legacyWeights = window.localStorage.getItem(WEIGHTS_KEY);
+    if (legacyWeights) {
+      return {
+        mode: "balanced",
+        weights: {
+          ...defaultWeights,
+          ...(JSON.parse(legacyWeights) as ScreenerWeights),
+        },
+      };
+    }
+  } catch {
+    // 脏数据或 localStorage 不可用时回退默认自动模式。
+  }
+  return { mode: "auto", weights: defaultWeights };
+}
+
+export function saveScreenerPreferences(
+  preferences: ScreenerPreferences,
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
+  } catch {
+    // localStorage 不可用(隐私模式/配额满)-> 静默, 用内存状态
+  }
+}
 
 export function loadStoredWeights(
   defaultWeights: ScreenerWeights,
