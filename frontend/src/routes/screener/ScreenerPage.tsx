@@ -27,8 +27,8 @@ import {
   getStrategies,
   getDefaultWeights,
   screenerFetchFn,
-  loadStoredWeights,
-  saveWeights,
+  loadScreenerPreferences,
+  saveScreenerPreferences,
   getAvailableDates,
   adaptScreenerReport,
   type ScreenerReport,
@@ -37,6 +37,11 @@ import {
 } from "@/api/screener";
 import { FactorIcCard } from "@/components/a-share/FactorIcCard";
 import { cn, formatRatio } from "@/lib/utils";
+import {
+  SCREENER_MODE_OPTIONS,
+  clonePreset,
+  type ScreenerMode,
+} from "./screenerPresets";
 
 /**
  * /screener 今日粗筛
@@ -52,8 +57,9 @@ import { cn, formatRatio } from "@/lib/utils";
 export function ScreenerPage() {
   const { setContext } = useChatContext();
   const [date, setDate] = useState("");
+  const [mode, setMode] = useState<ScreenerMode>("auto");
   const [weights, setWeights] = useState<ScreenerWeights>({});
-  const [weightsLoaded, setWeightsLoaded] = useState(false);
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false);
   const [progressMessages, setProgressMessages] = useState<string[]>([]);
 
   // 策略 + 默认权重
@@ -70,22 +76,23 @@ export function ScreenerPage() {
     queryFn: getAvailableDates,
   });
 
-  // 初始化: 优先用 localStorage 的权重, 否则用默认
+  // 初始化: 新用户默认自动；兼容旧版仅保存 weights 的数据。
   useEffect(() => {
-    if (weightsLoaded) return;
+    if (preferencesLoaded) return;
     if (defaultWeights.data) {
-      const stored = loadStoredWeights(defaultWeights.data);
-      setWeights(stored);
-      setWeightsLoaded(true);
+      const stored = loadScreenerPreferences(defaultWeights.data);
+      setMode(stored.mode);
+      setWeights(stored.weights);
+      setPreferencesLoaded(true);
     }
-  }, [defaultWeights.data, weightsLoaded]);
+  }, [defaultWeights.data, preferencesLoaded]);
 
-  // 持久化权重变化
+  // 持久化模式与人工权重变化。
   useEffect(() => {
-    if (weightsLoaded && Object.keys(weights).length > 0) {
-      saveWeights(weights);
+    if (preferencesLoaded && Object.keys(weights).length > 0) {
+      saveScreenerPreferences({ mode, weights });
     }
-  }, [weights, weightsLoaded]);
+  }, [mode, weights, preferencesLoaded]);
 
   // SSE 流式进度
   const { events, status, error, result, connect, abort, reset } = useSSE<{
@@ -130,12 +137,17 @@ export function ScreenerPage() {
   const running = status === "connecting" || status === "streaming";
 
   const startScreener = () => {
+    const manualWeights = mode === "auto" ? undefined : weights;
     setProgressMessages([]);
     void connect({
       path: "/api/screener/run",
       method: "POST",
-      body: { strategy_weights: weights, skip_ai: false, skip_selector: false },
-      fetchFn: screenerFetchFn(weights),
+      body: {
+        ...(manualWeights ? { strategy_weights: manualWeights } : {}),
+        skip_ai: false,
+        skip_selector: false,
+      },
+      fetchFn: screenerFetchFn(manualWeights),
     });
   };
 
@@ -143,6 +155,13 @@ export function ScreenerPage() {
   const retry = () => {
     reset();
     startScreener();
+  };
+
+  const selectMode = (nextMode: ScreenerMode) => {
+    setMode(nextMode);
+    if (nextMode !== "auto") {
+      setWeights(clonePreset(nextMode));
+    }
   };
 
   // 归一化: 让权重和 = 1
@@ -196,7 +215,7 @@ export function ScreenerPage() {
               重试
             </Button>
           ) : (
-            <Button variant="primary" onClick={startScreener} disabled={!weightsLoaded}>
+            <Button variant="primary" onClick={startScreener} disabled={!preferencesLoaded}>
               <Play className="mr-1 h-3.5 w-3.5" />
               跑粗筛
             </Button>
@@ -216,7 +235,40 @@ export function ScreenerPage() {
             <CardDescription>ED16 localStorage 持久化</CardDescription>
           </CardHeader>
           <CardContent className="pt-0">
-            {strategies.isLoading ? (
+            <div className="mb-4 grid gap-2 sm:grid-cols-2">
+              {SCREENER_MODE_OPTIONS.map((option) => (
+                <label
+                  key={option.mode}
+                  className={cn(
+                    "cursor-pointer rounded-md border p-3 transition-colors",
+                    mode === option.mode
+                      ? "border-text-primary bg-bg-base"
+                      : "border-border hover:border-text-secondary",
+                  )}
+                >
+                  <span className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="screener-mode"
+                      value={option.mode}
+                      aria-label={option.label}
+                      checked={mode === option.mode}
+                      onChange={() => selectMode(option.mode)}
+                    />
+                    <span className="text-sm font-medium">{option.label}</span>
+                  </span>
+                  <span className="mt-1 block text-[11px] text-text-secondary">
+                    {option.description}
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            {mode === "auto" ? (
+              <div className="rounded-md border border-up/20 bg-up/5 p-3 text-xs leading-relaxed text-text-secondary">
+                系统将根据市场状态、历史表现和今日候选数自动分配权重；失败时回退等权。
+              </div>
+            ) : strategies.isLoading ? (
               <p className="py-2 text-sm text-flat">加载策略...</p>
             ) : (
               <div className="space-y-3">
@@ -423,6 +475,7 @@ function WeightSlider({
       </div>
       <input
         type="range"
+        aria-label={strategy.name}
         min={0}
         max={1}
         step={0.05}
