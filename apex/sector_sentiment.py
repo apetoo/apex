@@ -91,7 +91,7 @@ def _redact_text(value: Any, limit: int | None = None) -> str:
         r"weibo|telegram|tg|知乎号)\s*[:：号]?\s*[^\s,，。；;、]{2,}",
         r"\1[账号已脱敏]", text,
     )
-    text = re.sub(r"@[\w.-]{2,}", "@[账号已脱敏]", text)
+    # text = re.sub(r"@[\w.-]{2,}", "@[账号已脱敏]", text)
     return text if limit is None else text[:limit]
 
 
