@@ -10,6 +10,10 @@ from string import Formatter
 from typing import Callable
 
 from .models import CollectionResult
+from .representatives import (
+    describe_injected_constituents,
+    normalize_injected_representative_provenance,
+)
 from .targets import EastmoneyTargetProvider
 
 
@@ -20,7 +24,10 @@ _INTEGER_FIELDS = (
     "circuit_breaker_failures", "max_requests", "requests_per_target",
     "minimum_posts", "minimum_authors", "collection_timeout_seconds",
 )
-_ENDPOINT_FIELDS = ("list_url_template", "detail_url_template", "comments_url_template")
+_ENDPOINT_FIELDS = (
+    "list_url_template", "list_next_url_template",
+    "detail_url_template", "comments_url_template",
+)
 
 
 def validate_eastmoney_config(config: dict) -> dict:
@@ -30,6 +37,11 @@ def validate_eastmoney_config(config: dict) -> dict:
         raise ValueError("eastmoney access_mode must be public")
     if config.get("phase", "shadow") not in {"shadow", "promoted"}:
         raise ValueError("eastmoney phase must be shadow or promoted")
+    override_reason = config.get("promotion_override_reason", "")
+    if not isinstance(override_reason, str):
+        raise ValueError("eastmoney promotion_override_reason must be a string")
+    if len(override_reason.strip()) > 500:
+        raise ValueError("eastmoney promotion_override_reason is too long")
     for name in _INTEGER_FIELDS:
         value = config.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -55,7 +67,8 @@ def validate_eastmoney_config(config: dict) -> dict:
         if not isinstance(template, str) or not template.startswith("https://"):
             raise ValueError(f"eastmoney {name} must be an explicit HTTPS template")
         fields = {field for _, field, _, _ in Formatter().parse(template) if field}
-        expected = ({"forum_id"} if name == "list_url_template"
+        expected = ({"forum_id", "page"} if name == "list_next_url_template"
+                    else {"forum_id"} if name == "list_url_template"
                     else {"content_id"} if name == "comments_url_template"
                     else {"forum_id", "content_id"})
         if not expected.issubset(fields):
@@ -113,10 +126,29 @@ def _recover_latest_success(cache_dir: Path) -> dict | None:
 def build_frozen_manifest(
     path: Path, *, config: dict, taxonomy: list[dict], constituents: dict[str, list[dict]],
     trade_date: str, collected_at: str, output_file: Path, cursor_file: Path,
+    representative_provenance: dict[str, dict] | None = None,
 ) -> dict:
     config = validate_eastmoney_config(config)
     provider = EastmoneyTargetProvider(config["constituent_count"], config["target_pool_version"])
     targets, missing = provider.build_targets(taxonomy, constituents, generated_at=collected_at)
+    supplied_provenance = dict(representative_provenance or {})
+    representative_provenance = (
+        normalize_injected_representative_provenance(
+            taxonomy, constituents, supplied_provenance, trade_date=trade_date,
+            constituent_count=config["constituent_count"],
+        ) if supplied_provenance else describe_injected_constituents(
+            taxonomy, constituents, trade_date=trade_date,
+            constituent_count=config["constituent_count"],
+        )
+    )
+    for sector_id, detail in representative_provenance.items():
+        requested = int(detail.get("requested_count") or config["constituent_count"])
+        selected = int(detail.get("selected_count") or 0)
+        if detail.get("status") != "ok" or selected < requested:
+            missing.append({
+                "sector_id": str(sector_id), "reason": "target_shortfall",
+                "requested_count": requested, "selected_count": selected,
+            })
     cursor = _read_cursor(cursor_file)
     floor = _iso(collected_at) - timedelta(
         hours=config["lookback_hours"] + config["overlap_hours"]
@@ -136,6 +168,9 @@ def build_frozen_manifest(
         jobs.append({
             "kind": "list", "target_id": target.forum_id,
             "url": endpoints["list_url_template"].format(forum_id=target.forum_id),
+            "list_next_url_template": endpoints["list_next_url_template"].replace(
+                "{forum_id}", target.forum_id
+            ),
             "detail_url_template": endpoints["detail_url_template"].replace(
                 "{forum_id}", target.forum_id
             ),
@@ -143,6 +178,7 @@ def build_frozen_manifest(
                 "{forum_id}", target.forum_id
             ),
             "window_start": floor.isoformat(),
+            "page": 1,
             "posts_limit": (config["posts_per_sector_forum"]
                             if target.source_type == "sector_forum"
                             else config["posts_per_constituent_forum"]),
@@ -159,6 +195,7 @@ def build_frozen_manifest(
         "jobdir": str(path.parent / "jobdir"),
         "schema_version": config["schema_version"],
         "target_pool_version": config["target_pool_version"],
+        "representative_constituents": representative_provenance,
         "missing_targets": missing,
         "settings": {
             "max_requests": config["max_requests"],
@@ -210,9 +247,30 @@ def collector_health(report: dict) -> dict:
     }
 
 
+_SAFE_COLLECTOR_FIELDS = (
+    "records", "request_count", "failed_targets", "quota_exhausted",
+    "parser_successes", "parser_errors", "request_successes", "request_errors",
+    "terminal_reason",
+)
+
+
+def _safe_collector_report(report: dict) -> dict:
+    """Keep only typed collector fields that are safe to freeze into telemetry."""
+    return {key: report[key] for key in _SAFE_COLLECTOR_FIELDS if key in report}
+
+
+def _safe_result_message(result) -> str | None:
+    if getattr(result, "message", None) is None:
+        return None
+    status = str(getattr(result, "status", "") or "unavailable")
+    return f"collector_{status}" if status.isidentifier() else "collector_unavailable"
+
+
 def collect_eastmoney(
     *, cache_dir: Path, config: dict, taxonomy: list[dict], constituents: dict[str, list[dict]],
     trade_date: str, collected_at: str, runner: Callable,
+    representative_provenance: dict[str, dict] | None = None,
+    promotion_audit: dict | None = None,
 ) -> tuple[dict, dict]:
     platform_root = cache_dir / "raw" / trade_date / "eastmoney"
     pointer_root = cache_dir / "raw" / "eastmoney"
@@ -224,7 +282,7 @@ def collect_eastmoney(
     manifest = build_frozen_manifest(
         manifest_path, config=config, taxonomy=taxonomy, constituents=constituents,
         trade_date=trade_date, collected_at=collected_at, output_file=output,
-        cursor_file=cursor_file,
+        cursor_file=cursor_file, representative_provenance=representative_provenance,
     )
     try:
         result = runner(manifest_path, report_path,
@@ -254,37 +312,47 @@ def collect_eastmoney(
             collector = json.loads(report_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             collector = {}
+    collector = _safe_collector_report(collector) if isinstance(collector, dict) else {}
+    if report_path.exists():
+        report_path.write_text(json.dumps(collector, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     requests = int(getattr(result, "request_count", 0))
     failed = int(getattr(result, "failed_targets", 0))
     health = collector_health(collector)
+    target_shortfall = any(
+        item.get("reason") == "target_shortfall" for item in manifest["missing_targets"]
+    )
+    effective_status = "degraded" if target_shortfall else result.status
     telemetry = {
-        "platform": "eastmoney", "status": result.status, "records": len(records),
-        "current_status": result.status, "display_status": result.status,
+        "platform": "eastmoney", "status": effective_status, "records": len(records),
+        "current_status": effective_status, "display_status": effective_status,
         "current_path": str(output), "display_path": str(output),
         "posts": posts, "comments": len(records) - posts, "independent_authors": authors,
         "sector_forum_records": sector_forum_records,
         "constituent_forum_records": constituent_forum_records,
         "request_count": requests, "failed_targets": failed,
         "quota_exhausted": bool(getattr(result, "quota_exhausted", False)),
-        "circuit_open": result.status == "schema_changed",
+        "circuit_open": result.status == "schema_changed", "target_shortfall": target_shortfall,
+        "representative_constituents": manifest["representative_constituents"],
         **health,
         "batch_id": manifest["batch_id"], "manifest_path": str(manifest_path),
         "path": str(output), "as_of": collected_at,
-        "message": getattr(result, "message", None), "collector": collector,
+        "message": _safe_result_message(result), "collector": collector,
     }
+    if promotion_audit is not None:
+        telemetry["promotion_audit"] = dict(promotion_audit)
     pointer_root.mkdir(parents=True, exist_ok=True)
     latest = pointer_root / "latest.json"
     _atomic_json(latest, {"batch_id": manifest["batch_id"],
-                          "batch_path": str(batch_root), "status": result.status})
-    if result.status in {"ok", "empty_valid"}:
+                          "batch_path": str(batch_root), "status": effective_status})
+    if effective_status in {"ok", "empty_valid"}:
         _atomic_json(pointer_root / "latest-success.json", {
             "batch_id": manifest["batch_id"], "batch_path": str(batch_root),
-            "status": result.status,
+            "status": effective_status,
         })
     else:
         previous = (_valid_pointer(pointer_root / "latest-success.json")
                     or _recover_latest_success(cache_dir))
-    if result.status not in {"ok", "empty_valid"} and previous:
+    if effective_status not in {"ok", "empty_valid"} and previous:
         telemetry["stale"] = True
         telemetry["stale_from_batch_id"] = previous["batch_id"]
         telemetry["display_status"] = "stale"
@@ -298,7 +366,7 @@ def collect_eastmoney(
     telemetry_path = batch_root / "telemetry.json"
     with telemetry_path.open("x", encoding="utf-8") as stream:
         json.dump(telemetry, stream, ensure_ascii=False, sort_keys=True, indent=2)
-    if result.status in {"ok", "empty_valid"} and records:
+    if effective_status in {"ok", "empty_valid"} and records:
         dated = [(row.get("published_at"), str(row.get("content_id") or "")) for row in records
                  if row.get("published_at")]
         if dated:
@@ -310,6 +378,9 @@ def collect_eastmoney(
     return telemetry, {"trade_date": trade_date, "jobs": [{
         "platform": "eastmoney", "mode": "eastmoney_guba",
         "source_id": f"eastmoney:{manifest['batch_id']}", "sector_ids": [],
-        "status": "ok" if result.status in {"ok", "partial"} and output.exists() else result.status,
+        # Target shortfall degrades quality/promotion, but successfully collected raw
+        # rows still enter the audit store (and remain score-isolated in shadow mode).
+        "status": ("ok" if result.status in {"ok", "partial"} and output.exists()
+                   else result.status),
         "records": len(records), "path": str(output),
     }]}

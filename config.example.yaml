@@ -129,6 +129,7 @@ sector_sentiment:
   eastmoney:
     enabled: false
     phase: shadow              # shadow只采集审计；完成14个质量达标日后人工改promoted
+    promotion_override_reason: ""  # 未满14个合格影子日时，promoted必须填写人工审计原因
     access_mode: public
     lookback_hours: 24
     overlap_hours: 2
@@ -152,6 +153,7 @@ sector_sentiment:
     author_salt: "CHANGE-ME-LOCAL-ONLY"
     endpoints:
       list_url_template: "https://guba.eastmoney.com/list,{forum_id}.html"
+      list_next_url_template: "https://guba.eastmoney.com/list,{forum_id}_{page}.html"
       detail_url_template: "https://guba.eastmoney.com/news,{forum_id},{content_id}.html"
       comments_url_template: "https://guba.eastmoney.com/comments/{content_id}"
   retrieval:

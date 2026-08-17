@@ -39,8 +39,10 @@ def _config() -> dict:
         "schema_version": "eastmoney-public-v1",
         "target_pool_version": "eastmoney-target-v1",
         "author_salt": "local-only",
+        "promotion_override_reason": "fixture promotion review approved",
         "endpoints": {
             "list_url_template": "https://guba.eastmoney.com/list,{forum_id}.html",
+            "list_next_url_template": "https://guba.eastmoney.com/list,{forum_id}_{page}.html",
             "detail_url_template": "https://guba.eastmoney.com/news,{forum_id},{content_id}.html",
             "comments_url_template": "https://guba.eastmoney.com/comments/{content_id}",
         },
@@ -127,6 +129,9 @@ def test_manifest_is_frozen_and_uses_explicit_targets_and_overlap_cursor(tmp_pat
     assert manifest["cursor"]["max_content_id"] == "88"
     assert [job["target_id"] for job in manifest["jobs"]] == ["bk0910", "000001"]
     assert manifest["jobs"][0]["url"] == "https://guba.eastmoney.com/list,bk0910.html"
+    assert manifest["jobs"][0]["list_next_url_template"] == (
+        "https://guba.eastmoney.com/list,bk0910_{page}.html"
+    )
     assert manifest["jobs"][0]["window_start"] == manifest["window_start"]
     assert [job["posts_limit"] for job in manifest["jobs"]] == [100, 50]
     assert json.loads(manifest_path.read_text()) == manifest
@@ -145,6 +150,95 @@ def test_grouped_coverage_requires_short_video_and_qualifying_eastmoney():
     assert not grouped_coverage([{"platform": "bili", "status": "failed"}], good, _config())["qualified"]
     assert not grouped_coverage([{"platform": "dy", "status": "ok"}],
                                 {**good, "status": "blocked"}, _config())["qualified"]
+
+
+def _record_shadow_history(store: ss.SentimentStore, qualified_days: int) -> None:
+    """Seed hand-audited distinct shadow dates without involving live collection."""
+    for offset in range(qualified_days):
+        day = f"2026-07-{offset + 1:02d}"
+        store.record_collection({
+            "trade_date": day, "coverage": 0.0, "search_coverage": 0.0,
+            "creator_coverage": 0.0, "platforms": {"eastmoney": {
+                "phase": "shadow", "current_status": "ok", "shadow_qualified": True,
+            }}, "funnel": {},
+        })
+
+
+def _promotion_config(tmp_path: Path, *, override_reason: str) -> dict:
+    return {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": [], "mediacrawler_commit": "a" * 40,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": {**_config(), "promotion_override_reason": override_reason},
+    }}
+
+
+def _empty_valid_eastmoney_runner(_manifest_path, report_path, *, timeout_seconds):
+    Path(report_path).write_text(json.dumps({
+        "parser_successes": 1, "parser_errors": 0,
+        "request_successes": 1, "request_errors": 0,
+    }))
+    return CollectionResult("empty_valid", 0, 1, 0)
+
+
+def test_promoted_eastmoney_rejects_thirteen_qualified_shadow_days(tmp_path: Path):
+    """Catches promotion that is enabled before the required 14 qualified shadow dates."""
+    store = ss.open_store(tmp_path)
+    _record_shadow_history(store, 13)
+
+    with pytest.raises(ValueError, match="14"):
+        ss.run_configured(
+            _promotion_config(tmp_path, override_reason=""), runner=lambda *_args: None,
+            eastmoney_runner=_empty_valid_eastmoney_runner, trade_date="2026-08-12",
+        )
+
+
+def test_promoted_eastmoney_uses_fourteen_qualified_shadow_days_without_override(tmp_path: Path):
+    """Catches a gate that ignores the 14th qualified shadow date or mis-audits its decision."""
+    store = ss.open_store(tmp_path)
+    _record_shadow_history(store, 14)
+
+    result = ss.run_configured(
+        _promotion_config(tmp_path, override_reason=""), runner=lambda *_args: None,
+        eastmoney_runner=_empty_valid_eastmoney_runner, trade_date="2026-08-12",
+    )
+
+    audit = result["collection"]["eastmoney"]["promotion_audit"]
+    assert audit == {
+        "required_qualified_days": 14,
+        "observed_qualified_days": 14,
+        "eligible_by_history": True,
+        "override_used": False,
+        "override_reason": "",
+    }
+    assert ss.open_store(tmp_path).collection_summary("2026-08-12")["platforms"]["eastmoney"]["promotion_audit"] == audit
+
+
+def test_reasoned_promotion_override_is_trimmed_and_persisted_in_collection_audit(tmp_path: Path):
+    """Catches an unreasoned override or one that fails to leave its private audit trail."""
+    result = ss.run_configured(
+        _promotion_config(tmp_path, override_reason="  operator reviewed collector evidence  "),
+        runner=lambda *_args: None, eastmoney_runner=_empty_valid_eastmoney_runner,
+        trade_date="2026-08-12",
+    )
+
+    audit = result["collection"]["eastmoney"]["promotion_audit"]
+    assert audit == {
+        "required_qualified_days": 14,
+        "observed_qualified_days": 0,
+        "eligible_by_history": False,
+        "override_used": True,
+        "override_reason": "operator reviewed collector evidence",
+    }
+    persisted = ss.open_store(tmp_path).collection_summary("2026-08-12")
+    assert persisted["platforms"]["eastmoney"]["promotion_audit"] == audit
+    telemetry = json.loads(Path(result["collection"]["eastmoney"]["manifest_path"])
+                           .with_name("telemetry.json").read_text())
+    assert telemetry["promotion_audit"] == audit
 
 
 def test_daily_score_coverage_is_per_sector_and_alert_is_suppressed(tmp_path: Path):
@@ -408,6 +502,25 @@ def test_real_batch_jsonl_to_score_state_replay_is_idempotent(tmp_path: Path):
                       "max_contents_per_query": 20, "max_comments_per_content": 20},
         "eastmoney": _config(),
     }}
+    constituents = [
+        {"stock_code": f"00000{index}", "turnover_20d": float(600 - index * 100),
+         "turnover_as_of": "2026-08-12",
+         "membership_source": "replay-fixture-members-v1",
+         "turnover_source": "replay-fixture-turnover-v1"}
+        for index in range(1, 6)
+    ]
+    representative_provenance = {"robot": {
+        "sector_id": "robot", "membership_source": "replay-fixture-members-v1",
+        "turnover_source": "replay-fixture-turnover-v1", "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 5,
+        "selected": constituents, "status": "ok",
+    }}
+
+    def constituent_provider(taxonomy, trade_date):
+        assert taxonomy == config["sector_sentiment"]["taxonomy"]
+        assert trade_date == "2026-08-12"
+        return {"robot": constituents}, representative_provenance
+
     def media(job, destination, timeout, limits):
         destination.write_text("".join(json.dumps({
             "platform": "bili", "content_id": f"b{i}", "text": "机器人股票资金流入必须起飞坚定看多",
@@ -429,17 +542,382 @@ def test_real_batch_jsonl_to_score_state_replay_is_idempotent(tmp_path: Path):
         Path(report_path).write_text(json.dumps({"parser_successes": 1, "parser_errors": 0,
                                                 "request_successes": 1, "request_errors": 0}))
         return CollectionResult("ok", 12, 1, 0)
-    first_result = ss.run_configured(config, runner=media, eastmoney_runner=east,
-                                     trade_date="2026-08-12")
+    first_result = ss.run_configured(
+        config, runner=media, eastmoney_runner=east,
+        eastmoney_constituent_provider=constituent_provider, trade_date="2026-08-12",
+    )
     assert first_result["ingest"]["inserted"] == 24
     store = ss.open_store(tmp_path)
     assert len(store.list_eligible_content("2026-08-12")) == 24
     first_score = store.scores_for_date("2026-08-12")
     first_state = store.get_state("robot")
     first_events = store.list_events()
-    ss.run_configured(config, runner=media, eastmoney_runner=east, trade_date="2026-08-12")
+    ss.run_configured(
+        config, runner=media, eastmoney_runner=east,
+        eastmoney_constituent_provider=constituent_provider, trade_date="2026-08-12",
+    )
     assert store.scores_for_date("2026-08-12") == first_score
     assert store.get_state("robot") == first_state
     assert store.list_events() == first_events
     assert first_score[0]["coverage_quality"]["qualified"] is True
     assert first_state["state"] == "observe" and len(first_events) == 1
+
+
+def test_representative_provider_selects_deterministic_top_five_from_twenty_day_turnover():
+    """Catches a provider that requests the wrong lookback or leaves ties non-deterministic."""
+    from apex.eastmoney_guba.representatives import select_representative_constituents
+
+    membership_calls = []
+    turnover_calls = []
+    taxonomy = [{"sector_id": "robot", "sector_name": "机器人",
+                 "eastmoney_forum_id": "bk0910"}]
+
+    def membership_fetcher(sector):
+        membership_calls.append(sector)
+        return ([
+            {"stock_code": "000006"}, {"stock_code": "000004"},
+            {"stock_code": "000002"}, {"stock_code": "000001"},
+            {"stock_code": "000003"}, {"stock_code": "000005"},
+        ], "eastmoney-sector-members")
+
+    def turnover_fetcher(stock_codes, trade_date, trading_days):
+        turnover_calls.append((stock_codes, trade_date, trading_days))
+        return ({
+            "000001": 200.0, "000002": 350.0, "000003": 350.0,
+            "000004": 410.0, "000005": 100.0, "000006": 520.0,
+        }, "2026-08-12", "eastmoney-daily-turnover")
+
+    constituents, provenance = select_representative_constituents(
+        taxonomy, "2026-08-13", membership_fetcher=membership_fetcher,
+        turnover_fetcher=turnover_fetcher,
+    )
+
+    assert membership_calls == taxonomy
+    assert turnover_calls == [(
+        ["000006", "000004", "000002", "000001", "000003", "000005"],
+        "2026-08-13", 20,
+    )]
+    assert constituents == {"robot": [
+        {"stock_code": "000006", "turnover_20d": 520.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "eastmoney-sector-members", "turnover_source": "eastmoney-daily-turnover"},
+        {"stock_code": "000004", "turnover_20d": 410.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "eastmoney-sector-members", "turnover_source": "eastmoney-daily-turnover"},
+        {"stock_code": "000002", "turnover_20d": 350.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "eastmoney-sector-members", "turnover_source": "eastmoney-daily-turnover"},
+        {"stock_code": "000003", "turnover_20d": 350.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "eastmoney-sector-members", "turnover_source": "eastmoney-daily-turnover"},
+        {"stock_code": "000001", "turnover_20d": 200.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "eastmoney-sector-members", "turnover_source": "eastmoney-daily-turnover"},
+    ]}
+    assert provenance == {"robot": {
+        "sector_id": "robot",
+        "membership_source": "eastmoney-sector-members",
+        "turnover_source": "eastmoney-daily-turnover",
+        "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20,
+        "requested_count": 5,
+        "selected_count": 5,
+        "selected": constituents["robot"],
+        "status": "ok",
+    }}
+
+
+def test_manifest_normalizes_nonempty_injected_constituents_into_provenance(tmp_path: Path):
+    """Catches direct manifests that silently freeze no provenance for supplied targets."""
+    selected = [{"stock_code": f"00000{index}", "turnover_20d": float(10 - index),
+                 "turnover_as_of": "2026-08-12"} for index in range(1, 6)]
+    manifest = build_frozen_manifest(
+        tmp_path / "batch" / "manifest.json", config=_config(),
+        taxonomy=[{"sector_id": "robot", "sector_name": "机器人", "eastmoney_forum_id": "bk0910"}],
+        constituents={"robot": selected}, trade_date="2026-08-13",
+        collected_at="2026-08-13T16:00:00+08:00", output_file=tmp_path / "records.jsonl",
+        cursor_file=tmp_path / "cursor.json",
+    )
+
+    provenance = manifest["representative_constituents"]["robot"]
+    assert provenance["status"] == "ok"
+    assert provenance["membership_source"] == "injected"
+    assert provenance["turnover_source"] == "injected.turnover_20d"
+    assert all(row["membership_source"] == "injected" for row in provenance["selected"])
+    assert all(row["turnover_source"] == "injected.turnover_20d" for row in provenance["selected"])
+
+
+def test_manifest_freezes_representative_provenance_and_target_shortfall(tmp_path: Path):
+    """Catches a manifest that silently schedules only a sector forum after a shortfall."""
+    selected = [
+        {"stock_code": "000001", "turnover_20d": 300.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "sector-members-v1", "turnover_source": "daily-turnover-v1"},
+        {"stock_code": "000002", "turnover_20d": 200.0, "turnover_as_of": "2026-08-12",
+         "membership_source": "sector-members-v1", "turnover_source": "daily-turnover-v1"},
+    ]
+    provenance = {"robot": {
+        "sector_id": "robot", "membership_source": "sector-members-v1",
+        "turnover_source": "daily-turnover-v1", "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 2,
+        "selected": selected, "status": "insufficient",
+        "reason": "only 2 valid constituents have twenty-day turnover",
+    }}
+    manifest = build_frozen_manifest(
+        tmp_path / "batch" / "manifest.json", config=_config(),
+        taxonomy=[{"sector_id": "robot", "sector_name": "机器人",
+                   "eastmoney_forum_id": "bk0910"}],
+        constituents={"robot": selected}, representative_provenance=provenance,
+        trade_date="2026-08-13", collected_at="2026-08-13T16:00:00+08:00",
+        output_file=tmp_path / "batch" / "records.jsonl", cursor_file=tmp_path / "cursor.json",
+    )
+
+    assert manifest["representative_constituents"] == provenance
+    assert {"sector_id": "robot", "reason": "target_shortfall",
+            "requested_count": 5, "selected_count": 2} in manifest["missing_targets"]
+
+
+def test_run_configured_uses_default_representative_provider_and_freezes_its_provenance(
+    tmp_path: Path, monkeypatch,
+):
+    """Catches the legacy static-constituents fallback in the normal configured path."""
+    selected = [{"stock_code": "000001", "turnover_20d": 300.0,
+                 "turnover_as_of": "2026-08-12", "membership_source": "members-v1",
+                 "turnover_source": "turnover-v1"}]
+    provenance = {"robot": {
+        "sector_id": "robot", "membership_source": "members-v1",
+        "turnover_source": "turnover-v1", "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 1,
+        "selected": selected, "status": "insufficient", "reason": "fixture shortfall",
+    }}
+    calls = []
+
+    def selector(taxonomy, trade_date, constituent_count=5):
+        calls.append((taxonomy, trade_date, constituent_count))
+        return {"robot": selected}, provenance
+
+    monkeypatch.setattr(
+        "apex.eastmoney_guba.representatives.select_representative_constituents", selector,
+    )
+    frozen = {}
+
+    def eastmoney_runner(manifest_path, report_path, *, timeout_seconds):
+        frozen.update(json.loads(Path(manifest_path).read_text()))
+        Path(report_path).write_text(json.dumps({
+            "parser_successes": 1, "parser_errors": 0,
+            "request_successes": 1, "request_errors": 0,
+        }))
+        return CollectionResult("empty_valid", 0, 1, 0)
+
+    config = {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": [{"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+                      "aliases": ["机器人"], "eastmoney_forum_id": "bk0910"}],
+        "mediacrawler_commit": "a" * 40, "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": _config(),
+    }}
+    result = ss.run_configured(config, runner=lambda *_args: None,
+                               eastmoney_runner=eastmoney_runner, trade_date="2026-08-13")
+
+    assert calls == [(config["sector_sentiment"]["taxonomy"], "2026-08-13", 5)]
+    assert frozen["representative_constituents"] == provenance
+    assert result["collection"]["eastmoney"]["shadow_qualified"] is False
+
+
+def test_short_representative_provider_result_surfaces_target_shortfall_and_degrades(
+    tmp_path: Path,
+):
+    """Catches a successful sector-only collection being incorrectly quality-qualified."""
+    selected = [{"stock_code": "000001", "turnover_20d": 300.0,
+                 "turnover_as_of": "2026-08-12", "membership_source": "members-v1",
+                 "turnover_source": "turnover-v1"}]
+    provenance = {"robot": {
+        "sector_id": "robot", "membership_source": "members-v1",
+        "turnover_source": "turnover-v1", "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 1,
+        "selected": selected, "status": "insufficient", "reason": "fixture shortfall",
+    }}
+
+    def eastmoney_runner(manifest_path, report_path, *, timeout_seconds):
+        Path(report_path).write_text(json.dumps({
+            "parser_successes": 1, "parser_errors": 0,
+            "request_successes": 1, "request_errors": 0,
+        }))
+        return CollectionResult("ok", 0, 1, 0)
+
+    config = {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": [{"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+                      "aliases": ["机器人"], "eastmoney_forum_id": "bk0910"}],
+        "mediacrawler_commit": "a" * 40, "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": _config(),
+    }}
+    result = ss.run_configured(
+        config, runner=lambda *_args: None, eastmoney_runner=eastmoney_runner,
+        eastmoney_constituent_provider=lambda *_args: ({"robot": selected}, provenance),
+        trade_date="2026-08-13",
+    )
+
+    eastmoney = result["collection"]["eastmoney"]
+    assert result["status"] == "degraded"
+    assert eastmoney["status"] == "degraded"
+    assert eastmoney["target_shortfall"] is True
+    assert eastmoney["shadow_qualified"] is False
+
+
+def test_representative_provider_failure_surfaces_target_shortfall_and_degrades(tmp_path: Path):
+    """Catches provider exceptions being hidden behind a seemingly healthy sector forum."""
+    config = {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": [{"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+                      "aliases": ["机器人"], "eastmoney_forum_id": "bk0910"}],
+        "mediacrawler_commit": "a" * 40, "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": _config(),
+    }}
+
+    def failed_provider(*_args):
+        raise RuntimeError("turnover source unavailable")
+
+    result = ss.run_configured(
+        config, runner=lambda *_args: None,
+        eastmoney_constituent_provider=failed_provider, trade_date="2026-08-13",
+    )
+
+    eastmoney = result["collection"]["eastmoney"]
+    assert result["status"] == "degraded"
+    assert eastmoney["status"] == "degraded"
+    assert eastmoney["target_shortfall"] is True
+    assert eastmoney["shadow_qualified"] is False
+
+
+def test_tuple_provider_normalizes_missing_and_inconsistent_sector_provenance(tmp_path: Path):
+    """Catches tuple injection that silently permits a sector-only qualified run."""
+    taxonomy = [
+        {"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+         "aliases": ["机器人"], "eastmoney_forum_id": "bk0910"},
+        {"sector_id": "chip", "sector_name": "芯片", "taxonomy": "concept",
+         "aliases": ["芯片"], "eastmoney_forum_id": "bk1036"},
+    ]
+    config = {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": taxonomy, "mediacrawler_commit": "a" * 40,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": _config(),
+    }}
+    selected = [{"stock_code": "000001", "turnover_20d": 300.0,
+                 "turnover_as_of": "2026-08-12", "membership_source": "members-v1",
+                 "turnover_source": "turnover-v1"}]
+    claimed_ok = {"robot": {
+        "sector_id": "robot", "membership_source": "members-v1",
+        "turnover_source": "turnover-v1", "turnover_as_of": "2026-08-12",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 5,
+        "selected": [dict(selected[0]) for _ in range(5)], "status": "ok",
+    }}
+    frozen = {}
+
+    def eastmoney_runner(manifest_path, report_path, *, timeout_seconds):
+        frozen.update(json.loads(Path(manifest_path).read_text()))
+        Path(report_path).write_text(json.dumps({
+            "parser_successes": 1, "parser_errors": 0,
+            "request_successes": 1, "request_errors": 0,
+        }))
+        return CollectionResult("ok", 0, 1, 0)
+
+    result = ss.run_configured(
+        config, runner=lambda *_args: None, eastmoney_runner=eastmoney_runner,
+        eastmoney_constituent_provider=lambda *_args: (
+            {"robot": selected, "chip": []}, claimed_ok,
+        ),
+        trade_date="2026-08-13",
+    )
+
+    representative = frozen["representative_constituents"]
+    assert representative["robot"]["selected"] == selected
+    assert representative["robot"]["selected_count"] == 1
+    assert representative["robot"]["status"] == "insufficient"
+    assert representative["chip"]["selected"] == []
+    assert representative["chip"]["selected_count"] == 0
+    assert representative["chip"]["status"] == "failed"
+    assert {item["sector_id"] for item in frozen["missing_targets"]
+            if item["reason"] == "target_shortfall"} == {"robot", "chip"}
+    assert result["status"] == "degraded"
+    assert result["collection"]["eastmoney"]["shadow_qualified"] is False
+
+
+def test_provider_failure_writes_safe_degraded_audit_without_live_runner(tmp_path: Path):
+    """Catches a failed provider that skips the frozen audit or stores its raw exception."""
+    secret = "https://token:super-secret@example.invalid/private/path"
+    config = {"sector_sentiment": {
+        "enabled": True, "cache_dir": str(tmp_path), "platforms": ["eastmoney"],
+        "taxonomy": [{"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+                      "aliases": ["机器人"], "eastmoney_forum_id": "bk0910"}],
+        "mediacrawler_commit": "a" * 40, "semantic_prompt_version": ss.PROMPT_VERSION,
+        "retrieval": {"query_templates": ["{term} 股票"], "query_version": ss.QUERY_VERSION,
+                      "relevance_version": ss.RELEVANCE_VERSION,
+                      "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                      "max_contents_per_query": 2, "max_comments_per_content": 2},
+        "eastmoney": _config(),
+    }}
+
+    def failed_provider(*_args):
+        raise RuntimeError(secret)
+
+    def live_runner(*_args, **_kwargs):
+        raise AssertionError("provider failure must not launch live sector-only scraping")
+
+    result = ss.run_configured(
+        config, runner=lambda *_args: None, eastmoney_runner=live_runner,
+        eastmoney_constituent_provider=failed_provider, trade_date="2026-08-13",
+    )
+
+    eastmoney = result["collection"]["eastmoney"]
+    manifest = json.loads(Path(eastmoney["manifest_path"]).read_text())
+    persisted = "\n".join([
+        json.dumps(eastmoney, ensure_ascii=False),
+        Path(eastmoney["manifest_path"]).read_text(),
+        Path(eastmoney["manifest_path"]).with_name("telemetry.json").read_text(),
+        json.dumps(ss.open_store(tmp_path).collection_summary("2026-08-13"), ensure_ascii=False),
+    ])
+    assert eastmoney["status"] == "degraded"
+    assert eastmoney["target_shortfall"] is True
+    assert eastmoney["shadow_qualified"] is False
+    assert all(item["status"] == "failed"
+               for item in manifest["representative_constituents"].values())
+    assert all(item["reason"] == "representative_provider_unavailable"
+               for item in manifest["representative_constituents"].values())
+    assert secret not in persisted
+    assert "RuntimeError" not in persisted
+
+
+def test_collection_telemetry_replaces_runner_and_report_exception_text(tmp_path: Path):
+    """Catches raw collector exception details being persisted in Eastmoney telemetry."""
+    secret = "https://token:super-secret@example.invalid/private/path"
+
+    def runner(_manifest_path, report_path, *, timeout_seconds):
+        Path(report_path).write_text(json.dumps({
+            "parser_successes": 0, "parser_errors": 1,
+            "request_successes": 0, "request_errors": 1, "message": secret,
+        }))
+        return CollectionResult("failed", 0, 1, 1, message=secret)
+
+    telemetry, _ = collect_eastmoney(
+        cache_dir=tmp_path, config=_config(), taxonomy=[], constituents={},
+        trade_date="2026-08-13", collected_at="2026-08-13T16:00:00+08:00", runner=runner,
+    )
+
+    persisted = "\n".join([
+        json.dumps(telemetry, ensure_ascii=False),
+        Path(telemetry["manifest_path"]).with_name("telemetry.json").read_text(),
+    ])
+    assert telemetry["message"] == "collector_failed"
+    assert secret not in persisted

@@ -72,7 +72,13 @@ export function SectorSentimentPage() {
         </div>
       )}
 
-      {overview.data?.eastmoney && <EastmoneyStatus telemetry={overview.data.eastmoney} />}
+      {overview.data?.eastmoney && (
+        <EastmoneyStatus
+          telemetry={overview.data.eastmoney}
+          scoreAsOf={overview.data.score_as_of}
+          scoreFallbackStale={overview.data.stale}
+        />
+      )}
 
       <div className="flex gap-2" aria-label="情绪预警视图">
         {(["alerts", "creators"] as const).map((value) => (
@@ -259,10 +265,20 @@ function SectorCard({ sector }: { sector: SectorSentimentScore }) {
   );
 }
 
-function EastmoneyStatus({ telemetry }: { telemetry: EastmoneyTelemetry }) {
+function EastmoneyStatus({
+  telemetry,
+  scoreAsOf,
+  scoreFallbackStale,
+}: {
+  telemetry: EastmoneyTelemetry;
+  scoreAsOf: string | null;
+  scoreFallbackStale: boolean;
+}) {
+  const isStale = telemetry.stale || scoreFallbackStale;
   const currentLabel: Record<string, string> = {
     ok: "采集正常", empty_valid: "窗口内无新增内容", partial: "部分目标采集失败",
-    blocked: "当前采集受限", schema_changed: "页面结构发生变化", failed: "当前采集失败",
+    degraded: "当前采集不完整", blocked: "当前采集受限",
+    schema_changed: "页面结构发生变化", failed: "当前采集失败",
   };
   return (
     <Card>
@@ -271,9 +287,13 @@ function EastmoneyStatus({ telemetry }: { telemetry: EastmoneyTelemetry }) {
           <p className="font-medium">东方财富股吧</p>
           <p className={telemetry.current_status === "ok" ? "text-up" : "text-amber-700"}>
             {currentLabel[telemetry.current_status] ?? telemetry.current_status}
-            {telemetry.display_status === "stale" ? " · 展示上一成功批次" : ""}
+            {telemetry.display_status === "stale" ? " · 展示上一成功批次" :
+              scoreFallbackStale ? " · 展示上一成功评分" : ""}
           </p>
         </div>
+        {isStale && scoreAsOf && (
+          <p className="text-xs text-amber-700">评分展示截至 {scoreAsOf}</p>
+        )}
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-secondary">
           <span>帖子 {telemetry.posts}</span><span>一级评论 {telemetry.first_level_comments}</span>
           <span>独立作者 {telemetry.independent_authors}</span>

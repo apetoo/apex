@@ -317,3 +317,109 @@ def test_eastmoney_shadow_progress_counts_its_own_attempt_and_qualified_dates(tm
     assert payload["shadow_attempt_days"] == 2
     assert payload["shadow_qualified_days"] == 1
     assert payload["shadow_days"] == 1
+
+
+def _promoted_score(trade_date: str) -> dict:
+    return {
+        "trade_date": trade_date, "sector_id": "concept:robot", "sector_name": "机器人",
+        "taxonomy": "concept", "platforms": ["bili", "eastmoney"], "independent_authors": 20,
+        "mapping_confidence": 0.9, "sentiment_extreme": 0.95,
+        "attention_acceleration": 0.92, "consensus_crowding": 0.8,
+        "market_divergence": 0.2, "short_risk": 66, "swing_risk": 48,
+        "coverage_quality": {"qualified": True},
+    }
+
+
+def test_promoted_collection_failure_uses_prior_score_but_current_audit_for_overview_and_detail(tmp_path):
+    """Catches an API that either hides today's failed audit or presents stale scores as current."""
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.record_collection({
+        "trade_date": "2026-08-10", "coverage": 1.0, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "phase": "promoted", "current_status": "ok", "status": "ok",
+            "as_of": "2026-08-10T10:00:00Z",
+        }}, "funnel": {},
+    })
+    store.save_daily_score(_promoted_score("2026-08-10"))
+    store.record_collection({
+        "trade_date": "2026-08-11", "coverage": 0.0, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "phase": "promoted", "current_status": "blocked", "status": "blocked",
+            "as_of": "2026-08-11T10:00:00Z",
+            "promotion_audit": {
+                "required_qualified_days": 14, "observed_qualified_days": 3,
+                "eligible_by_history": False, "override_used": True,
+                "override_reason": "operator reviewed collector evidence",
+            },
+        }}, "funnel": {},
+    })
+    client = _client(store)
+
+    assert store.latest_successful_eastmoney_date("2026-08-11") == "2026-08-10"
+    overview = client.get("/api/sector-sentiment/overview").json()
+    detail = client.get("/api/sector-sentiment/concept:robot").json()
+
+    for payload in (overview, detail):
+        assert payload["as_of"] == "2026-08-11"
+        assert payload["score_as_of"] == "2026-08-10"
+        assert payload["stale"] is True
+        assert payload["data_quality"] == "degraded"
+        assert payload["eastmoney"]["current_status"] == "blocked"
+        assert payload["eastmoney"]["current_attempt_at"] == "2026-08-11T10:00:00Z"
+        assert payload["eastmoney"]["override_used"] is True
+        assert "override_reason" not in payload["eastmoney"]
+        assert "operator reviewed collector evidence" not in json.dumps(payload, ensure_ascii=False)
+    assert overview["sectors"][0]["trade_date"] == "2026-08-10"
+    assert detail["sector"]["trade_date"] == "2026-08-10"
+
+
+def test_promoted_same_day_retry_failure_keeps_earlier_successful_score_stale(tmp_path):
+    """Catches a retry hiding a successful promoted score from earlier on the same date."""
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.record_collection({
+        "trade_date": "2026-08-11", "coverage": 1.0, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "phase": "promoted", "current_status": "ok", "status": "ok",
+            "as_of": "2026-08-11T09:00:00Z",
+        }}, "funnel": {},
+    })
+    store.save_daily_score(_promoted_score("2026-08-11"))
+    store.record_collection({
+        "trade_date": "2026-08-11", "coverage": 0.0, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "phase": "promoted", "current_status": "failed", "status": "failed",
+            "as_of": "2026-08-11T16:00:00Z",
+        }}, "funnel": {},
+    })
+    client = _client(store)
+
+    assert store.latest_successful_eastmoney_date("2026-08-11") == "2026-08-11"
+    for payload in (
+        client.get("/api/sector-sentiment/overview").json(),
+        client.get("/api/sector-sentiment/concept:robot").json(),
+    ):
+        assert payload["as_of"] == "2026-08-11"
+        assert payload["score_as_of"] == "2026-08-11"
+        assert payload["stale"] is True
+        assert payload["data_quality"] == "degraded"
+        assert payload["eastmoney"]["current_status"] == "failed"
+    assert client.get("/api/sector-sentiment/overview").json()["sectors"][0]["state"] == "insufficient_data"
+
+
+def test_promoted_collection_failure_without_prior_score_is_insufficient_data_not_normal(tmp_path):
+    """Catches a first promoted failure being rendered as harmless because no alert event exists."""
+    store = ss.SentimentStore(tmp_path / "sentiment.sqlite3")
+    store.save_daily_score({**_promoted_score("2026-08-11"), "coverage_quality": {"qualified": False}})
+    store.record_collection({
+        "trade_date": "2026-08-11", "coverage": 0.0, "search_coverage": 1.0,
+        "creator_coverage": 1.0, "platforms": {"eastmoney": {
+            "phase": "promoted", "current_status": "failed", "status": "failed",
+            "as_of": "2026-08-11T10:00:00Z",
+        }}, "funnel": {},
+    })
+
+    payload = _client(store).get("/api/sector-sentiment/overview").json()
+
+    assert payload["data_quality"] == "degraded"
+    assert payload["stale"] is False
+    assert payload["sectors"][0]["state"] == "insufficient_data"

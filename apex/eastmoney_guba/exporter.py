@@ -2,7 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
+from urllib.parse import urlsplit
+
+
+_CANONICAL_DETAIL_PATH = re.compile(r"/news,([A-Za-z0-9_-]+),([A-Za-z0-9_-]+)\.html\Z")
+
+
+def _is_canonical_detail_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and parsed.netloc == "guba.eastmoney.com"
+        and not parsed.query
+        and not parsed.fragment
+        and _CANONICAL_DETAIL_PATH.fullmatch(parsed.path)
+    )
 
 
 class EastmoneyExporter:
@@ -30,6 +49,9 @@ class EastmoneyExporter:
         sectors = sorted(set(sector_ids or [sector_id]))
         with self.output.open("a", encoding="utf-8") as stream:
             for item in records:
+                source_url = str(item.get("url") or "")
+                if not _is_canonical_detail_url(source_url):
+                    raise ValueError("record requires a canonical Eastmoney detail URL")
                 identity = (batch_id, str(item["content_id"]), str(item.get("comment_id") or ""),
                             tuple(sectors))
                 if identity in self._seen:
@@ -44,7 +66,7 @@ class EastmoneyExporter:
                     "title": item.get("title") or "", "text": item.get("text") or "",
                     "engagement": sum(int(item.get(key) or 0) for key in
                                       ("read_count", "reply_count", "like_count")),
-                    "url": item.get("url"),
+                    "url": source_url,
                     "author_hash": hashlib.sha256(
                         f"{self.author_salt}:{author}".encode("utf-8")
                     ).hexdigest() if author else None,

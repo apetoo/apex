@@ -27,75 +27,16 @@ def _store() -> ss.SentimentStore:
     return ss.open_store(Path(str(cache)))
 
 
-def _meta(store: ss.SentimentStore, date: str | None) -> dict:
-    resolved = date or store.latest_date()
-    scores = store.scores_for_date(resolved) if resolved else []
-    model_version = scores[0]["model_version"] if scores else ss.MODEL_VERSION
-    return {"as_of": resolved, "model_version": model_version, "rule_version": ss.RULE_VERSION,
-            "prompt_version": ss.PROMPT_VERSION, "dictionary_version": ss.DICTIONARY_VERSION,
-            "mapping_version": ss.MAPPING_VERSION}
-
-
 def _expected_platforms() -> int:
-    cfg = config.get() or {}
+    # API read paths remain usable in a fresh install and unit tests before an
+    # operator has created config.yaml.  Deliberately narrow this fallback to
+    # the absent-file case: malformed YAML and other configuration errors must
+    # still surface rather than being mistaken for the legacy default policy.
+    try:
+        cfg = config.get() or {}
+    except FileNotFoundError:
+        cfg = {}
     return max(1, len((cfg.get("sector_sentiment") or {}).get("platforms", ["bili", "dy"])))
-
-
-def _quality_meta(store: ss.SentimentStore, date: str | None) -> dict:
-    resolved = date or store.latest_date()
-    sectors = store.scores_for_date(resolved) if resolved else []
-    run = store.collection_summary(resolved if date else None)
-    if run["status"] == "no_data":
-        present = {platform for sector in sectors for platform in sector["platforms"]}
-        coverage = min(1.0, len(present) / _expected_platforms())
-    else:
-        coverage = float(run["coverage"])
-    quality = "ok" if sectors and coverage >= 1 else "no_data" if not sectors else "degraded"
-    stale = bool(resolved and run.get("trade_date") and resolved < run["trade_date"])
-    return {**_meta(store, resolved), "coverage": coverage, "data_quality": quality,
-            "stale": stale}
-
-
-def _retrieval_funnel(store: ss.SentimentStore, date: str | None) -> dict | None:
-    """Return daily accounting, preserving absent telemetry as null."""
-    return store.collection_summary(date).get("funnel")
-
-
-def _eastmoney_telemetry(store: ss.SentimentStore, date: str | None) -> dict | None:
-    """Return an allowlisted operational view; never expose paths or collector payloads."""
-    run = store.collection_summary(date)
-    raw = (run.get("platforms") or {}).get("eastmoney")
-    if not isinstance(raw, dict):
-        return None
-    current = str(raw.get("current_status") or raw.get("status") or "failed")
-    display = str(raw.get("display_status") or current)
-    last_success = raw.get("last_success") if isinstance(raw.get("last_success"), dict) else {}
-    shown = last_success if display == "stale" and last_success else raw
-    progress = store.eastmoney_shadow_progress()
-    return {
-        "current_status": current,
-        "display_status": display,
-        "posts": int(shown.get("posts") or 0),
-        "first_level_comments": int(shown.get("comments") or 0),
-        "independent_authors": int(shown.get("independent_authors") or 0),
-        "sector_forum_records": int(shown.get("sector_forum_records") or 0),
-        "constituent_forum_records": int(shown.get("constituent_forum_records") or 0),
-        "request_success_rate": float(shown.get("request_success_rate") or 0),
-        "parse_success_rate": float(shown.get("parse_success_rate") or 0),
-        "quota_exhausted": bool(raw.get("quota_exhausted")),
-        "circuit_open": bool(raw.get("circuit_open")),
-        "schema_changed": current == "schema_changed",
-        "blocked": current == "blocked",
-        "stale": display == "stale" or bool(raw.get("stale")),
-        "current_attempt_at": raw.get("as_of"),
-        "latest_success_at": (raw.get("last_success_at") or last_success.get("as_of")
-                              or (raw.get("as_of") if current in {"ok", "empty_valid"} else None)),
-        "phase": str(raw.get("phase") or "shadow"),
-        "shadow_attempt_days": progress["attempt_days"],
-        "shadow_qualified_days": progress["qualified_days"],
-        "shadow_days": min(progress["qualified_days"], 14),
-        "shadow_target_days": 14,
-    }
 
 
 def _public_creator(creator: dict) -> dict:
@@ -117,23 +58,17 @@ def _public_creator(creator: dict) -> dict:
 
 @router.get("/overview")
 def overview(date: str | None = Query(None)):
-    store = _store()
-    resolved = date or store.latest_date()
-    sectors = store.scores_for_date(resolved) if resolved else []
-    for sector in sectors:
-        sector["state"] = store.state_as_of(sector["sector_id"], resolved)
-    events = [event for event in store.list_events() if event["trade_date"] == resolved]
-    meta = _quality_meta(store, resolved)
-    return {**meta,
-            "sectors": sectors, "changes": events, "shadow_mode": True,
-            "retrieval_funnel": _retrieval_funnel(store, resolved),
-            "eastmoney": _eastmoney_telemetry(store, resolved)}
+    return ss.sector_sentiment_overview(
+        _store(), date, expected_platforms=_expected_platforms(),
+    )
 
 
 @router.get("/events")
 def events():
     store = _store()
-    return {**_quality_meta(store, store.latest_date()), "events": store.list_events()}
+    return {**ss.sector_sentiment_quality_meta(
+        store, store.latest_date(), expected_platforms=_expected_platforms(),
+    ), "events": store.list_events()}
 
 
 @router.get("/validation")
@@ -146,7 +81,9 @@ def validation():
     swing = ss.evaluate_layer(rows, "swing_hit")
     verdicts = {short["verdict"], swing["verdict"]}
     go_no_go = "GO" if verdicts == {"GO"} else "NO-GO" if verdicts == {"NO-GO"} else "MIXED" if "PENDING" not in verdicts else "PENDING"
-    return {**_quality_meta(store, store.latest_date()), "status": "ready" if trading_days >= 60 else "accumulating",
+    return {**ss.sector_sentiment_quality_meta(
+        store, store.latest_date(), expected_platforms=_expected_platforms(),
+    ), "status": "ready" if trading_days >= 60 else "accumulating",
             "trading_days": trading_days, "target_days": 60,
             "short": short, "swing": swing, "go_no_go": go_no_go}
 
@@ -155,7 +92,9 @@ def validation():
 def creators(status: Literal["candidate", "approved", "rejected"] | None = Query(None)):
     store = _store()
     return {
-        **_quality_meta(store, store.latest_date()),
+        **ss.sector_sentiment_quality_meta(
+            store, store.latest_date(), expected_platforms=_expected_platforms(),
+        ),
         "creators": [_public_creator(creator) for creator in store.list_creators(status)],
     }
 
@@ -163,7 +102,9 @@ def creators(status: Literal["candidate", "approved", "rejected"] | None = Query
 def _moderate(platform: str, creator_id: str, action: Literal["approve", "reject", "restore"]):
     store = _store()
     creator = store.moderate_creator(platform, creator_id, action)
-    return {**_quality_meta(store, store.latest_date()), "creator": _public_creator(creator)}
+    return {**ss.sector_sentiment_quality_meta(
+        store, store.latest_date(), expected_platforms=_expected_platforms(),
+    ), "creator": _public_creator(creator)}
 
 
 @router.post("/creators/{platform}/{creator_id}/approve")
@@ -183,23 +124,9 @@ def restore_creator(platform: str, creator_id: str):
 
 @router.get("/{sector_id}")
 def detail(sector_id: str, date: str | None = Query(None)):
-    store = _store()
-    history = store.scores_for_sector(sector_id)
-    if date:
-        history = [row for row in history if row["trade_date"] <= date]
-    if not history:
+    payload = ss.sector_sentiment_detail(
+        _store(), sector_id, date, expected_platforms=_expected_platforms(),
+    )
+    if payload is None:
         raise HTTPException(status_code=404, detail="sector not found")
-    latest = history[-1]
-    state = store.get_state(sector_id)
-    meta = _quality_meta(store, latest["trade_date"])
-    quality = "ok" if meta["data_quality"] == "ok" and _detail_ok(latest) else "degraded"
-    return {**meta, "data_quality": quality, "sector": latest,
-            "state": state, "history": history[-60:],
-            "retrieval_funnel": _retrieval_funnel(store, latest["trade_date"]),
-            "eastmoney": _eastmoney_telemetry(store, latest["trade_date"])}
-
-
-def _detail_ok(score: dict) -> bool:
-    return (len(score["platforms"]) >= ss.MIN_PLATFORMS
-            and score["independent_authors"] >= ss.MIN_AUTHORS
-            and score["mapping_confidence"] >= ss.MIN_MAPPING_CONFIDENCE)
+    return payload
