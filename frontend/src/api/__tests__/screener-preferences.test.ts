@@ -20,7 +20,10 @@ const requestParams = {
 };
 
 describe("screener request mode", () => {
-  const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
+  const fetchSpy = vi.fn(
+    async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(null, { status: 200 }),
+  );
 
   beforeEach(() => {
     fetchSpy.mockClear();
