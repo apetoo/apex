@@ -259,11 +259,18 @@ def _validate_retrieval_policy(settings: dict, retrieval_settings: dict) -> str:
                               eastmoney.get("phase", "shadow") == "promoted")
     frozen_platforms = [value for value in settings.get("platforms", ["bili", "dy"])
                         if value != "eastmoney" or eastmoney_promoted]
+    taxonomy = settings.get("taxonomy")
+    if not eastmoney_promoted and isinstance(taxonomy, list):
+        taxonomy = [
+            {key: value for key, value in sector.items() if key != "eastmoney_forum_id"}
+            if isinstance(sector, dict) else sector
+            for sector in taxonomy
+        ]
     frozen = {
         **expected,
         "mediacrawler_commit": commit.lower(),
         "platforms": frozen_platforms,
-        "taxonomy": settings.get("taxonomy"),
+        "taxonomy": taxonomy,
         "fallback_keywords": settings.get("keywords"),
         "llm_enabled": bool(settings.get("llm_enabled", False)),
         "relevance_llm_enabled": relevance_llm_enabled,

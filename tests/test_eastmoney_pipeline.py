@@ -488,6 +488,31 @@ def test_pre_feature_policy_hash_is_golden_and_shadow_is_byte_compatible(tmp_pat
     assert legacy_hash == "3255d32e06ab4f6857920e782a448423a4f36e8b8f713b7689f99b407c59cde6"
 
 
+def test_eastmoney_forum_id_is_excluded_from_shadow_but_frozen_when_promoted():
+    settings = {
+        "platforms": ["bili", "dy"], "mediacrawler_commit": "a" * 40,
+        "semantic_prompt_version": ss.PROMPT_VERSION,
+        "taxonomy": [{"sector_id": "robot", "sector_name": "机器人",
+                      "taxonomy": "concept", "aliases": ["机器人"]}],
+    }
+    retrieval = {"query_version": ss.QUERY_VERSION,
+                 "relevance_version": ss.RELEVANCE_VERSION,
+                 "creator_rule_version": ss.CREATOR_RULE_VERSION,
+                 "query_templates": ["{term} 股票"],
+                 "max_contents_per_query": 20, "max_comments_per_content": 20}
+    legacy_hash = ss._validate_retrieval_policy(settings, retrieval)
+    shadow = copy.deepcopy(settings)
+    shadow["eastmoney"] = {**_config(), "phase": "shadow"}
+    shadow["taxonomy"][0]["eastmoney_forum_id"] = "bk0910"
+    assert ss._validate_retrieval_policy(shadow, retrieval) == legacy_hash
+
+    promoted = copy.deepcopy(shadow)
+    promoted["eastmoney"]["phase"] = "promoted"
+    first_promoted_hash = ss._validate_retrieval_policy(promoted, retrieval)
+    promoted["taxonomy"][0]["eastmoney_forum_id"] = "bk1036"
+    assert ss._validate_retrieval_policy(promoted, retrieval) != first_promoted_hash
+
+
 def test_real_batch_jsonl_to_score_state_replay_is_idempotent(tmp_path: Path):
     config = {"sector_sentiment": {
         "enabled": True, "cache_dir": str(tmp_path), "platforms": ["bili", "eastmoney"],
