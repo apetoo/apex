@@ -79,12 +79,15 @@ def _validate_manifest(value: object) -> dict:
         for key in ("target_id", "sector_id", "source_type", "pool_version"):
             if not job.get(key):
                 raise ValueError(f"job missing {key}")
-        urls = [job["url"], job.get("detail_url_template"), job.get("comments_url_template"),
+        urls = [job["url"], job.get("list_next_url_template"),
+                job.get("detail_url_template"), job.get("comments_url_template"),
                 job.get("comments_next_url_template")]
-        if any(url and not _allowed_url(url.replace("{content_id}", "1").replace("{cursor}", "1"),
+        if any(url and not _allowed_url(url.replace("{content_id}", "1")
+                                        .replace("{cursor}", "1").replace("{page}", "2"),
                                         test_hosts) for url in urls):
             raise ValueError("collector URLs must use HTTPS Eastmoney allowlist")
-        key = (job["kind"], job["url"], job.get("detail_url_template"),
+        key = (job["kind"], job["url"], job.get("list_next_url_template"),
+               job.get("detail_url_template"),
                job.get("comments_url_template"), job.get("comments_next_url_template"))
         mapping = {name: job.get(name) for name in
                    ("target_id", "sector_id", "source_type", "stock_code", "pool_version")}
@@ -218,6 +221,7 @@ class EastmoneySpider(scrapy.Spider):
                 unique = [record for record in page.records
                           if record["comment_id"] not in seen]
                 records = unique[: max(0, self.comments_per_post - len(seen))]
+                records = [self._with_source_url(record, job) for record in records]
                 self._export(records, job)
                 seen.update(record["comment_id"] for record in records)
                 if (page.has_more and page.next_cursor and len(seen) < self.comments_per_post
@@ -234,59 +238,118 @@ class EastmoneySpider(scrapy.Spider):
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
         except SchemaChanged:
-            self.parser_errors += 1
-            if self.parser_errors >= self.circuit_breaker_failures:
-                self.terminal_reason = "schema_changed"
-                raise CloseSpider("schema_changed")
-            for mapping in job.get("mappings") or [job]:
-                self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
+            self._schema_changed(job)
             return
         self.parser_successes += 1
 
         if job["kind"] == "detail":
-            self._export(posts[:1], job)
+            self._export([self._with_source_url(post, job) for post in posts[:1]], job)
             return
 
         window_start = job.get("window_start")
+        lower = None
         if window_start:
             try:
                 lower = datetime.fromisoformat(str(window_start).replace("Z", "+00:00"))
-                selected_window = []
-                for post in posts:
-                    if not post.get("published_at"):
-                        continue
-                    published = datetime.fromisoformat(
-                        str(post["published_at"]).replace("Z", "+00:00")
-                    )
-                    if published.tzinfo is None and lower.tzinfo is not None:
-                        published = published.replace(tzinfo=lower.tzinfo)
-                    if published >= lower:
-                        selected_window.append(post)
-                posts = selected_window
             except (TypeError, ValueError):
                 raise CloseSpider("invalid_window_timestamp")
         posts_limit = job.get("posts_limit", self.posts_per_target)
         if isinstance(posts_limit, bool) or not isinstance(posts_limit, int) or posts_limit < 0:
             raise CloseSpider("invalid_posts_limit")
-        selected = posts[: min(self.posts_per_target, posts_limit)]
-        self.seen_posts[job["target_id"]] = len(selected)
-        for post in selected:
+        cap = min(self.posts_per_target, posts_limit)
+        seen_ids = set(job.get("seen_post_ids") or [])
+        scheduled_count = int(job.get("scheduled_post_count") or 0)
+        children = []
+        page_activities: list[datetime] = []
+        parsed_posts = []
+        for post in posts:
+            try:
+                published = self._timestamp(post.get("published_at"), lower)
+                activity = self._timestamp(
+                    post.get("last_activity_at") or post.get("published_at"), lower,
+                )
+            except (TypeError, ValueError):
+                self._schema_changed(job)
+                return
+            if published is None and activity is None:
+                self._schema_changed(job)
+                return
+            if activity is not None:
+                page_activities.append(activity)
+            parsed_posts.append((post, published, activity))
+        for post, published, activity in parsed_posts:
             content_id = post["content_id"]
-            detail_template = job.get("detail_url_template")
-            if detail_template:
-                child = dict(job, kind="detail", url=detail_template.format(content_id=content_id))
-                request = self._request(child)
-                if request is not None:
-                    yield request
-            else:
-                self._export([post], job)
+            if content_id in seen_ids:
+                continue
+            body_in_window = lower is None or (published is not None and published >= lower)
+            active_in_window = lower is None or (activity is not None and activity >= lower)
+            if not body_in_window and not active_in_window:
+                continue
+            seen_ids.add(content_id)
+            if body_in_window and scheduled_count < cap:
+                scheduled_count += 1
+                detail_template = job.get("detail_url_template")
+                if detail_template:
+                    child = dict(job, kind="detail", url=detail_template.format(content_id=content_id))
+                    request = self._request(child)
+                    if request is not None:
+                        children.append(request)
+                else:
+                    self._export([self._with_source_url(post, job)], job)
+            elif body_in_window:
+                continue
             comments_template = job.get("comments_url_template")
-            if comments_template:
+            if comments_template and (body_in_window or active_in_window):
                 child = dict(job, kind="comments", content_id=content_id,
                              url=comments_template.format(content_id=content_id))
                 request = self._request(child)
                 if request is not None:
-                    yield request
+                    children.append(request)
+        self.seen_posts[job["target_id"]] = scheduled_count
+
+        page = job.get("page", 1)
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            raise CloseSpider("invalid_list_page")
+        crossed_floor = bool(lower is not None and page_activities
+                             and page_activities[-1] < lower)
+        next_template = job.get("list_next_url_template")
+        if next_template and scheduled_count < cap and posts and not crossed_floor:
+            child = dict(
+                job, kind="list", page=page + 1,
+                url=next_template.format(page=page + 1),
+                seen_post_ids=sorted(seen_ids), scheduled_post_count=scheduled_count,
+            )
+            request = self._request(child)
+            if request is not None:
+                yield request
+        yield from children
+
+    @staticmethod
+    def _timestamp(value, lower: datetime | None) -> datetime | None:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if lower is not None and parsed.tzinfo is None and lower.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=lower.tzinfo)
+        return parsed
+
+    def _schema_changed(self, job: dict) -> None:
+        self.parser_errors += 1
+        for mapping in job.get("mappings") or [job]:
+            self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
+        if self.parser_errors >= self.circuit_breaker_failures:
+            self.terminal_reason = "schema_changed"
+            raise CloseSpider("schema_changed")
+
+    @staticmethod
+    def _canonical_detail_url(job: dict, content_id: str) -> str:
+        forum_id = str(job.get("forum_id") or job.get("target_id") or "").strip()
+        return f"https://guba.eastmoney.com/news,{forum_id},{content_id}.html"
+
+    def _with_source_url(self, record: dict, job: dict) -> dict:
+        value = dict(record)
+        value["url"] = self._canonical_detail_url(job, str(value["content_id"]))
+        return value
 
     def _export(self, records: list[dict], job: dict):
         mappings = job.get("mappings") or [job]
@@ -337,7 +400,6 @@ class EastmoneySpider(scrapy.Spider):
             report["terminal_reason"] = self.terminal_reason
         elif reason not in {"finished", "shutdown"}:
             report["terminal_reason"] = "failed"
-            report["message"] = str(reason)
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.report_path.with_suffix(self.report_path.suffix + ".tmp")
         temporary.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")

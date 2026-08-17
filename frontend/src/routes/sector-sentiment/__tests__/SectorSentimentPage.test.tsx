@@ -14,6 +14,7 @@ const { getSectorSentimentCreators, getSectorSentimentDetail, moderateSectorSent
 vi.mock("@/api/sector-sentiment", () => ({
   getSectorSentimentOverview: vi.fn().mockResolvedValue({
     as_of: "2026-08-10",
+    score_as_of: "2026-08-09",
     coverage: 1,
     data_quality: "ok",
     model_version: "model-v1",
@@ -228,10 +229,41 @@ test("shows Eastmoney stale telemetry and 14-day shadow progress", async () => {
   expect(await screen.findByText("东方财富股吧")).toBeInTheDocument();
   expect(screen.getByText(/当前采集受限/)).toBeInTheDocument();
   expect(screen.getByText(/展示上一成功批次/)).toBeInTheDocument();
+  expect(screen.getByText("评分展示截至 2026-08-09")).toBeInTheDocument();
   expect(screen.getByText("帖子 12")).toBeInTheDocument();
   expect(screen.getByText("一级评论 34")).toBeInTheDocument();
   expect(screen.getByText("独立作者 9")).toBeInTheDocument();
   expect(screen.getByText("影子采集 5 / 14 个交易日")).toBeInTheDocument();
+});
+
+test("shows stale score date when the API fallback is stale but raw telemetry is not", async () => {
+  vi.mocked(getSectorSentimentOverview).mockResolvedValueOnce({
+    as_of: "2026-08-11",
+    score_as_of: "2026-08-10",
+    stale: true,
+    coverage: 0,
+    data_quality: "degraded",
+    model_version: "model-v1",
+    rule_version: "rule-v1",
+    shadow_mode: true,
+    sectors: [],
+    changes: [],
+    retrieval_funnel: null,
+    eastmoney: {
+      phase: "promoted", current_status: "failed", display_status: "failed",
+      posts: 0, first_level_comments: 0, independent_authors: 0,
+      sector_forum_records: 0, constituent_forum_records: 0,
+      request_success_rate: 0, parse_success_rate: 0,
+      quota_exhausted: false, circuit_open: false, schema_changed: false,
+      blocked: false, stale: false, current_attempt_at: "2026-08-11T16:00:00Z",
+      latest_success_at: null, shadow_days: 14, shadow_attempt_days: 14,
+      shadow_qualified_days: 14, shadow_target_days: 14,
+    },
+  });
+  renderPage();
+
+  expect(await screen.findByText(/当前采集失败/)).toBeInTheDocument();
+  expect(screen.getByText("评分展示截至 2026-08-10")).toBeInTheDocument();
 });
 
 test("renders safe Eastmoney evidence as an external link", async () => {

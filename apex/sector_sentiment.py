@@ -43,6 +43,7 @@ MAPPING_VERSION = "sector-alias-v1"
 MIN_PLATFORMS = 2
 MIN_AUTHORS = 10
 MIN_MAPPING_CONFIDENCE = 0.70
+EASTMONEY_PROMOTION_QUALIFIED_DAYS = 14
 
 
 class CreatorNotFoundError(Exception):
@@ -287,7 +288,12 @@ def _validate_retrieval_policy(settings: dict, retrieval_settings: dict) -> str:
         "exclude_terms": list(EXCLUDE_TERMS),
     }
     if eastmoney_promoted:
-        frozen["eastmoney"] = eastmoney
+        # The operator's audit note authorizes rollout; it does not change the
+        # frozen retrieval/scoring policy and therefore must not rotate its hash.
+        frozen["eastmoney"] = {
+            key: value for key, value in eastmoney.items()
+            if key != "promotion_override_reason"
+        }
     payload = json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1315,6 +1321,38 @@ class SentimentStore:
                 qualified.add(str(row["trade_date"]))
         return {"attempt_days": len(attempts), "qualified_days": len(qualified)}
 
+    def latest_successful_eastmoney_date(
+        self, on_or_before: str | None = None,
+    ) -> str | None:
+        """Return the newest promoted Eastmoney date with a qualified saved score."""
+        params: tuple[str, ...] = ()
+        where = ""
+        if on_or_before is not None:
+            where = "WHERE trade_date<=?"
+            params = (on_or_before,)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT trade_date, platforms_json FROM collection_runs
+                    {where}
+                    ORDER BY trade_date DESC, completed_at DESC, rowid DESC""",
+                params,
+            ).fetchall()
+        for row in rows:
+            trade_date = str(row["trade_date"])
+            try:
+                eastmoney = json.loads(row["platforms_json"] or "{}").get("eastmoney")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if not isinstance(eastmoney, dict):
+                continue
+            status = str(eastmoney.get("current_status") or eastmoney.get("status") or "")
+            if eastmoney.get("phase") != "promoted" or status not in {"ok", "empty_valid"}:
+                continue
+            if any(_coverage_ok(score) for score in self.scores_for_date(trade_date)):
+                return trade_date
+        return None
+
+
     def reserve_collection_budget(
         self, trade_date: str, job: RetrievalJob, limits: dict,
     ) -> bool:
@@ -1392,6 +1430,166 @@ class SentimentStore:
             else:
                 rows = conn.execute("SELECT * FROM outcomes ORDER BY signal_date").fetchall()
         return [dict(row) for row in rows]
+
+
+def _sector_sentiment_meta(
+    store: SentimentStore, date: str | None, *, score_date: str | None = None,
+) -> dict:
+    resolved = date or store.latest_date()
+    score_resolved = score_date or resolved
+    scores = store.scores_for_date(score_resolved) if score_resolved else []
+    model_version = scores[0]["model_version"] if scores else MODEL_VERSION
+    return {
+        "as_of": resolved, "score_as_of": score_resolved,
+        "model_version": model_version, "rule_version": RULE_VERSION,
+        "prompt_version": PROMPT_VERSION, "dictionary_version": DICTIONARY_VERSION,
+        "mapping_version": MAPPING_VERSION,
+    }
+
+
+def _sector_sentiment_display_dates(
+    store: SentimentStore, requested_date: str | None,
+) -> tuple[str | None, str | None, bool, bool]:
+    """Resolve the current audit date separately from the score safe to display."""
+    if requested_date is not None:
+        attempted = requested_date
+    else:
+        latest_run = store.collection_summary()
+        attempted = (latest_run.get("trade_date")
+                     if latest_run.get("status") != "no_data" else store.latest_date())
+    score_date = attempted or store.latest_date()
+    if not attempted:
+        return attempted, score_date, False, False
+    eastmoney = (store.collection_summary(attempted).get("platforms") or {}).get("eastmoney")
+    promoted_failure = isinstance(eastmoney, dict) and eastmoney.get("phase") == "promoted" and str(
+        eastmoney.get("current_status") or eastmoney.get("status") or "failed"
+    ) not in {"ok", "empty_valid"}
+    if promoted_failure:
+        previous = store.latest_successful_eastmoney_date(attempted)
+        if previous:
+            return attempted, previous, True, True
+    return attempted, score_date, False, bool(promoted_failure)
+
+
+def sector_sentiment_quality_meta(
+    store: SentimentStore, date: str | None, *, expected_platforms: int,
+    score_date: str | None = None, stale: bool | None = None,
+    force_degraded: bool = False,
+) -> dict:
+    """Project collection and score metadata without exposing store internals."""
+    resolved = date or store.latest_date()
+    score_resolved = score_date or resolved
+    sectors = store.scores_for_date(score_resolved) if score_resolved else []
+    run = store.collection_summary(resolved if date else None)
+    if run["status"] == "no_data":
+        present = {platform for sector in sectors for platform in sector["platforms"]}
+        coverage = min(1.0, len(present) / max(1, expected_platforms))
+    else:
+        coverage = float(run["coverage"])
+    quality = "ok" if sectors and coverage >= 1 else "no_data" if not sectors else "degraded"
+    if stale is None:
+        stale = bool(resolved and score_resolved and run.get("trade_date")
+                     and score_resolved < run["trade_date"])
+    if force_degraded or stale:
+        quality = "degraded"
+    return {**_sector_sentiment_meta(store, resolved, score_date=score_resolved),
+            "coverage": coverage, "data_quality": quality, "stale": bool(stale)}
+
+
+def sector_sentiment_eastmoney_telemetry(store: SentimentStore, date: str | None) -> dict | None:
+    """Return the public Eastmoney operational projection, excluding raw telemetry."""
+    raw = (store.collection_summary(date).get("platforms") or {}).get("eastmoney")
+    if not isinstance(raw, dict):
+        return None
+    current = str(raw.get("current_status") or raw.get("status") or "failed")
+    display = str(raw.get("display_status") or current)
+    last_success = raw.get("last_success") if isinstance(raw.get("last_success"), dict) else {}
+    shown = last_success if display == "stale" and last_success else raw
+    progress = store.eastmoney_shadow_progress()
+    public = {
+        "current_status": current, "display_status": display,
+        "posts": int(shown.get("posts") or 0),
+        "first_level_comments": int(shown.get("comments") or 0),
+        "independent_authors": int(shown.get("independent_authors") or 0),
+        "sector_forum_records": int(shown.get("sector_forum_records") or 0),
+        "constituent_forum_records": int(shown.get("constituent_forum_records") or 0),
+        "request_success_rate": float(shown.get("request_success_rate") or 0),
+        "parse_success_rate": float(shown.get("parse_success_rate") or 0),
+        "quota_exhausted": bool(raw.get("quota_exhausted")),
+        "circuit_open": bool(raw.get("circuit_open")),
+        "schema_changed": current == "schema_changed", "blocked": current == "blocked",
+        "stale": display == "stale" or bool(raw.get("stale")),
+        "current_attempt_at": raw.get("as_of"),
+        "latest_success_at": (raw.get("last_success_at") or last_success.get("as_of")
+                              or (raw.get("as_of") if current in {"ok", "empty_valid"} else None)),
+        "phase": str(raw.get("phase") or "shadow"),
+        "shadow_attempt_days": progress["attempt_days"],
+        "shadow_qualified_days": progress["qualified_days"],
+        "shadow_days": min(progress["qualified_days"], EASTMONEY_PROMOTION_QUALIFIED_DAYS),
+        "shadow_target_days": EASTMONEY_PROMOTION_QUALIFIED_DAYS,
+    }
+    promotion_audit = raw.get("promotion_audit")
+    if isinstance(promotion_audit, dict):
+        public["override_used"] = bool(promotion_audit.get("override_used"))
+    return public
+
+
+def _score_is_qualified_for_display(score: dict) -> bool:
+    groups = score.get("coverage_quality") or score.get("coverage_groups") or {}
+    return _coverage_ok(score) if "qualified" in groups else _detail_ok_for_display(score)
+
+
+def _detail_ok_for_display(score: dict) -> bool:
+    return (len(score["platforms"]) >= MIN_PLATFORMS
+            and score["independent_authors"] >= MIN_AUTHORS
+            and score["mapping_confidence"] >= MIN_MAPPING_CONFIDENCE)
+
+
+def sector_sentiment_overview(
+    store: SentimentStore, requested_date: str | None, *, expected_platforms: int,
+) -> dict:
+    """Build the read-only overview while keeping audit and score dates distinct."""
+    resolved, score_date, stale, promoted_failure = _sector_sentiment_display_dates(store, requested_date)
+    sectors = store.scores_for_date(score_date) if score_date else []
+    for sector in sectors:
+        sector["state"] = ("insufficient_data" if stale or promoted_failure
+                           or not _score_is_qualified_for_display(sector)
+                           else store.state_as_of(sector["sector_id"], score_date))
+    return {
+        **sector_sentiment_quality_meta(
+            store, resolved, expected_platforms=expected_platforms, score_date=score_date,
+            stale=stale, force_degraded=promoted_failure,
+        ),
+        "sectors": sectors,
+        "changes": [event for event in store.list_events() if event["trade_date"] == resolved],
+        "shadow_mode": True, "retrieval_funnel": store.collection_summary(resolved).get("funnel"),
+        "eastmoney": sector_sentiment_eastmoney_telemetry(store, resolved),
+    }
+
+
+def sector_sentiment_detail(
+    store: SentimentStore, sector_id: str, requested_date: str | None, *, expected_platforms: int,
+) -> dict | None:
+    """Build one sector's public view, or return ``None`` when it is absent."""
+    resolved, score_date, stale, promoted_failure = _sector_sentiment_display_dates(store, requested_date)
+    history = store.scores_for_sector(sector_id)
+    if score_date:
+        history = [row for row in history if row["trade_date"] <= score_date]
+    if not history:
+        return None
+    latest = history[-1]
+    latest["state"] = ("insufficient_data" if stale or promoted_failure
+                       or not _score_is_qualified_for_display(latest)
+                       else store.state_as_of(sector_id, latest["trade_date"]))
+    meta = sector_sentiment_quality_meta(
+        store, resolved, expected_platforms=expected_platforms,
+        score_date=latest["trade_date"], stale=stale, force_degraded=promoted_failure,
+    )
+    quality = "ok" if meta["data_quality"] == "ok" and _detail_ok_for_display(latest) else "degraded"
+    return {**meta, "data_quality": quality, "sector": latest,
+            "state": store.get_state(sector_id), "history": history[-60:],
+            "retrieval_funnel": store.collection_summary(resolved).get("funnel"),
+            "eastmoney": sector_sentiment_eastmoney_telemetry(store, resolved)}
 
 
 def _decode_score(row: sqlite3.Row) -> dict:
@@ -2286,6 +2484,31 @@ def llm_semantic_evidence(
     return output
 
 
+def _eastmoney_promotion_audit(
+    store: SentimentStore, phase: str, override_reason: str,
+) -> dict[str, Any] | None:
+    if phase != "promoted":
+        return None
+    progress = store.eastmoney_shadow_progress()
+    observed = int(progress["qualified_days"])
+    eligible = observed >= EASTMONEY_PROMOTION_QUALIFIED_DAYS
+    reason = override_reason.strip()
+    override_used = not eligible and bool(reason)
+    audit = {
+        "required_qualified_days": EASTMONEY_PROMOTION_QUALIFIED_DAYS,
+        "observed_qualified_days": observed,
+        "eligible_by_history": eligible,
+        "override_used": override_used,
+        "override_reason": reason if override_used else "",
+    }
+    if not eligible and not override_used:
+        raise ValueError(
+            "eastmoney promotion requires 14 quality-qualified shadow dates "
+            "or an explicit audited override reason"
+        )
+    return audit
+
+
 def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
                    eastmoney_runner: Callable | None = None,
                    eastmoney_constituent_provider: Callable | None = None,
@@ -2316,9 +2539,15 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
     eastmoney_phase = str(eastmoney_settings.get("phase", "shadow"))
     eastmoney_promoted = eastmoney_enabled and eastmoney_phase == "promoted"
     media_platforms = [platform for platform in platforms if platform != "eastmoney"]
+    store = open_store(cache_dir)
+    promotion_audit = None
     if eastmoney_enabled:
         from apex.eastmoney_guba.pipeline import validate_eastmoney_config
         validate_eastmoney_config(eastmoney_settings)
+        promotion_audit = _eastmoney_promotion_audit(
+            store, eastmoney_phase,
+            str(eastmoney_settings.get("promotion_override_reason") or ""),
+        )
     retrieval_settings = dict(settings.get("retrieval") or {})
     policy_hash = _validate_retrieval_policy(settings, retrieval_settings)
     retrieval_settings["config_hash"] = policy_hash
@@ -2340,7 +2569,6 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
             retrieval_settings.get("creator_id_argument", "--creator_id"),
         )
     raw_dir = cache_dir / "raw"
-    store = open_store(cache_dir)
     policy_cohort = store.reserve_policy_day(resolved_date, policy_hash)
     relevance_llm_enabled = bool(retrieval_settings.get(
         "relevance_llm_enabled", settings.get("llm_enabled", False),
@@ -2385,24 +2613,69 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
         "platform": "eastmoney", "status": "disabled", "posts": 0,
         "comments": 0, "independent_authors": 0, "parse_success_rate": 0.0,
     }
+    if promotion_audit is not None:
+        eastmoney_telemetry["promotion_audit"] = promotion_audit
     eastmoney_report = {"trade_date": resolved_date, "jobs": []}
     if eastmoney_enabled:
-        from apex.eastmoney_guba import EastmoneyRunner
+        from apex.eastmoney_guba import CollectionResult, EastmoneyRunner
         from apex.eastmoney_guba.pipeline import collect_eastmoney
+        from apex.eastmoney_guba.representatives import (
+            describe_provider_failure,
+            describe_injected_constituents,
+            normalize_injected_representative_provenance,
+            select_representative_constituents,
+        )
         if eastmoney_runner is None:
             eastmoney_runner = EastmoneyRunner().run
         try:
-            constituents = (
-                eastmoney_constituent_provider(taxonomy, resolved_date)
-                if eastmoney_constituent_provider is not None
-                else dict(eastmoney_settings.get("constituents") or {})
-            )
+            if eastmoney_constituent_provider is None:
+                provider_result = select_representative_constituents(
+                    taxonomy, resolved_date, eastmoney_settings["constituent_count"],
+                )
+            else:
+                provider_result = eastmoney_constituent_provider(taxonomy, resolved_date)
+            if (isinstance(provider_result, tuple) and len(provider_result) == 2):
+                constituents, representative_provenance = provider_result
+            else:
+                constituents = provider_result
+                representative_provenance = describe_injected_constituents(
+                    taxonomy, constituents, trade_date=resolved_date,
+                    constituent_count=eastmoney_settings["constituent_count"],
+                ) if isinstance(constituents, dict) else {}
             if not isinstance(constituents, dict):
                 raise ValueError("eastmoney constituent provider must return a sector mapping")
+            if not isinstance(representative_provenance, dict):
+                raise ValueError("eastmoney representative provenance must be a sector mapping")
+            if isinstance(provider_result, tuple):
+                representative_provenance = normalize_injected_representative_provenance(
+                    taxonomy, constituents, representative_provenance,
+                    trade_date=resolved_date,
+                    constituent_count=eastmoney_settings["constituent_count"],
+                )
+            collection_runner = eastmoney_runner
+        except Exception:
+            constituents, representative_provenance = describe_provider_failure(
+                taxonomy, trade_date=resolved_date,
+                constituent_count=eastmoney_settings["constituent_count"],
+            )
+
+            def collection_runner(manifest_path, report_path, *args, **kwargs):
+                with Path(report_path).open("x", encoding="utf-8") as stream:
+                    json.dump({
+                        "parser_successes": 0, "parser_errors": 0,
+                        "request_successes": 0, "request_errors": 0,
+                        "reason": "representative_provider_unavailable",
+                    }, stream, ensure_ascii=False, sort_keys=True)
+                return CollectionResult(
+                    "failed", 0, 0, len(taxonomy),
+                    message="representative_provider_unavailable",
+                )
+        try:
             eastmoney_telemetry, eastmoney_report = collect_eastmoney(
                 cache_dir=cache_dir, config=eastmoney_settings, taxonomy=taxonomy,
-                constituents=constituents,
-                trade_date=resolved_date, collected_at=_now(), runner=eastmoney_runner,
+                constituents=constituents, representative_provenance=representative_provenance,
+                trade_date=resolved_date, collected_at=_now(), runner=collection_runner,
+                promotion_audit=promotion_audit,
             )
             eastmoney_telemetry["phase"] = eastmoney_phase
             eastmoney_ingest = _ingest_and_classify_relevance(
@@ -2413,13 +2686,16 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
             )
             for key in totals:
                 totals[key] += eastmoney_ingest[key]
-        except Exception as exc:
+        except Exception:
             eastmoney_telemetry.update(
-                status="failed", phase=eastmoney_phase,
-                message=f"{type(exc).__name__}: {exc}",
+                status="degraded", current_status="degraded", display_status="degraded",
+                phase=eastmoney_phase, target_shortfall=True,
+                message="eastmoney_collection_unavailable",
             )
     if eastmoney_enabled:
         eastmoney_telemetry["phase"] = eastmoney_phase
+        if promotion_audit is not None:
+            eastmoney_telemetry["promotion_audit"] = promotion_audit
         eastmoney_telemetry["shadow_qualified"] = bool(
             eastmoney_telemetry.get("status") in {"ok", "empty_valid"}
             and int(eastmoney_telemetry.get("posts") or 0)

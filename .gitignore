@@ -60,6 +60,7 @@ data/
 # Reports and temporary files
 *.pdf
 *.html
+!frontend/index.html
 temp/
 tmp/
 

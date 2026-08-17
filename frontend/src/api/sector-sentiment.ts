@@ -43,10 +43,13 @@ export interface EastmoneyTelemetry {
   shadow_attempt_days: number;
   shadow_qualified_days: number;
   shadow_target_days: number;
+  override_used?: boolean;
 }
 
 export interface SectorSentimentOverview {
   as_of: string | null;
+  score_as_of: string | null;
+  stale: boolean;
   coverage: number;
   data_quality: "ok" | "degraded" | "no_data";
   model_version: string;
@@ -68,6 +71,9 @@ export interface SectorSentimentValidation {
 }
 
 export interface SectorSentimentDetail {
+  as_of: string | null;
+  score_as_of: string | null;
+  stale: boolean;
   history: SectorSentimentScore[];
   sector: SectorSentimentScore;
   retrieval_funnel: RetrievalFunnel | null;

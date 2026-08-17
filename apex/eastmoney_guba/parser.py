@@ -57,10 +57,15 @@ class _PostHTMLParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         values = dict(attrs)
         classes = set(values.get("class", "").split())
-        if "articleh" in classes and values.get("data-post-id"):
+        post_id = values.get("data-post-id") or values.get("data-postid")
+        if "articleh" in classes and post_id:
             self.current = {
-                "content_id": values["data-post-id"], "author_id": values.get("data-user-id"),
-                "title": "", "text": "", "published_at": None,
+                "content_id": post_id, "author_id": values.get("data-user-id"),
+                "title": "", "text": "",
+                "published_at": (values.get("data-publish-time")
+                                 or values.get("data-published-at")),
+                "last_activity_at": (values.get("data-last-activity")
+                                     or values.get("data-last-update")),
                 "read_count": 0, "reply_count": 0, "like_count": 0,
             }
             self.posts.append(self.current)
@@ -70,6 +75,9 @@ class _PostHTMLParser(HTMLParser):
                 self.current["url"] = values.get("href")
             elif "publish_time" in classes:
                 self.field = "published_at"
+            elif ("last_activity" in classes or "last_update" in classes
+                  or {"l5", "a5"}.issubset(classes)):
+                self.field = "last_activity_at"
             elif "read" in classes:
                 self.field = "read_count"
             elif "reply" in classes:
@@ -206,6 +214,8 @@ class EastmoneyParser:
             "content_id": str(row["post_id"]), "comment_id": "",
             "title": str(row.get("post_title") or ""), "text": str(row.get("post_content") or ""),
             "published_at": row["post_publish_time"], "author_id": row.get("user_id"),
+            "last_activity_at": row.get("post_last_time") or row["post_publish_time"],
+            "url": row.get("post_url"),
             "read_count": _count(row.get("post_click_count")),
             "reply_count": _count(row.get("post_comment_count")),
             "like_count": _count(row.get("post_like_count")),
@@ -220,6 +230,7 @@ class EastmoneyParser:
             "parent_content_id": str(row["post_id"]), "title": "",
             "text": str(row.get("comment_content") or ""),
             "published_at": row["comment_publish_time"], "author_id": row.get("user_id"),
+            "url": row.get("post_url"),
             "read_count": 0, "reply_count": 0,
             "like_count": _count(row.get("comment_like_count")),
         }

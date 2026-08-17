@@ -7,6 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from scrapy.exceptions import CloseSpider
+from scrapy.http import HtmlResponse
 
 from apex.eastmoney_guba import (
     BlockedResponse,
@@ -17,7 +19,11 @@ from apex.eastmoney_guba import (
     QuotaBudget,
     SchemaChanged,
 )
-from apex.eastmoney_guba.spider import ExponentialRetryMiddleware, _validate_manifest
+from apex.eastmoney_guba.spider import (
+    EastmoneySpider,
+    ExponentialRetryMiddleware,
+    _validate_manifest,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "eastmoney"
@@ -94,6 +100,7 @@ def test_exporter_emits_ingestible_record_without_identity(tmp_path: Path):
             "content_id": "1001", "comment_id": "", "title": "标题", "text": "正文",
             "published_at": "2026-08-11T15:20:00+08:00", "author_id": "private-user",
             "read_count": 100, "reply_count": 2, "like_count": 3,
+            "url": "https://guba.eastmoney.com/news,bk0910,1001.html",
         }],
         trade_date="2026-08-12", batch_id="batch-1", sector_id="robot",
         source_type="sector_forum", stock_code=None, pool_version="pool-v1",
@@ -108,6 +115,78 @@ def test_exporter_emits_ingestible_record_without_identity(tmp_path: Path):
     assert record["author_hash"]
     assert "private-user" not in output.read_text()
     assert "author_id" not in record and "author_name" not in record
+
+
+def test_json_post_and_comment_export_canonical_public_detail_urls(tmp_path: Path):
+    post_payload = json.loads(fixture("posts.json"))
+    comment_payload = json.loads(fixture("comments.json"))
+    detail_url = "https://guba.eastmoney.com/news,bk0910,1001.html"
+    post_payload["re"][0]["post_url"] = detail_url
+    comment_payload["re"][0]["post_url"] = detail_url
+
+    parser = EastmoneyParser()
+    posts = parser.parse_posts(json.dumps(post_payload).encode(), "application/json")
+    comments = parser.parse_comments(json.dumps(comment_payload).encode(), "application/json")
+    output = tmp_path / "records.jsonl"
+    EastmoneyExporter(output, author_salt="local-secret").export(
+        posts + comments,
+        trade_date="2026-08-12", batch_id="batch-urls", sector_id="robot",
+        source_type="sector_forum", stock_code=None, pool_version="pool-v1",
+        collected_at="2026-08-12T16:00:00+08:00",
+    )
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [(record["content_id"], record["comment_id"], record["url"])
+            for record in records] == [
+                ("1001", "", detail_url),
+                ("1001", "c-1", detail_url),
+            ]
+
+
+def test_parser_preserves_post_last_activity_timestamp():
+    payload = json.loads(fixture("posts.json"))
+    payload["re"][0]["post_last_time"] = "2026-08-11T16:00:00+08:00"
+
+    posts = EastmoneyParser().parse_posts(json.dumps(payload).encode(), "application/json")
+
+    assert posts[0]["last_activity_at"] == "2026-08-11T16:00:00+08:00"
+
+
+def test_html_post_keeps_independent_published_and_last_activity_timestamps():
+    """Catches HTML parsing that mistakes the list's final-update field for publish time."""
+    posts = EastmoneyParser().parse_posts(
+        b'''<div class="articleh" data-postid="old-1001" data-publish-time="2026-08-11T13:59:00+08:00">
+          <a class="l3" href="/news,bk0910,old-1001.html">old post</a>
+          <span class="l5 a5">2026-08-11T14:10:00+08:00</span>
+        </div>''',
+        "text/html",
+    )
+
+    assert posts[0]["published_at"] == "2026-08-11T13:59:00+08:00"
+    assert posts[0]["last_activity_at"] == "2026-08-11T14:10:00+08:00"
+
+
+@pytest.mark.parametrize("url", [
+    None,
+    "https://guba.eastmoney.com/list,bk0910.html",
+    "https://guba.eastmoney.com/news,bk0910,1001,extra.html",
+    "https://guba.eastmoney.com/news,bk0910%2C1001.html",
+    "https://guba.eastmoney.com/news,bk0910,%2F1001.html",
+    "https://guba.eastmoney.com/news,bk0910,../1001.html",
+    "https://guba.eastmoney.com/news,bk0910,1001.html?next=%2Flist",
+    "https://guba.eastmoney.com/news,bk0910,1001.html#comments",
+])
+def test_exporter_rejects_records_without_a_canonical_public_detail_url(tmp_path: Path, url):
+    with pytest.raises(ValueError, match="canonical.*detail.*URL"):
+        EastmoneyExporter(tmp_path / "records.jsonl", author_salt="local-secret").export(
+            [{
+                "content_id": "1001", "comment_id": "", "title": "标题", "text": "正文",
+                "published_at": "2026-08-11T15:20:00+08:00", "url": url,
+            }],
+            trade_date="2026-08-12", batch_id="batch-url-validation", sector_id="robot",
+            source_type="sector_forum", stock_code=None, pool_version="pool-v1",
+            collected_at="2026-08-12T16:00:00+08:00",
+        )
 
 
 def test_quota_and_runner_return_explicit_partial_and_empty_states(tmp_path: Path):
@@ -235,6 +314,7 @@ def test_process_path_exports_detail_and_first_level_comments(tmp_path: Path, co
     assert result.status == "ok"
     assert {(r["content_id"], r["comment_id"]) for r in records} == {("1001", ""), ("1001", "c-1")}
     assert all(r["platform"] == "eastmoney" for r in records)
+    assert all(r["url"] == "https://guba.eastmoney.com/news,bk0910,1001.html" for r in records)
     assert json.loads(report_file.read_text())["request_count"] == 3
 
 
@@ -341,6 +421,196 @@ def test_process_comment_pagination_stops_at_fifty(tmp_path: Path, collector_ser
     assert result.status == "ok"
     assert sum(bool(record["comment_id"]) for record in records) == 50
     assert json.loads(report.read_text())["request_count"] == 4
+
+
+def test_list_response_schedules_page_two_and_only_comments_for_an_old_active_post(tmp_path: Path):
+    detail_url = "https://guba.eastmoney.com/news,bk0910,old-1001.html"
+    old_post = {
+        "post_id": "old-1001", "post_title": "旧帖子", "post_content": "过期正文",
+        "post_publish_time": "2026-08-11T13:59:00+08:00",
+        "post_last_time": "2026-08-11T14:10:00+08:00",
+        "post_click_count": 999, "post_comment_count": 1, "post_like_count": 88,
+        "user_id": "old-author", "post_type": 0, "post_url": detail_url,
+    }
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job.update({
+        "window_start": "2026-08-11T14:00:00+08:00",
+        "list_next_url_template": "https://guba.eastmoney.com/list,bk0910_{page}.html",
+        "page": 1,
+    })
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], body=json.dumps({"re": [old_post]}).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+
+    requests = list(spider.parse_job(response, job))
+
+    assert [(request.url, request.cb_kwargs["job"]["kind"])
+            for request in requests] == [
+                ("https://guba.eastmoney.com/list,bk0910_2.html", "list"),
+                ("https://guba.eastmoney.com/comments/old-1001", "comments"),
+            ]
+    assert not (tmp_path / "records.jsonl").exists()
+
+
+def test_html_old_body_with_new_activity_schedules_comments_not_body_and_paginates(tmp_path: Path):
+    """Catches the production HTML list path dropping an old post's in-window comments."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job.update({
+        "window_start": "2026-08-11T14:00:00+08:00",
+        "list_next_url_template": "https://guba.eastmoney.com/list,bk0910_{page}.html",
+        "page": 1,
+    })
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], encoding="utf-8", headers={b"Content-Type": b"text/html"},
+        body=b'''<div class="articleh" data-post-id="old-1001" data-publish-time="2026-08-11T13:59:00+08:00">
+          <a class="l3" href="/news,bk0910,old-1001.html">old post</a>
+          <span class="last_activity">2026-08-11T14:10:00+08:00</span>
+        </div>''',
+    )
+
+    requests = list(spider.parse_job(response, job))
+
+    assert [(request.url, request.cb_kwargs["job"]["kind"]) for request in requests] == [
+        ("https://guba.eastmoney.com/list,bk0910_2.html", "list"),
+        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
+    ]
+    assert not (tmp_path / "records.jsonl").exists()
+
+
+def test_invalid_list_activity_timestamp_stops_target_as_schema_changed(tmp_path: Path):
+    """Catches malformed activity values causing unbounded pagination until quota exhaustion."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"circuit_breaker_failures": 1},
+    )
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job["list_next_url_template"] = "https://guba.eastmoney.com/list,bk0910_{page}.html"
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], encoding="utf-8", headers={b"Content-Type": b"application/json"},
+        body=json.dumps({"re": [{
+            "post_id": "bad-time", "post_publish_time": "not-a-timestamp",
+            "post_last_time": "also-not-a-timestamp", "post_type": 0,
+        }]}).encode(),
+    )
+
+    with pytest.raises(CloseSpider):
+        list(spider.parse_job(response, job))
+    assert spider.terminal_reason == "schema_changed"
+    assert spider.failed_targets == {"bk0910"}
+
+
+def test_list_row_without_published_or_activity_timestamp_stops_target(tmp_path: Path):
+    """Catches blank public list rows causing pagination to continue without a time boundary."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"circuit_breaker_failures": 1},
+    )
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job["list_next_url_template"] = "https://guba.eastmoney.com/list,bk0910_{page}.html"
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], encoding="utf-8", headers={b"Content-Type": b"text/html"},
+        body=b'<div class="articleh" data-post-id="no-time"><a class="l3">post</a></div>',
+    )
+
+    with pytest.raises(CloseSpider):
+        list(spider.parse_job(response, job))
+    assert spider.terminal_reason == "schema_changed"
+    assert spider.failed_targets == {"bk0910"}
+
+
+def test_old_active_post_does_not_consume_the_in_window_body_cap(tmp_path: Path):
+    posts = [
+        {
+            "post_id": "old-1001", "post_title": "旧帖子", "post_content": "过期正文",
+            "post_publish_time": "2026-08-11T13:59:00+08:00",
+            "post_last_time": "2026-08-11T14:10:00+08:00",
+            "post_comment_count": 1, "user_id": "old-author", "post_type": 0,
+        },
+        {
+            "post_id": "new-1002", "post_title": "新帖子", "post_content": "窗口内正文",
+            "post_publish_time": "2026-08-11T14:05:00+08:00",
+            "post_last_time": "2026-08-11T14:05:00+08:00",
+            "post_comment_count": 0, "user_id": "new-author", "post_type": 0,
+        },
+    ]
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job.update({"window_start": "2026-08-11T14:00:00+08:00", "posts_limit": 1})
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], body=json.dumps({"re": posts}).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+
+    requests = list(spider.parse_job(response, job))
+
+    assert {(request.url, request.cb_kwargs["job"]["kind"]) for request in requests} == {
+        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
+        ("https://guba.eastmoney.com/detail/new-1002", "detail"),
+        ("https://guba.eastmoney.com/comments/new-1002", "comments"),
+    }
+    assert spider.seen_posts["bk0910"] == 1
+
+
+def test_old_active_post_schedules_comments_when_reply_count_is_stale_or_zero(tmp_path: Path):
+    old_post = {
+        "post_id": "old-1001", "post_title": "旧帖子", "post_content": "过期正文",
+        "post_publish_time": "2026-08-11T13:59:00+08:00",
+        "post_last_time": "2026-08-11T14:10:00+08:00",
+        "post_comment_count": 0, "user_id": "old-author", "post_type": 0,
+    }
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job["window_start"] = "2026-08-11T14:00:00+08:00"
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], body=json.dumps({"re": [old_post]}).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+
+    requests = list(spider.parse_job(response, job))
+
+    assert [(request.url, request.cb_kwargs["job"]["kind"]) for request in requests] == [
+        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
+    ]
+
+
+def test_duplicate_old_row_still_stops_list_pagination_at_window_floor(tmp_path: Path):
+    old_post = {
+        "post_id": "old-1001", "post_title": "旧帖子", "post_content": "过期正文",
+        "post_publish_time": "2026-08-11T13:00:00+08:00",
+        "post_last_time": "2026-08-11T13:00:00+08:00",
+        "post_comment_count": 0, "user_id": "old-author", "post_type": 0,
+    }
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910_2.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job.update({
+        "window_start": "2026-08-11T14:00:00+08:00",
+        "list_next_url_template": "https://guba.eastmoney.com/list,bk0910_{page}.html",
+        "page": 2,
+        "seen_post_ids": ["old-1001"],
+    })
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], body=json.dumps({"re": [old_post]}).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+
+    assert list(spider.parse_job(response, job)) == []
 
 
 def test_duplicate_url_jobs_preserve_all_sector_mappings(tmp_path: Path, collector_server: str):
