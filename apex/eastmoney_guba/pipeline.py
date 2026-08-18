@@ -321,6 +321,11 @@ def collect_eastmoney(
     target_shortfall = any(
         item.get("reason") == "target_shortfall" for item in manifest["missing_targets"]
     )
+    provider_unavailable = any(
+        str(item.get("status") or "") == "failed"
+        and str(item.get("reason") or "").startswith("representative provider failed:")
+        for item in manifest["representative_constituents"].values()
+    )
     effective_status = "degraded" if target_shortfall else result.status
     telemetry = {
         "platform": "eastmoney", "status": effective_status, "records": len(records),
@@ -336,7 +341,9 @@ def collect_eastmoney(
         **health,
         "batch_id": manifest["batch_id"], "manifest_path": str(manifest_path),
         "path": str(output), "as_of": collected_at,
-        "message": _safe_result_message(result), "collector": collector,
+        "message": (_safe_result_message(result)
+                    or ("representative_provider_unavailable" if provider_unavailable else None)),
+        "collector": collector,
     }
     if promotion_audit is not None:
         telemetry["promotion_audit"] = dict(promotion_audit)

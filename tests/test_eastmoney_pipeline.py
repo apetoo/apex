@@ -821,6 +821,41 @@ def test_representative_provider_failure_surfaces_target_shortfall_and_degrades(
     assert eastmoney["shadow_qualified"] is False
 
 
+def test_provider_proxy_unavailability_has_a_safe_top_level_reason_and_audited_shortfall(
+    tmp_path: Path,
+):
+    """Catches a visible target shortfall whose telemetry gives users no reason to act."""
+    provenance = {"robot": {
+        "sector_id": "robot", "membership_source": "unavailable",
+        "turnover_source": "unavailable", "turnover_as_of": "2026-08-17",
+        "lookback_trading_days": 20, "requested_count": 5, "selected_count": 0,
+        "selected": [], "status": "failed",
+        "reason": "representative provider failed: ProxyError",
+    }}
+
+    def runner(_manifest_path, report_path, *, timeout_seconds):
+        Path(report_path).write_text(json.dumps({
+            "parser_successes": 1, "parser_errors": 0,
+            "request_successes": 1, "request_errors": 0,
+        }))
+        return CollectionResult("empty_valid", 0, 1, 0)
+
+    telemetry, _ = collect_eastmoney(
+        cache_dir=tmp_path, config=_config(),
+        taxonomy=[{"sector_id": "robot", "sector_name": "\xe6\x9c\xba\xe5\x99\xa8\xe4\xba\xba",
+                   "eastmoney_forum_id": "bk1408"}],
+        constituents={"robot": []}, representative_provenance=provenance,
+        trade_date="2026-08-17", collected_at="2026-08-17T23:10:00+08:00", runner=runner,
+    )
+
+    assert telemetry["status"] == "degraded"
+    assert telemetry["target_shortfall"] is True
+    assert telemetry["message"] == "representative_provider_unavailable"
+    assert telemetry["representative_constituents"]["robot"]["reason"] == (
+        "representative provider failed: ProxyError"
+    )
+
+
 def test_tuple_provider_normalizes_missing_and_inconsistent_sector_provenance(tmp_path: Path):
     """Catches tuple injection that silently permits a sector-only qualified run."""
     taxonomy = [

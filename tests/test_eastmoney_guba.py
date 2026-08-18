@@ -82,6 +82,37 @@ def test_parser_uses_html_fallback_but_rejects_block_and_schema_changes():
         parser.parse_posts(b"<html><body>normal page, new markup</body></html>", "text/html")
 
 
+def test_parser_reads_current_article_list_html_into_exportable_public_post(tmp_path: Path):
+    """Catches the live list page's embedded article_list payload being treated as a schema change."""
+    # This is the relevant layout from the 2026-08-17 public bk1134 list response.
+    live_layout = b'''<html><body><script>var article_list={"re":[{
+      "post_id":1760184053,"post_title":"\xe8\xa6\x86\xe9\x93\x9c\xe6\x9d\xbf\xe6\xb6\xa8\xe4\xbb\xb7",
+      "stockbar_code":"bk1134","user_id":"5676114794013740",
+      "post_click_count":64,"post_comment_count":1,"post_like_count":0,
+      "post_publish_time":"2026-08-17 19:13:59",
+      "post_last_time":"2026-08-17 20:22:03","post_type":20
+    }]};</script></body></html>'''
+
+    posts = EastmoneyParser().parse_posts(live_layout, "text/html")
+
+    assert posts == [{
+        "content_id": "1760184053", "comment_id": "", "title": "覆铜板涨价", "text": "",
+        "published_at": "2026-08-17 19:13:59", "author_id": "5676114794013740",
+        "last_activity_at": "2026-08-17 20:22:03",
+        "url": "https://guba.eastmoney.com/news,bk1134,1760184053.html",
+        "read_count": 64, "reply_count": 1, "like_count": 0,
+    }]
+    output = tmp_path / "records.jsonl"
+    assert EastmoneyExporter(output, author_salt="local-secret").export(
+        posts, trade_date="2026-08-17", batch_id="live-layout", sector_id="compute",
+        source_type="sector_forum", stock_code=None, pool_version="pool-v1",
+        collected_at="2026-08-17T23:10:00+08:00",
+    ) == 1
+    assert json.loads(output.read_text())['url'] == (
+        "https://guba.eastmoney.com/news,bk1134,1760184053.html"
+    )
+
+
 def test_parser_uses_html_fallback_for_first_level_comments():
     comments = EastmoneyParser().parse_comments(fixture("comments.html"), "text/html")
 

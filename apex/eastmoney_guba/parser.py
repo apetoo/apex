@@ -146,6 +146,12 @@ class EastmoneyParser:
             if not isinstance(rows, list):
                 raise SchemaChanged("post response missing re list")
             return [self._post(row) for row in rows if not self._ignored_post(row)]
+        embedded = self._embedded_article_list(text)
+        if embedded is not None:
+            rows = embedded.get("re")
+            if not isinstance(rows, list):
+                raise SchemaChanged("embedded article_list missing re list")
+            return [self._post(row) for row in rows if not self._ignored_post(row)]
         parser = _PostHTMLParser()
         parser.feed(text)
         if not parser.posts:
@@ -202,6 +208,20 @@ class EastmoneyParser:
         return value
 
     @staticmethod
+    def _embedded_article_list(text: str) -> dict | None:
+        """Read the public list page's JSON payload without depending on its table markup."""
+        marker = re.search(r"\bvar\s+article_list\s*=\s*", text)
+        if marker is None:
+            return None
+        try:
+            value, _ = json.JSONDecoder().raw_decode(text[marker.end():])
+        except json.JSONDecodeError as exc:
+            raise SchemaChanged("invalid embedded article_list") from exc
+        if not isinstance(value, dict):
+            raise SchemaChanged("embedded article_list must be an object")
+        return value
+
+    @staticmethod
     def _ignored_post(row: dict) -> bool:
         return bool(row.get("is_ad") or row.get("is_notice") or row.get("post_type") in {1, 2})
 
@@ -210,12 +230,17 @@ class EastmoneyParser:
         required = ("post_id", "post_publish_time")
         if any(not row.get(key) for key in required):
             raise SchemaChanged("post row missing identity or time")
+        forum_id = str(row.get("stockbar_code") or "").strip()
+        post_id = str(row["post_id"])
+        url = row.get("post_url")
+        if not url and forum_id:
+            url = f"https://guba.eastmoney.com/news,{forum_id},{post_id}.html"
         return {
-            "content_id": str(row["post_id"]), "comment_id": "",
+            "content_id": post_id, "comment_id": "",
             "title": str(row.get("post_title") or ""), "text": str(row.get("post_content") or ""),
             "published_at": row["post_publish_time"], "author_id": row.get("user_id"),
             "last_activity_at": row.get("post_last_time") or row["post_publish_time"],
-            "url": row.get("post_url"),
+            "url": url,
             "read_count": _count(row.get("post_click_count")),
             "reply_count": _count(row.get("post_comment_count")),
             "like_count": _count(row.get("post_like_count")),
