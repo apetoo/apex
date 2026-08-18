@@ -647,6 +647,45 @@ def test_representative_provider_selects_deterministic_top_five_from_twenty_day_
     }}
 
 
+def test_default_membership_provider_uses_explicit_forum_code_and_selects_five_representatives(
+    monkeypatch,
+):
+    """Catches AkShare's name-map IndexError when the configured board code is available."""
+    import sys
+    import types
+
+    import pandas as pd
+
+    from apex.eastmoney_guba import representatives
+
+    requested_symbols = []
+
+    def concept_members(*, symbol: str):
+        requested_symbols.append(symbol)
+        return pd.DataFrame({"代码": ["000001", "000002", "000003", "000004", "000005"]})
+
+    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(
+        stock_board_concept_cons_em=concept_members,
+    ))
+
+    constituents, provenance = representatives.select_representative_constituents(
+        [{"sector_id": "robot", "sector_name": "机器人", "taxonomy": "concept",
+          "eastmoney_forum_id": "bk1408"}],
+        "2026-08-17",
+        turnover_fetcher=lambda codes, _trade_date, days: (
+            {code: float(index) for index, code in enumerate(codes, start=1)},
+            "2026-08-17", f"fixture.daily.{days}",
+        ),
+    )
+
+    assert requested_symbols == ["BK1408"]
+    assert [row["stock_code"] for row in constituents["robot"]] == [
+        "000005", "000004", "000003", "000002", "000001",
+    ]
+    assert provenance["robot"]["status"] == "ok"
+    assert provenance["robot"]["selected_count"] == 5
+
+
 def test_manifest_normalizes_nonempty_injected_constituents_into_provenance(tmp_path: Path):
     """Catches direct manifests that silently freeze no provenance for supplied targets."""
     selected = [{"stock_code": f"00000{index}", "turnover_20d": float(10 - index),

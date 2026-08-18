@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from html import unescape
 from html.parser import HTMLParser
 
 
@@ -152,6 +154,14 @@ class EastmoneyParser:
             if not isinstance(rows, list):
                 raise SchemaChanged("embedded article_list missing re list")
             return [self._post(row) for row in rows if not self._ignored_post(row)]
+        article = self._embedded_object(text, "post_article")
+        if article is not None:
+            row = dict(article)
+            user = row.get("post_user")
+            if isinstance(user, dict):
+                row.setdefault("user_id", user.get("user_id"))
+            row["post_content"] = self._plain_text(row.get("post_content"))
+            return [] if self._ignored_post(row) else [self._post(row)]
         parser = _PostHTMLParser()
         parser.feed(text)
         if not parser.posts:
@@ -164,7 +174,9 @@ class EastmoneyParser:
         return self.parse_comment_page(body, content_type).records
 
     def parse_comment_page(self, body: bytes, content_type: str, *,
-                           window_start: str | None = None) -> CommentPage:
+                           window_start: str | None = None,
+                           content_id: str | None = None,
+                           page: int = 1) -> CommentPage:
         text = body.decode("utf-8", errors="replace")
         self._ensure_not_blocked(text)
         if "json" not in content_type.lower():
@@ -175,15 +187,29 @@ class EastmoneyParser:
                     return CommentPage([], False, None)
                 raise SchemaChanged("comment HTML contains no recognized rows")
             records = parser.comments
-            filtered = [row for row in records if not window_start or row["published_at"] >= window_start]
+            filtered = self._filter_window(records, window_start)
             return CommentPage(filtered, False, None,
                                bool(window_start and len(filtered) < len(records)))
         payload = self._json(text)
         rows = payload.get("re")
         if not isinstance(rows, list):
             raise SchemaChanged("comment response missing re list")
-        records = [self._comment(row) for row in rows if not row.get("reply_to_comment_id")]
-        filtered = [row for row in records if not window_start or row["published_at"] >= window_start]
+        if any(not isinstance(row, dict) for row in rows):
+            raise SchemaChanged("comment response rows must be objects")
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            raise SchemaChanged("comment page must be a positive integer")
+        records = [self._comment(row, content_id=content_id) for row in rows
+                   if not row.get("reply_to_comment_id")]
+        filtered = self._filter_window(records, window_start)
+        current_contract = any(isinstance(row, dict) and "reply_id" in row for row in rows)
+        if current_contract:
+            total = payload.get("count", len(rows))
+            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                raise SchemaChanged("invalid current comment count")
+            exhausted = bool(window_start and len(filtered) < len(records))
+            has_more = total > page * 30 and not exhausted
+            return CommentPage(filtered, has_more, str(page + 1) if has_more else None,
+                               exhausted)
         has_more = payload.get("has_more", False)
         cursor = payload.get("next_cursor")
         if not isinstance(has_more, bool) or (cursor is not None and not isinstance(cursor, (str, int))):
@@ -198,6 +224,27 @@ class EastmoneyParser:
             raise BlockedResponse("Eastmoney returned an access-control page")
 
     @staticmethod
+    def _filter_window(records: list[dict], window_start: str | None) -> list[dict]:
+        if not window_start:
+            return records
+        try:
+            floor = datetime.fromisoformat(str(window_start).replace("Z", "+00:00"))
+            output = []
+            for row in records:
+                published = datetime.fromisoformat(
+                    str(row["published_at"]).replace("Z", "+00:00")
+                )
+                if published.tzinfo is None and floor.tzinfo is not None:
+                    published = published.replace(tzinfo=floor.tzinfo)
+                elif published.tzinfo is not None and floor.tzinfo is None:
+                    floor = floor.replace(tzinfo=published.tzinfo)
+                if published >= floor:
+                    output.append(row)
+            return output
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SchemaChanged("invalid comment timestamp") from exc
+
+    @staticmethod
     def _json(text: str) -> dict:
         try:
             value = json.loads(text)
@@ -210,16 +257,25 @@ class EastmoneyParser:
     @staticmethod
     def _embedded_article_list(text: str) -> dict | None:
         """Read the public list page's JSON payload without depending on its table markup."""
-        marker = re.search(r"\bvar\s+article_list\s*=\s*", text)
+        return EastmoneyParser._embedded_object(text, "article_list")
+
+    @staticmethod
+    def _embedded_object(text: str, variable: str) -> dict | None:
+        marker = re.search(rf"\bvar\s+{re.escape(variable)}\s*=\s*", text)
         if marker is None:
             return None
         try:
             value, _ = json.JSONDecoder().raw_decode(text[marker.end():])
         except json.JSONDecodeError as exc:
-            raise SchemaChanged("invalid embedded article_list") from exc
+            raise SchemaChanged(f"invalid embedded {variable}") from exc
         if not isinstance(value, dict):
-            raise SchemaChanged("embedded article_list must be an object")
+            raise SchemaChanged(f"embedded {variable} must be an object")
         return value
+
+    @staticmethod
+    def _plain_text(value: object) -> str:
+        text = re.sub(r"<[^>]+>", " ", str(value or ""))
+        return " ".join(unescape(text).split())
 
     @staticmethod
     def _ignored_post(row: dict) -> bool:
@@ -247,15 +303,23 @@ class EastmoneyParser:
         }
 
     @staticmethod
-    def _comment(row: dict) -> dict:
-        if not row.get("comment_id") or not row.get("post_id") or not row.get("comment_publish_time"):
+    def _comment(row: dict, *, content_id: str | None = None) -> dict:
+        comment_id = row.get("comment_id") or row.get("reply_id")
+        post_id = row.get("post_id") or content_id
+        published_at = row.get("comment_publish_time") or row.get("reply_publish_time")
+        if not comment_id or not post_id or not published_at:
             raise SchemaChanged("comment row missing identity, parent, or time")
+        reply_user = row.get("reply_user")
+        author_id = (reply_user.get("user_id") if isinstance(reply_user, dict)
+                     else row.get("user_id"))
         return {
-            "content_id": str(row["post_id"]), "comment_id": str(row["comment_id"]),
-            "parent_content_id": str(row["post_id"]), "title": "",
-            "text": str(row.get("comment_content") or ""),
-            "published_at": row["comment_publish_time"], "author_id": row.get("user_id"),
+            "content_id": str(post_id), "comment_id": str(comment_id),
+            "parent_content_id": str(post_id), "title": "",
+            "text": str(row.get("comment_content") or row.get("reply_text") or ""),
+            "published_at": published_at, "author_id": author_id,
             "url": row.get("post_url"),
             "read_count": 0, "reply_count": 0,
-            "like_count": _count(row.get("comment_like_count")),
+            "like_count": _count(row.get("comment_like_count")
+                                  if "comment_like_count" in row
+                                  else row.get("reply_like_count")),
         }

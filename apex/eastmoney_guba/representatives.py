@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, timedelta
 from typing import Callable
 
@@ -14,13 +15,15 @@ def _default_membership_fetcher(sector: dict) -> tuple[list[dict], str]:
     import akshare as ak
 
     name = str(sector.get("sector_name") or "").strip()
+    forum_id = str(sector.get("eastmoney_forum_id") or "").strip()
     if not name:
         raise ValueError("sector name is required")
     if sector.get("taxonomy") == "industry":
         method = "stock_board_industry_cons_em"
     else:
         method = "stock_board_concept_cons_em"
-    frame = getattr(ak, method)(symbol=name)
+    symbol = forum_id.upper() if re.fullmatch(r"(?i)bk\d+", forum_id) else name
+    frame = getattr(ak, method)(symbol=symbol)
     if frame is None or frame.empty or "代码" not in frame.columns:
         raise ValueError("sector membership is unavailable")
     rows = [{"stock_code": str(value).strip()} for value in frame["代码"].tolist()]

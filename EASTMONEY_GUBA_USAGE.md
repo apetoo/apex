@@ -72,7 +72,7 @@ sector_sentiment:
       list_url_template: "https://guba.eastmoney.com/list,{forum_id}.html"
       list_next_url_template: "https://guba.eastmoney.com/list,{forum_id}_{page}.html"
       detail_url_template: "https://guba.eastmoney.com/news,{forum_id},{content_id}.html"
-      comments_url_template: "https://guba.eastmoney.com/comments/{content_id}"
+      comments_url_template: "https://guba.eastmoney.com/api/getData?code={forum_id}&path=reply/api/Reply/ArticleNewReplyList&postid={content_id}"
 
   taxonomy:
     - sector_id: "concept:robot"

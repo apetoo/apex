@@ -155,7 +155,7 @@ sector_sentiment:
       list_url_template: "https://guba.eastmoney.com/list,{forum_id}.html"
       list_next_url_template: "https://guba.eastmoney.com/list,{forum_id}_{page}.html"
       detail_url_template: "https://guba.eastmoney.com/news,{forum_id},{content_id}.html"
-      comments_url_template: "https://guba.eastmoney.com/comments/{content_id}"
+      comments_url_template: "https://guba.eastmoney.com/api/getData?code={forum_id}&path=reply/api/Reply/ArticleNewReplyList&postid={content_id}"
   retrieval:
     query_version: "sector-finance-query-v1"
     query_templates: ["{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股", "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情"]

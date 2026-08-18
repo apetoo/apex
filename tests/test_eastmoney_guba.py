@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import threading
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import pytest
 from scrapy.exceptions import CloseSpider
-from scrapy.http import HtmlResponse
+from scrapy.http import FormRequest, HtmlResponse
 
 from apex.eastmoney_guba import (
     BlockedResponse,
@@ -27,6 +29,86 @@ from apex.eastmoney_guba.spider import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "eastmoney"
+
+# Reduced from the public page captured in the 2026-08-17 live batch.  The
+# names/content are deliberately redacted; the `post_article` envelope and
+# field names are the current page contract.
+CURRENT_DETAIL_HTML = b'''<!doctype html><html><body>
+<div class="newstitle">\xe6\x9c\xba\xe5\x99\xa8\xe4\xba\xba\xe6\x9d\xbf\xe5\x9d\x97</div>
+<script>var post_article={
+  "post_id":1759677380,
+  "post_user":{"user_id":"public-author"},
+  "post_guba":{"stockbar_code":"bk1106"},
+  "post_title":"\xe5\xbd\x93\xe5\x89\x8d\xe9\xa1\xb5\xe9\x9d\xa2\xe5\xb8\x96\xe5\xad\x90",
+  "post_content":"<p>\xe5\x88\x9b\xe6\x96\xb0\xe8\x8d\xaf\xe6\x9d\xbf\xe5\x9d\x97</p>",
+  "post_publish_time":"2026-08-17 09:36:52",
+  "post_last_time":"2026-08-17 09:39:51",
+  "post_click_count":16,
+  "post_comment_count":1,
+  "post_like_count":0,
+  "post_type":0
+};</script></body></html>'''
+
+# The public news page currently loads this through
+# reply/api/Reply/ArticleNewReplyList.  It returns reply_* fields (and embeds
+# nested replies), rather than the legacy comment_* shape.
+CURRENT_FIRST_LEVEL_REPLY_RESPONSE = {
+    "rc": 1,
+    "re": [
+        {
+            "reply_id": "reply-in-window", "source_post_id": 1759677380,
+            "reply_text": "窗口有反弹",
+            "reply_publish_time": "2026-08-17 19:01:00",
+            "reply_like_count": 2, "reply_is_like": False, "reply_is_top": False,
+            "reply_is_author": False, "reply_state": 1, "reply_count": 1,
+            "reply_picture": "", "user_id": "reply-author",
+            "reply_user": {"user_id": "reply-author",
+                                                "user_nickname": "公开用户"},
+            "child_replys": [{"reply_id": "nested-reply"}], "fake_child_replys": [],
+            "source_reply": None,
+        },
+        {
+            "reply_id": "reply-before-window", "source_post_id": 1759677380,
+            "reply_text": "旧评论",
+            "reply_publish_time": "2026-08-16 17:59:00",
+            "reply_like_count": 0, "reply_is_like": False, "reply_is_top": False,
+            "reply_is_author": False, "reply_state": 1, "reply_count": 0,
+            "reply_picture": "", "user_id": "old-author",
+            "reply_user": {"user_id": "old-author",
+                                                "user_nickname": "旧用户"},
+            "child_replys": [], "fake_child_replys": [], "source_reply": None,
+        },
+    ],
+    "fake_reply_list": [], "count": 2, "manager_comment_count": 0,
+    "reply_total_count": 2, "ad_list": [], "ad_type_list": [],
+    "post_comment_authority": 0, "top_reply_count": 0, "extend_data": {},
+    "fake_switch": 0, "system_comment_authority": 0, "isExistHide": False,
+    "user_jxreply_list": [], "user_jxreply_count": 0, "jxreply_wait_count": 0,
+    "loc_reply": None, "latest_time": "2026-08-17 19:01:00",
+    "me": "", "time": "2026-08-17T19:01:00+08:00", "loc_ext": None,
+}
+
+
+def current_reply_page(*, first_id: int, row_count: int, total_count: int,
+                       published_at: str = "2026-08-17 19:01:00") -> dict:
+    """Return a complete current API envelope with deterministic first-level rows."""
+    payload = deepcopy(CURRENT_FIRST_LEVEL_REPLY_RESPONSE)
+    rows = []
+    for offset in range(row_count):
+        row = deepcopy(CURRENT_FIRST_LEVEL_REPLY_RESPONSE["re"][0])
+        row.update({
+            "reply_id": f"reply-{first_id + offset}",
+            "reply_text": f"公开评论 {first_id + offset}",
+            "reply_publish_time": published_at,
+            "reply_count": 0,
+            "child_replys": [],
+            "fake_child_replys": [],
+        })
+        rows.append(row)
+    payload["re"] = rows
+    payload["count"] = total_count
+    payload["reply_total_count"] = total_count
+    return payload
 
 
 def fixture(name: str) -> bytes:
@@ -197,6 +279,73 @@ def test_html_post_keeps_independent_published_and_last_activity_timestamps():
     assert posts[0]["last_activity_at"] == "2026-08-11T14:10:00+08:00"
 
 
+def test_current_detail_and_reply_api_export_canonical_url_and_only_in_window_first_level_comment(
+    tmp_path: Path,
+):
+    """Catches the current `post_article`/`reply_*` contracts being marked schema-changed."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk1106.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    job.update({"forum_id": "bk1106", "window_start": "2026-08-16T18:00:00+08:00"})
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+
+    detail_job = dict(job, kind="detail", content_id="1759677380",
+                      url="https://guba.eastmoney.com/news,bk1106,1759677380.html")
+    detail_response = HtmlResponse(
+        url=detail_job["url"], body=CURRENT_DETAIL_HTML, encoding="utf-8",
+        headers={b"Content-Type": b"text/html; charset=utf-8"},
+    )
+    assert list(spider.parse_job(detail_response, detail_job)) == []
+
+    comments_job = dict(job, kind="comments", content_id="1759677380",
+                        url="https://guba.eastmoney.com/api/getData")
+    comments_response = HtmlResponse(
+        url=comments_job["url"],
+        body=json.dumps(CURRENT_FIRST_LEVEL_REPLY_RESPONSE).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+    assert list(spider.parse_job(comments_response, comments_job)) == []
+    assert spider.parser_errors == 0
+
+    records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
+    assert [(record["content_id"], record["comment_id"], record["url"])
+            for record in records] == [
+                ("1759677380", "", "https://guba.eastmoney.com/news,bk1106,1759677380.html"),
+                ("1759677380", "reply-in-window",
+                 "https://guba.eastmoney.com/news,bk1106,1759677380.html"),
+            ]
+
+
+def test_current_reply_api_contract_keeps_only_first_level_comments_inside_window():
+    """Catches reply_* API rows being mistaken for the retired comment_* response."""
+    page = EastmoneyParser().parse_comment_page(
+        json.dumps(CURRENT_FIRST_LEVEL_REPLY_RESPONSE).encode(), "application/json",
+        window_start="2026-08-16T18:00:00+08:00", content_id="1759677380",
+    )
+
+    assert [(row["content_id"], row["comment_id"], row["text"])
+            for row in page.records] == [
+                ("1759677380", "reply-in-window", "窗口有反弹"),
+            ]
+    assert page.window_exhausted is True
+
+
+def test_current_reply_window_compares_real_timestamps_across_api_and_iso_formats():
+    """Keeps same-day replies after an ISO lower bound despite Eastmoney's space separator."""
+    payload = current_reply_page(
+        first_id=1, row_count=1, total_count=1,
+        published_at="2026-08-17 19:01:00",
+    )
+
+    page = EastmoneyParser().parse_comment_page(
+        json.dumps(payload).encode(), "application/json",
+        window_start="2026-08-17T18:00:00+08:00", content_id="1759677380",
+    )
+
+    assert [row["comment_id"] for row in page.records] == ["reply-1"]
+    assert page.window_exhausted is False
+
+
 @pytest.mark.parametrize("url", [
     None,
     "https://guba.eastmoney.com/list,bk0910.html",
@@ -338,6 +487,124 @@ def _run_manifest(tmp_path: Path, manifest: dict):
     return EastmoneyRunner().run(job_file, report_file, timeout_seconds=15), report_file
 
 
+def assert_current_public_comment_request(request, content_id: str) -> None:
+    """Assert the observable public request, including the comment identity it carries."""
+    assert request.cb_kwargs["job"]["kind"] == "comments"
+    assert request.cb_kwargs["job"]["content_id"] == content_id
+    assert isinstance(request, FormRequest)
+    assert request.url == (
+        "https://guba.eastmoney.com/api/getData?code=bk0910&"
+        "path=reply/api/Reply/ArticleNewReplyList"
+    )
+
+
+def test_legacy_comment_template_uses_public_no_cookie_reply_api_post(tmp_path: Path):
+    """Catches comments reverting to the retired GET endpoint or requiring browser login state."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk1106.html")
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    # This is the old, allowlisted config value that existing installations
+    # have.  The collector must upgrade it at the request boundary instead of
+    # requiring users to edit a secret/session-dependent endpoint.
+    comment_job = dict(job, kind="comments", content_id="1759677380",
+                       url="https://guba.eastmoney.com/comments/1759677380",
+                       forum_id="bk1106")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+
+    request = spider._request(comment_job)
+
+    assert isinstance(request, FormRequest)
+    assert request.method == "POST"
+    assert request.url == (
+        "https://guba.eastmoney.com/api/getData?code=bk1106&"
+        "path=reply/api/Reply/ArticleNewReplyList"
+    )
+    assert parse_qs(request.body.decode("utf-8"), keep_blank_values=True) == {
+        "param": ["postid=1759677380&sort=1&sorttype=1&p=1&ps=30&needHide=true"],
+        "plat": ["Web"],
+        "path": ["reply/api/Reply/ArticleNewReplyList"],
+        # CDP capture of the public production page: env=1 returns an unrelated
+        # security payload, while env=2 returns ArticleNewReplyList reply_* data.
+        "env": ["2"],
+        "origin": [""],
+        "version": ["2022"],
+        "product": ["Guba"],
+    }
+    assert request.headers.getlist(b"Origin") == [b"https://guba.eastmoney.com"]
+    assert request.headers.getlist(b"Referer") == [
+        b"https://guba.eastmoney.com/news,bk1106,1759677380.html",
+    ]
+    assert b"Cookie" not in request.headers
+
+
+def test_current_reply_api_count_uses_thirty_row_pages_and_stops_at_window_floor():
+    """Catches pagination based on retired has_more/next_cursor fields instead of API count."""
+    parser = EastmoneyParser()
+    first = parser.parse_comment_page(
+        json.dumps(current_reply_page(first_id=1, row_count=30, total_count=50)).encode(),
+        "application/json", content_id="1759677380", page=1,
+        window_start="2026-08-16T18:00:00+08:00",
+    )
+    second = parser.parse_comment_page(
+        json.dumps(current_reply_page(first_id=31, row_count=20, total_count=50)).encode(),
+        "application/json", content_id="1759677380", page=2,
+        window_start="2026-08-16T18:00:00+08:00",
+    )
+    exhausted = parser.parse_comment_page(
+        json.dumps(current_reply_page(
+            first_id=1, row_count=30, total_count=50,
+            published_at="2026-08-16T17:59:00+08:00",
+        )).encode(),
+        "application/json", content_id="1759677380", page=1,
+        window_start="2026-08-16T18:00:00+08:00",
+    )
+
+    assert len(first.records) == 30
+    assert first.has_more is True and first.next_cursor == "2"
+    assert len(second.records) == 20
+    assert second.has_more is False and second.next_cursor is None
+    assert exhausted.records == []
+    assert exhausted.window_exhausted is True
+    assert exhausted.has_more is False and exhausted.next_cursor is None
+
+
+def test_current_reply_api_spider_requests_page_two_and_enforces_fifty_comment_cap(tmp_path: Path):
+    """Catches current reply paging that either skips p=2 or exports beyond comments_per_post."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk1106.html")
+    manifest.pop("test_hosts")
+    manifest["settings"]["comments_per_post"] = 50
+    job = dict(manifest["jobs"][0], kind="comments", content_id="1759677380",
+               forum_id="bk1106", url="https://guba.eastmoney.com/comments/1759677380",
+               comments_next_url_template="https://guba.eastmoney.com/comments/{content_id}?p={cursor}",
+               window_start="2026-08-16T18:00:00+08:00")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+
+    first_response = HtmlResponse(
+        url=job["url"], body=json.dumps(
+            current_reply_page(first_id=1, row_count=30, total_count=80),
+        ).encode(), encoding="utf-8", headers={b"Content-Type": b"application/json"},
+    )
+    children = list(spider.parse_job(first_response, job))
+    assert len(children) == 1
+    page_two = children[0]
+    assert isinstance(page_two, FormRequest)
+    assert parse_qs(page_two.body.decode("utf-8"))["param"] == [
+        "postid=1759677380&sort=1&sorttype=1&p=2&ps=30&needHide=true",
+    ]
+
+    second_response = HtmlResponse(
+        url=page_two.url, body=json.dumps(
+            current_reply_page(first_id=31, row_count=30, total_count=80),
+        ).encode(), encoding="utf-8", headers={b"Content-Type": b"application/json"},
+    )
+    assert list(spider.parse_job(second_response, page_two.cb_kwargs["job"])) == []
+    records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
+    assert len(records) == 50
+    assert [record["comment_id"] for record in records] == [
+        *(f"reply-{index}" for index in range(1, 51)),
+    ]
+
+
 def test_process_path_exports_detail_and_first_level_comments(tmp_path: Path, collector_server: str):
     result, report_file = _run_manifest(tmp_path, _manifest(tmp_path, collector_server))
     records = [json.loads(line) for line in (tmp_path / "records.jsonl").read_text().splitlines()]
@@ -360,6 +627,102 @@ def test_process_path_classifies_block_and_schema(tmp_path: Path, collector_serv
         tmp_path, collector_server, path=path, settings_override=override,
     ))
     assert result.status == status
+
+
+def test_unrelated_comment_security_payload_degrades_only_comments_and_preserves_posts(
+    tmp_path: Path,
+):
+    """Catches a no-cookie reply response tripping the global list/detail schema circuit."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"circuit_breaker_failures": 1},
+    )
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    detail_job = dict(job, kind="detail", content_id="1001",
+                      url="https://guba.eastmoney.com/news,bk0910,1001.html")
+    detail_response = HtmlResponse(
+        url=detail_job["url"], body=fixture("posts.json"), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+    assert list(spider.parse_job(detail_response, detail_job)) == []
+
+    # This is the observed unauthenticated false-success body from the comment
+    # proxy: it is JSON, but not an ArticleNewReplyList payload.
+    security_payload = {"re": True, "result": [{"security": "1$600111$12050879181666"}]}
+    for content_id in ("1001", "1002"):
+        comment_job = dict(job, kind="comments", content_id=content_id,
+                           url="https://guba.eastmoney.com/api/getData")
+        response = HtmlResponse(
+            url=comment_job["url"], body=json.dumps(security_payload).encode(), encoding="utf-8",
+            headers={b"Content-Type": b"application/json"},
+        )
+        assert list(spider.parse_job(response, comment_job)) == []
+
+    spider.closed("finished")
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["records"] == 1
+    assert report["parser_errors"] == 2
+    assert report["failed_targets"] == 1
+    assert "terminal_reason" not in report
+    assert EastmoneyRunner.classify_result(report).status == "partial"
+
+
+def test_non_object_comment_row_degrades_with_audited_parser_error_and_preserves_posts(
+    tmp_path: Path,
+):
+    """Treats malformed rows as comment schema drift rather than an unhandled spider error."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"circuit_breaker_failures": 1},
+    )
+    manifest.pop("test_hosts")
+    job = manifest["jobs"][0]
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    detail_job = dict(job, kind="detail", content_id="1001",
+                      url="https://guba.eastmoney.com/news,bk0910,1001.html")
+    detail_response = HtmlResponse(
+        url=detail_job["url"], body=fixture("posts.json"), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+    assert list(spider.parse_job(detail_response, detail_job)) == []
+
+    comment_job = dict(job, kind="comments", content_id="1001",
+                       url="https://guba.eastmoney.com/api/getData")
+    malformed_response = HtmlResponse(
+        url=comment_job["url"], body=json.dumps({"re": [True], "count": 1}).encode(),
+        encoding="utf-8", headers={b"Content-Type": b"application/json"},
+    )
+
+    assert list(spider.parse_job(malformed_response, comment_job)) == []
+    spider.closed("finished")
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["records"] == 1
+    assert report["parser_errors"] == 1
+    assert report["failed_targets"] == 1
+    assert "terminal_reason" not in report
+    assert EastmoneyRunner.classify_result(report).status == "partial"
+
+
+def test_detail_schema_change_still_opens_the_global_circuit(tmp_path: Path):
+    """Catches a policy change that would silently continue after malformed post evidence."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"circuit_breaker_failures": 1},
+    )
+    manifest.pop("test_hosts")
+    job = dict(manifest["jobs"][0], kind="detail", content_id="1001",
+               url="https://guba.eastmoney.com/news,bk0910,1001.html")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    response = HtmlResponse(
+        url=job["url"], body=b'{"re": true}', encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    )
+
+    with pytest.raises(CloseSpider):
+        list(spider.parse_job(response, job))
+    assert spider.terminal_reason == "schema_changed"
 
 
 def test_process_path_enforces_total_request_quota(tmp_path: Path, collector_server: str):
@@ -479,11 +842,9 @@ def test_list_response_schedules_page_two_and_only_comments_for_an_old_active_po
 
     requests = list(spider.parse_job(response, job))
 
-    assert [(request.url, request.cb_kwargs["job"]["kind"])
-            for request in requests] == [
-                ("https://guba.eastmoney.com/list,bk0910_2.html", "list"),
-                ("https://guba.eastmoney.com/comments/old-1001", "comments"),
-            ]
+    assert requests[0].url == "https://guba.eastmoney.com/list,bk0910_2.html"
+    assert requests[0].cb_kwargs["job"]["kind"] == "list"
+    assert_current_public_comment_request(requests[1], "old-1001")
     assert not (tmp_path / "records.jsonl").exists()
 
 
@@ -508,10 +869,9 @@ def test_html_old_body_with_new_activity_schedules_comments_not_body_and_paginat
 
     requests = list(spider.parse_job(response, job))
 
-    assert [(request.url, request.cb_kwargs["job"]["kind"]) for request in requests] == [
-        ("https://guba.eastmoney.com/list,bk0910_2.html", "list"),
-        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
-    ]
+    assert requests[0].url == "https://guba.eastmoney.com/list,bk0910_2.html"
+    assert requests[0].cb_kwargs["job"]["kind"] == "list"
+    assert_current_public_comment_request(requests[1], "old-1001")
     assert not (tmp_path / "records.jsonl").exists()
 
 
@@ -587,11 +947,15 @@ def test_old_active_post_does_not_consume_the_in_window_body_cap(tmp_path: Path)
 
     requests = list(spider.parse_job(response, job))
 
-    assert {(request.url, request.cb_kwargs["job"]["kind"]) for request in requests} == {
-        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
-        ("https://guba.eastmoney.com/detail/new-1002", "detail"),
-        ("https://guba.eastmoney.com/comments/new-1002", "comments"),
-    }
+    assert [(request.cb_kwargs["job"]["kind"], request.cb_kwargs["job"].get("content_id"))
+            for request in requests] == [
+                ("comments", "old-1001"),
+                ("detail", None),
+                ("comments", "new-1002"),
+            ]
+    assert_current_public_comment_request(requests[0], "old-1001")
+    assert requests[1].url == "https://guba.eastmoney.com/detail/new-1002"
+    assert_current_public_comment_request(requests[2], "new-1002")
     assert spider.seen_posts["bk0910"] == 1
 
 
@@ -614,9 +978,8 @@ def test_old_active_post_schedules_comments_when_reply_count_is_stale_or_zero(tm
 
     requests = list(spider.parse_job(response, job))
 
-    assert [(request.url, request.cb_kwargs["job"]["kind"]) for request in requests] == [
-        ("https://guba.eastmoney.com/comments/old-1001", "comments"),
-    ]
+    assert len(requests) == 1
+    assert_current_public_comment_request(requests[0], "old-1001")
 
 
 def test_duplicate_old_row_still_stops_list_pagination_at_window_floor(tmp_path: Path):

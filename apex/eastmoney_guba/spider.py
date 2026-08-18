@@ -10,7 +10,7 @@ import shutil
 import math
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
@@ -197,12 +197,34 @@ class EastmoneySpider(scrapy.Spider):
                                     for mapping in job.get("mappings", [job])))
         if not self.quota.consume(target_id):
             return None
-        return scrapy.Request(job["url"], callback=self.parse_job, errback=self.request_failed,
-                              cb_kwargs={"job": job}, meta={"quota_target_id": target_id},
-                              # Explicit manifests are already URL-premerged. Reissuing requests is
-                              # required for safe restart when JOBDIR's dupefilter contains a request
-                              # that completed just before an interrupted process.
-                              dont_filter=True)
+        request_options = {
+            "callback": self.parse_job, "errback": self.request_failed,
+            "cb_kwargs": {"job": job}, "meta": {"quota_target_id": target_id},
+            # Explicit manifests are already URL-premerged. Reissuing requests is
+            # required for safe restart when JOBDIR's dupefilter contains a request
+            # that completed just before an interrupted process.
+            "dont_filter": True,
+        }
+        parsed = urlparse(job["url"])
+        if job["kind"] == "comments" and parsed.hostname == "guba.eastmoney.com":
+            content_id = str(job.get("content_id") or "")
+            forum_id = str(job.get("forum_id") or job.get("target_id") or "")
+            page = int(job.get("cursor") or 1)
+            path = "reply/api/Reply/ArticleNewReplyList"
+            api_url = (f"https://guba.eastmoney.com/api/getData?code={forum_id}"
+                       f"&path={path}")
+            parameter = urlencode({
+                "postid": content_id, "sort": 1, "sorttype": 1,
+                "p": page, "ps": 30, "needHide": "true",
+            })
+            return scrapy.FormRequest(api_url, formdata={
+                "param": parameter, "plat": "Web", "path": path, "env": "2",
+                "origin": "", "version": "2022", "product": "Guba",
+            }, headers={
+                "Origin": "https://guba.eastmoney.com",
+                "Referer": self._canonical_detail_url(job, content_id),
+            }, **request_options)
+        return scrapy.Request(job["url"], **request_options)
 
     def parse_job(self, response, job: dict):
         self._snapshot_response(response, job)
@@ -214,8 +236,12 @@ class EastmoneySpider(scrapy.Spider):
         content_type = response.headers.get(b"Content-Type", b"").decode("latin1")
         try:
             if job["kind"] == "comments":
+                cursor = job.get("cursor")
+                comment_page = int(cursor) if str(cursor or "").isdigit() else 1
                 page = self.parser.parse_comment_page(response.body, content_type,
-                                                      window_start=job.get("window_start"))
+                                                      window_start=job.get("window_start"),
+                                                      content_id=str(job.get("content_id") or ""),
+                                                      page=comment_page)
                 self.parser_successes += 1
                 seen = set(job.get("seen_comment_ids") or [])
                 unique = [record for record in page.records
@@ -224,11 +250,18 @@ class EastmoneySpider(scrapy.Spider):
                 records = [self._with_source_url(record, job) for record in records]
                 self._export(records, job)
                 seen.update(record["comment_id"] for record in records)
-                if (page.has_more and page.next_cursor and len(seen) < self.comments_per_post
-                        and job.get("comments_next_url_template")):
-                    child = dict(job, url=job["comments_next_url_template"].format(
-                        content_id=job.get("content_id", ""), cursor=page.next_cursor),
-                                 cursor=page.next_cursor, seen_comment_ids=sorted(seen))
+                if page.has_more and page.next_cursor and len(seen) < self.comments_per_post:
+                    next_template = job.get("comments_next_url_template")
+                    parsed_url = urlparse(job["url"])
+                    if next_template:
+                        next_url = next_template.format(
+                            content_id=job.get("content_id", ""), cursor=page.next_cursor)
+                    elif parsed_url.hostname == "guba.eastmoney.com":
+                        next_url = job["url"]
+                    else:
+                        return
+                    child = dict(job, url=next_url, cursor=page.next_cursor,
+                                 seen_comment_ids=sorted(seen))
                     request = self._request(child)
                     if request is not None:
                         yield request
@@ -238,7 +271,7 @@ class EastmoneySpider(scrapy.Spider):
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
         except SchemaChanged:
-            self._schema_changed(job)
+            self._schema_changed(job, terminal=job.get("kind") != "comments")
             return
         self.parser_successes += 1
 
@@ -333,11 +366,11 @@ class EastmoneySpider(scrapy.Spider):
             parsed = parsed.replace(tzinfo=lower.tzinfo)
         return parsed
 
-    def _schema_changed(self, job: dict) -> None:
+    def _schema_changed(self, job: dict, *, terminal: bool = True) -> None:
         self.parser_errors += 1
         for mapping in job.get("mappings") or [job]:
             self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
-        if self.parser_errors >= self.circuit_breaker_failures:
+        if terminal and self.parser_errors >= self.circuit_breaker_failures:
             self.terminal_reason = "schema_changed"
             raise CloseSpider("schema_changed")
 
