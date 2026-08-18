@@ -245,7 +245,7 @@ def _same_selected_rows(supplied: object, rows: list[dict]) -> bool:
         if not isinstance(value, dict):
             return value
         return {key: item for key, item in value.items()
-                if key not in {"membership_source", "turnover_source"}}
+                if key not in {"membership_source", "turnover_source", "turnover_as_of"}}
     return [base(value) for value in supplied] == [base(value) for value in rows]
 
 
