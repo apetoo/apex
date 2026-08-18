@@ -61,9 +61,20 @@ def _representatives(taxonomy: list[dict], trade_date: str, config: dict,
 def _saved_batch(cache_dir: Path, trade_date: str) -> tuple[Path, dict]:
     batches = sorted((cache_dir / "raw" / trade_date / "eastmoney").glob("*/manifest.json"),
                      key=lambda path: path.stat().st_mtime, reverse=True)
-    if not batches:
-        raise FileNotFoundError("offline replay requires a saved Eastmoney batch")
-    return batches[0], json.loads(batches[0].read_text(encoding="utf-8"))
+    for path in batches:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        response_dir = Path(str(manifest.get("raw_response_dir") or ""))
+        if not response_dir.is_dir():
+            continue
+        for job in manifest.get("jobs", []):
+            if job.get("kind") != "list":
+                continue
+            for candidate in response_dir.glob("*.body"):
+                body = candidate.read_bytes()
+                identity = hashlib.sha256(("list\0" + str(job["url"]) + "\0").encode("utf-8") + body).hexdigest()
+                if candidate.name == f"{identity}.body":
+                    return path, manifest
+    raise FileNotFoundError("offline replay requires a saved Eastmoney batch with list responses")
 
 
 def _offline_runner(source_manifest: dict) -> Callable:
