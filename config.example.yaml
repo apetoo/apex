@@ -116,6 +116,7 @@ sector_sentiment:
   cache_dir: "~/.stock-sentiment"
   mediacrawler_path: "~/workspace/tools/MediaCrawler"
   mediacrawler_commit: ""       # 必填：`git -C <path> rev-parse HEAD`
+  policy_override_reason: ""    # 提前迁移冻结采集策略时必填；首次预约新 cohort 后删除
   platforms: ["bili", "dy"]  # eastmoney 在 phase=shadow 时不属于活跃评分平台
   timeout_seconds: 900
   market_data_enabled: true    # 用 akshare 板块日线更新背离和成熟事件标签
@@ -159,9 +160,9 @@ sector_sentiment:
   retrieval:
     query_version: "sector-finance-query-v1"
     query_templates: ["{term} 股票", "{term} A股", "{term} 板块", "{term} 概念股", "{term} ETF", "{term} 龙头", "{term} 投资", "{term} 行情"]
-    max_queries_per_sector: 8
-    max_contents_per_query: 20
-    max_comments_per_content: 50
+    max_queries_per_sector: 3
+    max_contents_per_query: 8
+    max_comments_per_content: 20
     creator_id_argument: "--creator_id"
     candidate_min_contents: 3
     candidate_min_sectors: 2

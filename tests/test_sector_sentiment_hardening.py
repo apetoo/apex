@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -969,6 +971,357 @@ def test_policy_freeze_uses_sixty_distinct_trading_dates_and_allows_next_cohort(
         store.validate_frozen_policy(
             (start + timedelta(days=20)).isoformat(), "policy-v2",
         )
+
+
+def test_policy_override_keeps_default_freeze_without_a_reason(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+
+    with pytest.raises(ValueError, match="frozen"):
+        store.reserve_policy_day("2026-08-11", "policy-v2")
+
+
+def test_policy_override_starts_audited_future_cohort_without_rewriting_history(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    old_cohort = store.reserve_policy_day("2026-08-10", "policy-v1")
+    with sqlite3.connect(store.path) as conn:
+        historical_before = conn.execute(
+            """SELECT trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                      status, reserved_at, completed_at
+               FROM policy_day_reservations ORDER BY trade_date"""
+        ).fetchall()
+
+    new_cohort = store.reserve_policy_day(
+        "2026-08-11", "policy-v2",
+        override_reason="升级 MediaCrawler 并降低 B站/抖音采集配额",
+    )
+
+    assert new_cohort["policy_cohort_id"] != old_cohort["policy_cohort_id"]
+    assert new_cohort["cohort_start_date"] == "2026-08-11"
+    with sqlite3.connect(store.path) as conn:
+        historical_after = conn.execute(
+            """SELECT trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                      status, reserved_at, completed_at
+               FROM policy_day_reservations WHERE trade_date<'2026-08-11'
+               ORDER BY trade_date"""
+        ).fetchall()
+        migration = conn.execute(
+            """SELECT effective_trade_date, old_config_hash, old_policy_cohort_id,
+                      new_config_hash, new_policy_cohort_id, reason, created_at
+               FROM policy_migrations"""
+        ).fetchone()
+
+    assert historical_after == historical_before
+    assert migration[:6] == (
+        "2026-08-11",
+        "policy-v1",
+        old_cohort["policy_cohort_id"],
+        "policy-v2",
+        new_cohort["policy_cohort_id"],
+        "升级 MediaCrawler 并降低 B站/抖音采集配额",
+    )
+    assert migration[6]
+
+
+def test_policy_override_cannot_replace_a_same_day_reservation(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+
+    with pytest.raises(ValueError, match="reserved|historical|conflict"):
+        store.reserve_policy_day(
+            "2026-08-10", "policy-v2", override_reason="紧急升级采集器",
+        )
+
+    with sqlite3.connect(store.path) as conn:
+        reservation = conn.execute(
+            "SELECT config_hash FROM policy_day_reservations WHERE trade_date='2026-08-10'"
+        ).fetchone()
+        migration_count = conn.execute("SELECT COUNT(*) FROM policy_migrations").fetchone()[0]
+    assert reservation == ("policy-v1",)
+    assert migration_count == 0
+
+
+def test_policy_override_retry_is_idempotent_and_does_not_duplicate_audit(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+    first = store.reserve_policy_day(
+        "2026-08-11", "policy-v2", override_reason="升级采集器",
+    )
+
+    second = store.reserve_policy_day(
+        "2026-08-11", "policy-v2", override_reason="重跑时文案不同也不重复迁移",
+    )
+
+    assert second == first
+    with sqlite3.connect(store.path) as conn:
+        migration_count = conn.execute("SELECT COUNT(*) FROM policy_migrations").fetchone()[0]
+        reservation_count = conn.execute(
+            "SELECT COUNT(*) FROM policy_day_reservations WHERE trade_date='2026-08-11'"
+        ).fetchone()[0]
+    assert migration_count == 1
+    assert reservation_count == 1
+
+
+def test_policy_override_does_not_apply_new_cohort_before_its_effective_date(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    old_cohort = store.reserve_policy_day("2026-08-10", "policy-v1")
+    store.reserve_policy_day(
+        "2026-08-12", "policy-v2", override_reason="升级采集器",
+    )
+
+    gap_day = store.reserve_policy_day("2026-08-11", "policy-v1")
+
+    assert gap_day == old_cohort
+    assert gap_day["cohort_start_date"] <= "2026-08-11"
+    with pytest.raises(ValueError, match="historical|conflict|frozen"):
+        store.reserve_policy_day("2026-08-11", "policy-v2")
+
+
+def test_policy_override_rejects_reason_when_policy_hash_is_unchanged(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+
+    with pytest.raises(ValueError, match="override|unchanged|same|identical"):
+        store.reserve_policy_day(
+            "2026-08-11", "policy-v1", override_reason="升级采集器",
+        )
+
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM policy_migrations").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM policy_day_reservations WHERE trade_date='2026-08-11'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("reason", [True, [], {}, "   ", "x" * 501])
+def test_policy_override_rejects_invalid_reason_values(tmp_path, reason):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+
+    with pytest.raises(ValueError, match="reason|string|non-empty|500"):
+        store.reserve_policy_day(
+            "2026-08-11", "policy-v2", override_reason=reason,
+        )
+
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM policy_migrations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("reason", [True, [], {}])
+def test_run_configured_does_not_stringify_invalid_policy_override_reason(
+    tmp_path, reason,
+):
+    initial = _config(tmp_path)
+    initial_settings = initial["sector_sentiment"]
+    initial_hash = ss._validate_retrieval_policy(
+        initial_settings, initial_settings["retrieval"],
+    )
+    ss.open_store(tmp_path).reserve_policy_day("2026-08-10", initial_hash)
+    migrated = _config(tmp_path)
+    migrated["sector_sentiment"]["mediacrawler_commit"] = "b" * 40
+    migrated["sector_sentiment"]["policy_override_reason"] = reason
+    runner_called = False
+
+    def runner(*_args):
+        nonlocal runner_called
+        runner_called = True
+
+    with pytest.raises(ValueError, match="reason|string"):
+        ss.run_configured(migrated, runner=runner, trade_date="2026-08-11")
+
+    assert runner_called is False
+
+
+def test_policy_override_reason_can_authorize_only_one_migration(tmp_path):
+    store = ss.SentimentStore(tmp_path / "policy-override.sqlite3")
+    store.reserve_policy_day("2026-08-10", "policy-v1")
+    store.reserve_policy_day(
+        "2026-08-11", "policy-v2", override_reason="一次性升级采集器",
+    )
+
+    with pytest.raises(ValueError, match="override|used|consumed|frozen"):
+        store.reserve_policy_day(
+            "2026-08-12", "policy-v3", override_reason="一次性升级采集器",
+        )
+
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM policy_migrations").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM policy_day_reservations WHERE trade_date='2026-08-12'"
+        ).fetchone()[0] == 0
+
+
+def test_concurrent_policy_overrides_leave_one_consistent_migration(tmp_path, monkeypatch):
+    path = tmp_path / "policy-override.sqlite3"
+    ss.SentimentStore(path).reserve_policy_day("2026-08-10", "policy-v1")
+    first = ss.SentimentStore(path)
+    second = ss.SentimentStore(path)
+    barrier = threading.Barrier(2)
+    original = ss.SentimentStore.resolve_policy_cohort
+
+    def synchronized_resolve(self, trade_date, config_hash, override_reason=""):
+        barrier.wait(timeout=5)
+        return original(self, trade_date, config_hash, override_reason)
+
+    monkeypatch.setattr(ss.SentimentStore, "resolve_policy_cohort", synchronized_resolve)
+
+    def reserve(store, policy):
+        try:
+            return ("ok", store.reserve_policy_day(
+                "2026-08-11", policy, override_reason=f"迁移到 {policy}",
+            ))
+        except Exception as exc:  # Assert the public failure type below.
+            return ("error", exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda args: reserve(*args),
+            [(first, "policy-v2"), (second, "policy-v3")],
+        ))
+
+    assert [status for status, _ in results].count("ok") == 1
+    errors = [value for status, value in results if status == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "conflict" in str(errors[0]) or "reserved" in str(errors[0])
+    with sqlite3.connect(path) as conn:
+        reservation = conn.execute(
+            "SELECT config_hash, policy_cohort_id FROM policy_day_reservations "
+            "WHERE trade_date='2026-08-11'"
+        ).fetchone()
+        migration = conn.execute(
+            "SELECT new_config_hash, new_policy_cohort_id FROM policy_migrations "
+            "WHERE effective_trade_date='2026-08-11'"
+        ).fetchone()
+    assert reservation == migration
+
+
+def test_concurrent_policy_overrides_cannot_reuse_one_reason_on_different_dates(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "policy-override.sqlite3"
+    ss.SentimentStore(path).reserve_policy_day("2026-08-10", "policy-v1")
+    first = ss.SentimentStore(path)
+    second = ss.SentimentStore(path)
+    barrier = threading.Barrier(2)
+    original = ss.SentimentStore.resolve_policy_cohort
+
+    def synchronized_resolve(self, trade_date, config_hash, override_reason=""):
+        result = original(self, trade_date, config_hash, override_reason)
+        barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(ss.SentimentStore, "resolve_policy_cohort", synchronized_resolve)
+
+    def reserve(store, trade_date, policy):
+        try:
+            return ("ok", store.reserve_policy_day(
+                trade_date, policy, override_reason="同一个一次性迁移授权",
+            ))
+        except Exception as exc:  # Assert the public failure type below.
+            return ("error", exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda args: reserve(*args),
+            [
+                (first, "2026-08-11", "policy-v2"),
+                (second, "2026-08-12", "policy-v3"),
+            ],
+        ))
+
+    assert [status for status, _ in results].count("ok") == 1
+    errors = [value for status, value in results if status == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "used" in str(errors[0]) or "consumed" in str(errors[0])
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM policy_migrations "
+            "WHERE reason='同一个一次性迁移授权'"
+        ).fetchone()[0] == 1
+
+
+def test_natural_policy_rollover_rechecks_latest_cohort_after_obtaining_write_lock(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "policy-override.sqlite3"
+    seed = ss.SentimentStore(path)
+    start = date(2026, 1, 1)
+    for offset in range(60):
+        seed.reserve_policy_day(
+            (start + timedelta(days=offset)).isoformat(), "policy-v1",
+        )
+    store = ss.SentimentStore(path)
+    original = ss.SentimentStore.resolve_policy_cohort
+    competing = original(store, "2026-03-02", "policy-v3")
+    injected = False
+
+    def synchronized_resolve(self, trade_date, config_hash, override_reason=""):
+        nonlocal injected
+        result = original(self, trade_date, config_hash, override_reason)
+        if not injected:
+            injected = True
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO policy_day_reservations
+                       (trade_date, config_hash, policy_cohort_id, cohort_start_date,
+                        status, reserved_at)
+                       VALUES ('2026-03-02', 'policy-v3', ?, ?, 'running',
+                               '2026-03-02T00:00:00+08:00')""",
+                    (competing["policy_cohort_id"], competing["cohort_start_date"]),
+                )
+        return result
+
+    monkeypatch.setattr(ss.SentimentStore, "resolve_policy_cohort", synchronized_resolve)
+
+    with pytest.raises(ValueError, match="changed|conflict"):
+        store.reserve_policy_day("2026-03-03", "policy-v2")
+
+    with sqlite3.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT trade_date, config_hash FROM policy_day_reservations "
+            "WHERE trade_date>='2026-03-02' ORDER BY trade_date"
+        ).fetchall()
+    assert rows == [("2026-03-02", "policy-v3")]
+
+
+def test_policy_override_reason_is_audit_data_not_retrieval_policy(tmp_path):
+    first = _config(tmp_path)
+    first["sector_sentiment"]["policy_override_reason"] = "升级 MediaCrawler"
+    second = _config(tmp_path)
+    second["sector_sentiment"]["policy_override_reason"] = "降低采集配额"
+
+    assert ss._validate_retrieval_policy(
+        first["sector_sentiment"], first["sector_sentiment"]["retrieval"],
+    ) == ss._validate_retrieval_policy(
+        second["sector_sentiment"], second["sector_sentiment"]["retrieval"],
+    )
+
+
+def test_run_configured_uses_policy_override_reason_for_the_precollection_reservation(tmp_path):
+    initial = _config(tmp_path)
+    initial_settings = initial["sector_sentiment"]
+    initial_hash = ss._validate_retrieval_policy(
+        initial_settings, initial_settings["retrieval"],
+    )
+    ss.open_store(tmp_path).reserve_policy_day("2026-08-10", initial_hash)
+    migrated = _config(tmp_path)
+    migrated["sector_sentiment"]["mediacrawler_commit"] = "b" * 40
+    migrated["sector_sentiment"]["policy_override_reason"] = "升级 MediaCrawler"
+
+    report = ss.run_configured(
+        migrated,
+        runner=lambda _job, destination, _timeout, _limits: destination.write_text(""),
+        trade_date="2026-08-11",
+    )
+
+    assert report["collection"]["trade_date"] == "2026-08-11"
+    with sqlite3.connect(ss.open_store(tmp_path).path) as conn:
+        migration = conn.execute(
+            "SELECT effective_trade_date, reason FROM policy_migrations"
+        ).fetchone()
+    assert migration == ("2026-08-11", "升级 MediaCrawler")
 
 
 def test_policy_day_is_reserved_before_ingest_side_effects_and_survives_crash(

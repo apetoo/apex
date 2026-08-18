@@ -434,6 +434,17 @@ class SentimentStore:
                     status TEXT NOT NULL DEFAULT 'running',
                     reserved_at TEXT NOT NULL, completed_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS policy_migrations (
+                    effective_trade_date TEXT PRIMARY KEY,
+                    old_config_hash TEXT NOT NULL,
+                    old_policy_cohort_id TEXT NOT NULL,
+                    new_config_hash TEXT NOT NULL,
+                    new_policy_cohort_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_migrations_reason
+                    ON policy_migrations(reason);
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(daily_scores)")}
             for name in ("attention_raw", "sentiment_raw", "content_count", "comment_count",
@@ -1176,18 +1187,97 @@ class SentimentStore:
                      report["trade_date"], report["config_hash"]),
                 )
 
-    def reserve_policy_day(self, trade_date: str, config_hash: str) -> dict[str, str]:
+    def reserve_policy_day(
+        self, trade_date: str, config_hash: str, override_reason: Any = "",
+    ) -> dict[str, str]:
         """Bind a date to one policy before budgets, collection or ingest can mutate state."""
-        cohort = self.resolve_policy_cohort(trade_date, config_hash)
+        if not isinstance(override_reason, str):
+            raise ValueError("sector sentiment policy override reason must be a string")
+        if override_reason and not override_reason.strip():
+            raise ValueError("sector sentiment policy override reason must be non-empty")
+        reason = override_reason.strip()
+        if len(reason) > 500:
+            raise ValueError("sector sentiment policy override reason must be at most 500 characters")
         with self._connect() as conn:
+            existing = conn.execute(
+                """SELECT config_hash, policy_cohort_id, cohort_start_date
+                   FROM policy_day_reservations WHERE trade_date=?""",
+                (trade_date,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["config_hash"]) != config_hash:
+                    raise ValueError(
+                        "sector sentiment trade date is reserved by a conflicting policy"
+                    )
+                return {
+                    "policy_cohort_id": str(existing["policy_cohort_id"]),
+                    "cohort_start_date": str(existing["cohort_start_date"]),
+                }
+
+            cohort = self.resolve_policy_cohort(trade_date, config_hash, reason)
+            conn.execute("BEGIN IMMEDIATE")
+            concurrent = conn.execute(
+                """SELECT config_hash, policy_cohort_id, cohort_start_date
+                   FROM policy_day_reservations WHERE trade_date=?""",
+                (trade_date,),
+            ).fetchone()
+            if concurrent is not None:
+                if str(concurrent["config_hash"]) != config_hash:
+                    raise ValueError(
+                        "sector sentiment trade date is reserved by a conflicting policy"
+                    )
+                return {
+                    "policy_cohort_id": str(concurrent["policy_cohort_id"]),
+                    "cohort_start_date": str(concurrent["cohort_start_date"]),
+                }
+            if cohort.get("override_used"):
+                used = conn.execute(
+                    "SELECT 1 FROM policy_migrations WHERE reason=?", (reason,),
+                ).fetchone()
+                if used:
+                    raise ValueError(
+                        "sector sentiment policy override reason has already been used"
+                    )
+            if cohort.get("transition"):
+                latest = conn.execute(
+                    """SELECT config_hash, policy_cohort_id FROM (
+                           SELECT trade_date, config_hash, policy_cohort_id, rowid AS seq
+                           FROM collection_runs WHERE config_hash IS NOT NULL
+                           UNION ALL
+                           SELECT trade_date, config_hash, policy_cohort_id, rowid AS seq
+                           FROM policy_day_reservations
+                       ) ORDER BY trade_date DESC, seq DESC LIMIT 1"""
+                ).fetchone()
+                if (latest is None
+                        or str(latest["config_hash"]) != cohort["old_config_hash"]
+                        or str(latest["policy_cohort_id"])
+                        != cohort["old_policy_cohort_id"]):
+                    raise ValueError(
+                        "sector sentiment policy changed during cohort reservation"
+                    )
             conn.execute(
-                """INSERT OR IGNORE INTO policy_day_reservations
+                """INSERT INTO policy_day_reservations
                    (trade_date, config_hash, policy_cohort_id, cohort_start_date,
                     status, reserved_at)
                    VALUES (?, ?, ?, ?, 'running', ?)""",
                 (trade_date, config_hash, cohort["policy_cohort_id"],
                  cohort["cohort_start_date"], _now()),
             )
+            if cohort.get("override_used"):
+                try:
+                    conn.execute(
+                        """INSERT INTO policy_migrations
+                           (effective_trade_date, old_config_hash, old_policy_cohort_id,
+                            new_config_hash, new_policy_cohort_id, reason, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (trade_date, cohort["old_config_hash"],
+                         cohort["old_policy_cohort_id"], config_hash,
+                         cohort["policy_cohort_id"], reason, _now()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(
+                        "sector sentiment policy override is conflicting or already used"
+                    ) from exc
             row = conn.execute(
                 """SELECT config_hash, policy_cohort_id, cohort_start_date
                    FROM policy_day_reservations WHERE trade_date=?""",
@@ -1202,8 +1292,17 @@ class SentimentStore:
             "cohort_start_date": str(row["cohort_start_date"]),
         }
 
-    def resolve_policy_cohort(self, trade_date: str, config_hash: str) -> dict[str, str]:
+    def resolve_policy_cohort(
+        self, trade_date: str, config_hash: str, override_reason: Any = "",
+    ) -> dict[str, str]:
         """Resolve the audited cohort while enforcing 60 trading-date freezes."""
+        if not isinstance(override_reason, str):
+            raise ValueError("sector sentiment policy override reason must be a string")
+        if override_reason and not override_reason.strip():
+            raise ValueError("sector sentiment policy override reason must be non-empty")
+        reason = override_reason.strip()
+        if len(reason) > 500:
+            raise ValueError("sector sentiment policy override reason must be at most 500 characters")
         target = date.fromisoformat(trade_date)
         with self._connect() as conn:
             rows = conn.execute(
@@ -1242,7 +1341,12 @@ class SentimentStore:
 
         ordered_dates = sorted(by_date)
         if target <= ordered_dates[-1]:
-            required_date = next(run_date for run_date in ordered_dates if run_date >= target)
+            prior_dates = [run_date for run_date in ordered_dates if run_date <= target]
+            if not prior_dates:
+                raise ValueError(
+                    "sector sentiment retrieval policy cannot predate its historical cohort"
+                )
+            required_date = prior_dates[-1]
             required = by_date[required_date]
             if required["config_hash"] != config_hash:
                 raise ValueError(
@@ -1256,6 +1360,10 @@ class SentimentStore:
         current = by_date[ordered_dates[-1]]
         current_hash = current["config_hash"]
         if config_hash == current_hash:
+            if reason:
+                raise ValueError(
+                    "sector sentiment policy override is invalid when policy is unchanged"
+                )
             return {
                 "policy_cohort_id": current["policy_cohort_id"],
                 "cohort_start_date": current["cohort_start_date"],
@@ -1265,12 +1373,32 @@ class SentimentStore:
             for value in by_date.values()
         )
         if cohort_size < 60:
-            raise ValueError(
-                "sector sentiment retrieval policy is frozen until 60 trading dates complete"
-            )
+            if not reason:
+                raise ValueError(
+                    "sector sentiment retrieval policy is frozen until 60 trading dates complete"
+                )
+            with self._connect() as conn:
+                used = conn.execute(
+                    "SELECT 1 FROM policy_migrations WHERE reason=?", (reason,),
+                ).fetchone()
+            if used:
+                raise ValueError(
+                    "sector sentiment policy override reason has already been used"
+                )
+            return {
+                "policy_cohort_id": _policy_cohort_id(config_hash, trade_date),
+                "cohort_start_date": trade_date,
+                "transition": "true",
+                "override_used": "true",
+                "old_config_hash": current_hash,
+                "old_policy_cohort_id": current["policy_cohort_id"],
+            }
         return {
             "policy_cohort_id": _policy_cohort_id(config_hash, trade_date),
             "cohort_start_date": trade_date,
+            "transition": "true",
+            "old_config_hash": current_hash,
+            "old_policy_cohort_id": current["policy_cohort_id"],
         }
 
     def validate_frozen_policy(self, trade_date: str, config_hash: str) -> None:
@@ -2576,7 +2704,10 @@ def run_configured(cfg: dict | None = None, *, runner: Callable | None = None,
             retrieval_settings.get("creator_id_argument", "--creator_id"),
         )
     raw_dir = cache_dir / "raw"
-    policy_cohort = store.reserve_policy_day(resolved_date, policy_hash)
+    policy_cohort = store.reserve_policy_day(
+        resolved_date, policy_hash,
+        override_reason=settings.get("policy_override_reason", ""),
+    )
     relevance_llm_enabled = bool(retrieval_settings.get(
         "relevance_llm_enabled", settings.get("llm_enabled", False),
     ))

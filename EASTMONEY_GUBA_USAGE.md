@@ -86,6 +86,16 @@ sector_sentiment:
 
 - `eastmoney_forum_id` 必须人工核验，系统不会猜测板块吧 ID。
 - 完整的 `run_configured` 还会执行配置中的 Bilibili/抖音采集：先在仓库外安装 MediaCrawler，把 `sector_sentiment.mediacrawler_path` 改为其实际路径，并把 `mediacrawler_commit` 填为 `git -C <path> rev-parse HEAD` 输出的完整 40 位十六进制 commit。东方财富自身不使用 MediaCrawler，仍只访问公开免登录页面。
+
+### 提前迁移冻结的采集策略
+
+更新 MediaCrawler 提交或调整 Bilibili/抖音采集配额会改变采集策略哈希。当前 cohort 未满 60 个交易日时，可在 `sector_sentiment` 下临时填写一次带审计原因的迁移配置：
+
+```yaml
+policy_override_reason: "升级 MediaCrawler 并降低 B站/抖音采集配额"
+```
+
+原因必须是非空字符串且不超过 500 个字符，同一原因只能授权一次迁移。迁移只允许从最新历史日期之后的新交易日开始新 cohort，不会改写或删除历史，同一天已预约的策略也不能覆盖。首次运行完成策略预约后可以删除该配置；新的 cohort 会继续遵守正常的 60 个交易日冻结。
 - 每个板块还会按最近 20 个交易日成交额选择 5 只代表成分股，并抓取对应个股吧。
 - 少于 5 只、行情不可用或 provider 失败时，manifest 会记录 `target_shortfall`，当次结果不会被认定为质量达标。
 - 不要把 `eastmoney` 加入 `platforms` 来提前参与评分。是否纳入正式评分由 `phase` 控制。
