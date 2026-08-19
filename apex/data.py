@@ -1371,10 +1371,11 @@ def web_search(
         })
 
     code_short = ts_code.split(".")[0]
+    entity = " ".join(part for part in (name, code_short, ts_code) if part)
 
     if category == "general":
         q = query or (
-            f"{name} 公告 研报 新闻" if name
+            f"{entity} 公告 研报 新闻" if entity
             else f"{code_short} 公告 研报 新闻"
         )
     elif category == "industry":
@@ -1385,7 +1386,7 @@ def web_search(
         q = cat_spec["query_tpl"].format(industry=industry)
     else:
         # 其他分类需要 name；缺失时退化为 ts_code（召回会变差）
-        actual_name = name or code_short
+        actual_name = entity or code_short
         q = cat_spec["query_tpl"].format(name=actual_name)
 
     actual_freshness = freshness or cat_spec["freshness"]
@@ -1430,13 +1431,11 @@ def web_search(
             "snippet": (it.get("snippet") or "").strip().replace("\n", " "),
             "date": pub_date[:10] if pub_date else "",
             "site": site,
-            "trust_level": _site_trust(site),
         })
-    # 高信任来源排前面，同等信任度按发布日期降序
-    results.sort(key=lambda r: (r["trust_level"], -(int((r["date"] or "").replace("-", "") or 0))))
-    # 去掉排序辅助字段后返回
-    for r in results:
-        r.pop("trust_level", None)
+    from apex.evidence import normalize_search_results
+    results, quality = normalize_search_results(
+        results, ts_code=ts_code, name=name, category=category,
+    )
     return json.dumps({
         "source": "bocha:web-search",
         "category": category,
@@ -1444,6 +1443,7 @@ def web_search(
         "freshness": actual_freshness,
         "count": len(results),
         "results": results,
+        "quality": quality,
     }, ensure_ascii=False)
 
 

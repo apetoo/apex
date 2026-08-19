@@ -1,5 +1,19 @@
 from typing import TypedDict, Optional, Literal
 
+
+class EvidenceItem(TypedDict):
+    id: str
+    fact: str
+    inference: str
+    evidence_type: str
+    tool_name: str
+    source_name: str
+    source_url: Optional[str]
+    published_at: Optional[str]
+    source_tier: int
+    entity_matched: bool
+    freshness_status: str
+
 VERDICT_ENUM = ["看多", "偏多", "观望偏多", "中性", "观望偏空", "偏空", "看空"]
 BULLISH_VERDICTS = {"看多", "偏多", "观望偏多"}
 BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}

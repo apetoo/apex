@@ -6,7 +6,7 @@ Replace mandatory category searches with a stateful, quality-gated research loop
 
 ## Architecture
 
-LangGraph owns orchestration only. Existing data tools, trading guards, journal, trace, calibration, repeat-analysis limits, and position lifecycle remain business authorities.
+LangGraph is the sole orchestration path. Existing data tools, trading guards, journal, trace, calibration, repeat-analysis limits, and position lifecycle remain business authorities. The hand-written model/tool loop is removed after its behavior is covered by graph tests; no legacy runtime switch is retained.
 
 The graph is:
 

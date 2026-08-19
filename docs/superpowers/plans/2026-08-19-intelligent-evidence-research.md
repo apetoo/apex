@@ -4,7 +4,7 @@
 
 **Goal:** Build a LangGraph-orchestrated, quality-gated stock research loop that can either produce a reviewed conclusion or abstain safely.
 
-**Architecture:** Pure Python evidence-quality and budget modules enforce domain-independent invariants. A LangGraph `StateGraph` routes existing model/tool calls through safety scan, gap assessment, draft, independent review, one optional rework, and finalization. Existing business guards and persistence remain authoritative, with the legacy loop available as a temporary fallback.
+**Architecture:** Pure Python evidence-quality and budget modules enforce domain-independent invariants. A LangGraph `StateGraph` routes existing model/tool calls through safety scan, gap assessment, draft, independent review, one optional rework, and finalization. Existing business guards and persistence remain authoritative; the hand-written orchestration loop is removed rather than retained as a second runtime path.
 
 **Tech Stack:** Python 3.12, LangGraph 1.x, OpenAI-compatible DeepSeek client, pytest, React/TypeScript frontend.
 
@@ -45,7 +45,7 @@
 - [ ] Add failing graph-routing tests for clean completion, tool research, pass, rework, abstain, and trim/exit blocking.
 - [ ] Add LangGraph dependency and implement a custom `StateGraph`; do not use a prebuilt ReAct agent.
 - [ ] Adapt existing OpenAI-compatible messages/tools, progress events, final business guards, and trace output.
-- [ ] Keep the legacy loop behind `analysis.orchestrator=legacy`; default to `langgraph`.
+- [ ] Remove the legacy model/tool loop after the graph covers its successful verdict, position-action, rejection, and no-result behaviors.
 - [ ] Run focused analysis and position-action tests and commit the orchestration slice.
 
 ### Task 4: CLI and frontend output
