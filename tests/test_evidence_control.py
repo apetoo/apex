@@ -101,6 +101,22 @@ def test_review_allows_only_one_rework():
     assert ctl.review_issues == ["仍然缺失"]
 
 
+def test_review_rework_requires_new_evidence_and_fresh_assessment():
+    ctl = EvidenceController()
+    ctl.record_safety_scan(success=True, evidence=[])
+    ctl.add_evidence([_ev()])
+    ctl.submit_assessment(thesis="偏多", gaps=[], ready=True)
+
+    assert ctl.record_review("rework", ["补充监管证据"]) == "rework"
+    assert ctl.finalization_decision().allowed is False
+    assert "复核返工尚未取得新增证据并重新评估" in ctl.finalization_decision().blockers
+
+    ctl.add_evidence([_ev("ev_2")])
+    assert ctl.finalization_decision().allowed is False
+    ctl.submit_assessment(thesis="偏多", gaps=[], ready=True)
+    assert ctl.finalization_decision().allowed is True
+
+
 def test_builds_non_actionable_insufficient_entry():
     entry = build_insufficient_entry(
         ts_code="002050.SZ",

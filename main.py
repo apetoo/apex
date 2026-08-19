@@ -33,6 +33,21 @@ def analyze(ts_code, no_save):
     _clean_proxy()
     from apex.analyze import run
     result = run(ts_code, save=not no_save)
+    if result.get("analysis_status") == "insufficient_evidence":
+        click.echo(f"\n{'='*50}")
+        click.echo(f"  {ts_code} → 证据不足，暂不判断")
+        click.echo(f"{'='*50}")
+        summary = result.get("research_summary")
+        if summary:
+            click.echo(summary)
+        unknowns = result.get("unknowns") or []
+        if unknowns:
+            click.echo("关键未知项：")
+            for unknown in unknowns:
+                click.echo(f"  - {unknown}")
+        if not no_save:
+            click.echo(f"\n✓ 已保存补证记录: {ts_code}")
+        return
     verdict = result.get("verdict", "?")
     confidence = result.get("confidence", "?")
     analysis = result.get("analysis_text", "")
@@ -43,7 +58,8 @@ def analyze(ts_code, no_save):
         click.echo(analysis[:800])
         if len(analysis) > 800:
             click.echo(f"\n...（共 {len(analysis)} 字）")
-    click.echo(f"\n✓ 已保存到日志: {ts_code} → {verdict}")
+    if not no_save:
+        click.echo(f"\n✓ 已保存到日志: {ts_code} → {verdict}")
 
 
 # ── backtest ───────────────────────────────────────────────────────

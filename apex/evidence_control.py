@@ -50,6 +50,7 @@ class EvidenceController:
         self.failures: list[str] = []
         self.review_issues: list[str] = []
         self._evidence_at_last_assessment = 0
+        self._rework_evidence_baseline: int | None = None
 
     def record_external_call(self, tool_name: str, *, success: bool, error: str = "") -> None:
         self.external_calls += 1
@@ -95,6 +96,8 @@ class EvidenceController:
         else:
             self.no_progress_rounds = 0
         self._evidence_at_last_assessment = current
+        if self._rework_evidence_baseline is not None and current > self._rework_evidence_baseline:
+            self._rework_evidence_baseline = None
 
     def should_stop(self) -> StopDecision:
         elapsed = (self._clock() - self.started_at).total_seconds()
@@ -119,6 +122,8 @@ class EvidenceController:
             blockers.append("缺少可用于决策的 Tier 1/2 证据")
         if not self.ready:
             blockers.append("Agent 尚未声明证据收敛")
+        if self._rework_evidence_baseline is not None:
+            blockers.append("复核返工尚未取得新增证据并重新评估")
         if action in {"trim", "exit"} and self.safety_scan_status not in {"clear", "events_found"}:
             blockers.append("减仓/退出前必须完成权威风险核验")
         return FinalizationDecision(not blockers, blockers)
@@ -129,6 +134,8 @@ class EvidenceController:
             if self.review_reworks >= self.config.max_review_reworks:
                 return "abstain"
             self.review_reworks += 1
+            self._rework_evidence_baseline = len(self.evidence)
+            self.ready = False
         return outcome
 
 

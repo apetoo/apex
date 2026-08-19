@@ -49,6 +49,23 @@ describe("LatestAnalysisBadge", () => {
     expect(container.innerHTML).toBe("");
   });
 
+  it("证据不足 -> 显示弃权状态和未知项，不显示方向与交易价位", async () => {
+    mocked.mockResolvedValueOnce({
+      ts_code: "600519.SH",
+      analysis_status: "insufficient_evidence",
+      analyzed_at: new Date().toISOString(),
+      verdict: undefined,
+      evidence: [],
+      unknowns: ["监管事件未能从权威来源核实"],
+      research_summary: "补证预算内无法消除重大未知。",
+    });
+    withClient(<LatestAnalysisBadge tsCode="600519.SH" />);
+
+    expect((await screen.findAllByText("证据不足")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/监管事件未能从权威来源核实/)).toBeTruthy();
+    expect(screen.queryByText(/入场/)).toBeNull();
+  });
+
   it("verdict entry -> 徽标: 看多 + 校准62 + 日期; 浮窗: 三价 + 前2条证据", async () => {
     mocked.mockResolvedValueOnce(verdictEntry as never);
     withClient(<LatestAnalysisBadge tsCode="600519.SH" />);

@@ -50,7 +50,8 @@ def test_finalize_writes_position_action_entry_and_refreshes_plan(mock_names, is
     assert entry["verdict"] is None
     assert entry["confidence"] is None
     assert entry["price_advice"] is None
-    assert entry["evidence"] is None
+    assert entry["analysis_status"] == "completed"
+    assert entry["evidence"] == []
     # position_action 块
     assert entry["position_action"]["action"] == "add"
     assert entry["position_action"]["add_shares"] == 300

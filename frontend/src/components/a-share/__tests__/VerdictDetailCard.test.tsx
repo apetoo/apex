@@ -31,6 +31,55 @@ const baseVerdict = {
   evidence: [],
 };
 
+describe("VerdictDetailCard - evidence research states", () => {
+  it("insufficient evidence shows unknowns and hides trading controls", () => {
+    withClient(
+      <VerdictDetailCard
+        verdict={{
+          ts_code: "002050.SZ",
+          analysis_status: "insufficient_evidence",
+          verdict: null,
+          price_advice: null,
+          unknowns: ["重大事件无法从权威来源核实"],
+          research_summary: "动态补证后仍不充分。",
+          evidence: [],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("证据不足，暂不判断")).toBeTruthy();
+    expect(screen.getByText(/重大事件无法从权威来源核实/)).toBeTruthy();
+    expect(screen.queryByText("入场")).toBeNull();
+    expect(screen.queryByText("加入候选")).toBeNull();
+  });
+
+  it("renders structured evidence fact, inference, tier and source link", () => {
+    withClient(
+      <VerdictDetailCard
+        verdict={{
+          ...baseVerdict,
+          analysis_status: "completed",
+          evidence: [{
+            id: "ev_1",
+            fact: "公司收到监管函",
+            inference: "合规风险上升",
+            source_tier: 1,
+            source_name: "巨潮资讯",
+            source_url: "https://www.cninfo.com.cn/a",
+          }],
+        }}
+      />,
+    );
+
+    expect(screen.getByText(/公司收到监管函/)).toBeTruthy();
+    expect(screen.getByText(/合规风险上升/)).toBeTruthy();
+    expect(screen.getByText("Tier 1")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "巨潮资讯" })).toHaveAttribute(
+      "href", "https://www.cninfo.com.cn/a",
+    );
+  });
+});
+
 describe("VerdictDetailCard - Playstyle Engine v1 渲染", () => {
   it("完整 playstyle -> 星级条 + 主玩法标记 + 原因 + risk/fit 徽章", () => {
     withClient(

@@ -158,25 +158,23 @@ def test_invalid_action_rejected(isolated_paths):
     assert reasons
 
 
-# ── 守卫 3 (OV#1): trim/exit 强制 3 类搜索 ───────────────────────────────────
+# ── 搜索门控由 EvidenceController 统一负责，不再检查类别调用清单 ─────────────
 
-def test_trim_mandatory_search_missing_rejected(isolated_paths):
+def test_trim_does_not_use_legacy_search_checklist(isolated_paths):
     _add()
     reasons, _ = _validate_position_action(
         {"action": "trim", "trim_shares": 100, "rationale": "x"}, "002050.SZ", []
     )
-    assert reasons
-    assert any("regulatory" in r or "shareholders" in r or "money_flow" in r for r in reasons)
+    assert _ok(reasons)
 
 
-def test_trim_partial_search_rejected(isolated_paths):
-    """缺 money_flow -> 拒。earnings 不强制。"""
+def test_trim_ignores_partial_legacy_search_list(isolated_paths):
     _add()
     reasons, _ = _validate_position_action(
         {"action": "trim", "trim_shares": 100, "rationale": "x"}, "002050.SZ",
         ["regulatory", "shareholders", "earnings"],
     )
-    assert reasons
+    assert _ok(reasons)
 
 
 def test_trim_all_three_search_ok(isolated_paths):
@@ -188,12 +186,12 @@ def test_trim_all_three_search_ok(isolated_paths):
     assert _ok(reasons)
 
 
-def test_exit_mandatory_search_missing_rejected(isolated_paths):
+def test_exit_does_not_use_legacy_search_checklist(isolated_paths):
     _add()
     reasons, _ = _validate_position_action(
         {"action": "exit", "rationale": "x"}, "002050.SZ", []
     )
-    assert reasons
+    assert _ok(reasons)
 
 
 def test_exit_all_three_search_ok(isolated_paths):

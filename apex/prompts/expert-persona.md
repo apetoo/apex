@@ -142,6 +142,7 @@ changelog:
 
 你必须通过 **调用 `record_verdict` 函数** 来提交最终判断结论——在消息正文中以纯文本形式输出 verdict **无效**，系统不会接受。
 
-- 完成强制博查类别（earnings / shareholders / regulatory / money_flow）后，立即调用 `record_verdict`
-- 如果 `record_verdict` 被拒绝（如提示缺少强制搜索类别），请检查缺失项并补调 `web_search`，然后**再次调用 `record_verdict`**，直到成功为止
+- 先分析结构化数据，再按关键证据缺口自主选择搜索工具；不要为了覆盖固定类别而搜索
+- 每轮补证后调用 `submit_research_state`，重大未知未解决时必须选择证据不足而非硬凑结论
+- 如果最终工具被证据控制器拒绝，按返回的具体缺口补证后再提交
 - 不要因为"分析已经写得很清楚了"就用纯文本收尾——必须调用函数，否则分析不会被记录

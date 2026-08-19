@@ -18,6 +18,9 @@ from apex.schemas import (
     STOCK_TYPE_ENUM, VALUATION_BASIS_ENUM, PLAYSTYLE_ENUM,
     POSITION_ACTION_SOURCE,
 )
+from apex.analysis_graph import GraphHandlers, build_analysis_graph
+from apex.evidence import make_evidence_item
+from apex.evidence_control import EvidenceController
 
 
 class AnalysisError(Exception):
@@ -424,7 +427,7 @@ TOOLS = [
                 "系统会按价格顺序模拟执行 ladder 并拒绝不自洽路径：下行路径（现价往下）必须单一意图——纯回踩加仓或纯防守减仓，先卖后买/先买后卖是 churn（两档若互斥请合并为单一防守档或拉开到不同情景）；上行路径先加后减（金字塔），trim 之后不得再有 add；trim 低于有效止损（含路径内止损上移后的新止损）是死档；add ≥ 有效止盈价是自相矛盾（用 new_target 上移止盈修复）。"
                 "target 是建仓时的一次性字段，价格观上移时必须用 new_target 同步止盈，否则化石止盈（monitor 推送）会与 ladder 打架。"
                 "rationale 是机器可读摘要，完整推理写进分析文本。"
-                "action=trim/exit 涉及实质风险决策，调用前必须已调 web_search 的 regulatory+shareholders+money_flow 三类（缺则被拒）。"
+                "action=trim/exit 涉及实质风险决策；只有证据控制器确认重大风险已核实、独立复核通过后才会被接受。"
                 "4h 内重复调此工具会被反 churn 速率限制拒绝，除非 new_info 列出本次新增信息。"
             ),
             "parameters": {
@@ -464,6 +467,41 @@ TOOLS = [
         },
     },
 ]
+
+TOOLS.insert(-2, {
+    "type": "function",
+    "function": {
+        "name": "submit_research_state",
+        "description": (
+            "提交当前研究状态，让证据控制器判断继续补证、形成初稿或弃权。"
+            "完成基础结构化数据分析后调用；每次获得能解决关键缺口的新证据后再次调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "thesis": {"type": "string", "description": "当前最可能的方向及一句话原因"},
+                "strongest_bull_evidence": {"type": "array", "items": {"type": "string"}},
+                "strongest_bear_evidence": {"type": "array", "items": {"type": "string"}},
+                "gaps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "description": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["critical", "noncritical"]},
+                            "status": {"type": "string", "enum": ["open", "resolved"]},
+                        },
+                        "required": ["id", "description", "severity", "status"],
+                    },
+                },
+                "next_actions": {"type": "array", "items": {"type": "string"}},
+                "ready": {"type": "boolean", "description": "关键证据是否已收敛"},
+            },
+            "required": ["thesis", "gaps", "next_actions", "ready"],
+        },
+    },
+})
 
 
 def _load_system_prompt() -> str:
@@ -1515,6 +1553,284 @@ def _format_playstyle_block(ts_code: str) -> tuple[str, dict]:
     return "\n".join(lines), feats
 
 
+def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
+    """Convert accepted tool output into the compact evidence ledger."""
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return []
+    if name == "web_search" and isinstance(parsed, dict):
+        items = []
+        for row in parsed.get("results") or []:
+            if not row.get("entity_matched") or int(row.get("source_tier") or 3) > 3:
+                continue
+            items.append(make_evidence_item(
+                fact=(row.get("title") or row.get("snippet") or "")[:300],
+                inference="待 Agent 结合其他证据评估",
+                evidence_type=str(parsed.get("category") or "web"),
+                tool_name=name,
+                source=row,
+            ))
+        return items
+    summary = trace_mod.summarize_tool_result(name, raw)
+    if not isinstance(summary, dict) or summary.get("error") or summary.get("note"):
+        return []
+    return [make_evidence_item(
+        fact=json.dumps(summary, ensure_ascii=False, sort_keys=True)[:800],
+        inference="结构化数据，供多空论证使用",
+        evidence_type="structured_data",
+        tool_name=name,
+        source={
+            "title": name, "site": name, "url": "", "date": date.today().isoformat(),
+            "source_tier": 1, "entity_matched": True, "freshness_status": "current",
+        },
+    )]
+
+
+def _run_langgraph_loop(
+    *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
+) -> dict:
+    """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
+    controller = EvidenceController()
+    stock_name = data.get_name_map().get(ts_code) or ""
+
+    def parse_review_json(content: str) -> dict:
+        cleaned = (content or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```json").removeprefix("```")
+            cleaned = cleaned.removesuffix("```").strip()
+        return json.loads(cleaned or "{}")
+
+    def prepare(state):
+        return {
+            "messages": list(messages), "analysis_text": "", "model_iterations": 0,
+            "research_rounds": 0, "evidence": [], "gaps": [],
+        }
+
+    def safety_scan(state):
+        emit({"type": "status", "message": "正在执行权威黑天鹅扫描"})
+        query = (
+            f"{stock_name} {ts_code.split('.')[0]} {ts_code} "
+            "重大公告 监管 立案 处罚 诉讼 停牌 业绩预警"
+        )
+        raw = data.web_search(
+            ts_code, category="general", name=stock_name, query=query,
+            freshness="oneYear", count=10,
+        )
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            parsed = {"error": "返回不可解析"}
+        success = not bool(parsed.get("error"))
+        evidence = [item for item in _tool_evidence("web_search", raw, ts_code)
+                    if int(item.get("source_tier") or 3) <= 2]
+        controller.record_safety_scan(success=success, evidence=evidence)
+        emit({
+            "type": "tool_result", "iteration": 0, "tool_call_id": "safety-scan",
+            "name": "authoritative_scan", "summary": trace_mod.summarize_web_search(raw),
+            "raw": raw,
+        })
+        return {
+            "safety_scan_status": controller.safety_scan_status,
+            "evidence": list(controller.evidence.values()),
+        }
+
+    def reason(state):
+        iteration = int(state.get("model_iterations", 0))
+        response = client.chat.completions.create(
+            model=model, messages=state.get("messages") or [], tools=TOOLS,
+            max_tokens=16384, temperature=0.4,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise AnalysisError(f"AI exceeded token limit at iteration {iteration}")
+        msg = choice.message
+        text = state.get("analysis_text") or ""
+        if msg.content:
+            text += msg.content
+            emit({"type": "assistant_text", "iteration": iteration, "content": msg.content})
+        return {
+            "messages": [*(state.get("messages") or []), msg],
+            "assistant_message": msg,
+            "pending_tools": list(msg.tool_calls or []),
+            "analysis_text": text,
+            "model_iterations": iteration + 1,
+        }
+
+    def execute_tools(state):
+        appended = list(state.get("messages") or [])
+        draft_kind = state.get("draft_kind") or ""
+        draft_data = dict(state.get("draft_data") or {})
+        for tool_call in state.get("pending_tools") or []:
+            name = tool_call.function.name
+            try:
+                tool_input = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                tool_input = {}
+            emit({
+                "type": "tool_call", "iteration": state.get("model_iterations", 1) - 1,
+                "tool_call_id": tool_call.id, "name": name, "args": tool_input,
+            })
+
+            if name == "submit_research_state":
+                controller.submit_assessment(
+                    thesis=str(tool_input.get("thesis") or ""),
+                    gaps=list(tool_input.get("gaps") or []),
+                    ready=bool(tool_input.get("ready")),
+                )
+                result = json.dumps({
+                    "accepted": True,
+                    "stop": controller.should_stop().stop,
+                    "finalization": controller.finalization_decision().allowed,
+                }, ensure_ascii=False)
+            elif name in {"record_verdict", "record_position_action"}:
+                action = tool_input.get("action") if name == "record_position_action" else None
+                blockers = list(controller.finalization_decision(action=action).blockers)
+                if name == "record_verdict" and tool_input.get("verdict") in BULLISH_VERDICTS:
+                    blockers.extend(
+                        f"{field} 必须是大于 0 的具体价格"
+                        for field in ("entry", "stop_loss", "target")
+                        if not isinstance(tool_input.get(field), (int, float)) or tool_input.get(field) <= 0
+                    )
+                if (name == "record_verdict" and tool_input.get("stock_type") == "成长股"
+                        and tool_input.get("verdict") in BEARISH_VERDICTS
+                        and tool_input.get("valuation_basis") in (None, "static_pe_only")):
+                    blockers.append("成长股偏空不得仅使用静态 PE")
+                try:
+                    from apex import watchlist as _wl_graph
+                    held = any(p.get("ts_code") == ts_code for p in _wl_graph.load().get("active_positions", []))
+                except Exception:
+                    held = False
+                if name == "record_verdict" and held:
+                    blockers.append("已持仓票必须提交 position_action")
+                if name == "record_position_action":
+                    current_price = None
+                    try:
+                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                    except Exception:
+                        pass
+                    pa_reasons, _ = _validate_position_action(
+                        tool_input, ts_code, [], current_price=current_price,
+                    )
+                    blockers.extend(pa_reasons)
+                if blockers:
+                    result = json.dumps({"error": "；".join(blockers)}, ensure_ascii=False)
+                else:
+                    draft_kind = "verdict" if name == "record_verdict" else "position_action"
+                    draft_data = tool_input
+                    result = "candidate recorded; pending independent review"
+            else:
+                stop = controller.should_stop()
+                if stop.stop:
+                    result = json.dumps({"error": f"动态预算已停止: {stop.reason}"}, ensure_ascii=False)
+                else:
+                    try:
+                        result = _dispatch_tool(name, tool_input)
+                        parsed = json.loads(result) if isinstance(result, str) else result
+                        success = not (isinstance(parsed, dict) and parsed.get("error"))
+                        controller.record_external_call(
+                            name, success=success,
+                            error=str(parsed.get("error") or "") if isinstance(parsed, dict) else "",
+                        )
+                        controller.add_evidence(_tool_evidence(name, result, ts_code))
+                    except Exception as exc:
+                        controller.record_external_call(name, success=False, error=str(exc))
+                        result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                emit({
+                    "type": "tool_result", "iteration": state.get("model_iterations", 1) - 1,
+                    "tool_call_id": tool_call.id, "name": name,
+                    "summary": trace_mod.summarize_tool_result(name, result), "raw": result,
+                })
+            appended.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+        return {
+            "messages": appended, "pending_tools": [],
+            "draft_kind": draft_kind, "draft_data": draft_data,
+            "evidence": list(controller.evidence.values()),
+            "gaps": list(controller.gaps), "research_rounds": controller.research_rounds,
+        }
+
+    def assess(state):
+        if state.get("draft_kind") and state.get("draft_data"):
+            return {"route": "draft"}
+        stop = controller.should_stop()
+        if stop.stop or int(state.get("model_iterations", 0)) >= max_iter:
+            blockers = controller.finalization_decision().blockers
+            return {"route": "abstain", "unknowns": blockers or [stop.reason or "模型轮次耗尽"]}
+        return {"route": "research"}
+
+    def draft(state):
+        return {}
+
+    def review(state):
+        compact = {
+            "candidate_kind": state.get("draft_kind"),
+            "candidate": state.get("draft_data"),
+            "evidence": state.get("evidence") or [],
+            "gaps": state.get("gaps") or [],
+            "safety_scan_status": state.get("safety_scan_status"),
+        }
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": (
+                        "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
+                        "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, issues: string[]}。"
+                    )},
+                    {"role": "user", "content": json.dumps(compact, ensure_ascii=False)},
+                ],
+                max_tokens=2048, temperature=0,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            payload = parse_review_json(response.choices[0].message.content or "{}")
+            outcome = str(payload.get("outcome") or "abstain")
+            issues = list(payload.get("issues") or [])
+        except Exception as exc:
+            outcome, issues = "abstain", [f"独立复核失败: {exc}"]
+        outcome = controller.record_review(outcome, issues)
+        emit({"type": "review", "outcome": outcome, "issues": issues})
+        update = {"review_outcome": outcome, "review_issues": issues}
+        if outcome == "rework":
+            update.update({
+                "draft_kind": "", "draft_data": {},
+                "messages": [*(state.get("messages") or []), {
+                    "role": "user", "content": "独立复核要求定向补证：" + "；".join(issues),
+                }],
+            })
+        return update
+
+    def finalize(state):
+        kind = state.get("draft_kind")
+        data_value = state.get("draft_data") or {}
+        emit({
+            "type": "verdict_recorded" if kind == "verdict" else "position_action_recorded",
+            "iteration": state.get("model_iterations", 0),
+            "verdict": data_value.get("verdict"), "confidence": data_value.get("confidence"),
+            "action": data_value.get("action"),
+        })
+        return {"analysis_status": "completed"}
+
+    def abstain(state):
+        unknowns = list(state.get("unknowns") or controller.finalization_decision().blockers)
+        emit({"type": "analysis_abstained", "unknowns": unknowns})
+        return {
+            "analysis_status": "insufficient_evidence", "unknowns": unknowns,
+            "attempted_tools": list(controller.attempted_tools),
+            "failures": list(controller.failures),
+            "evidence": list(controller.evidence.values()),
+        }
+
+    graph = build_analysis_graph(GraphHandlers(
+        prepare=prepare, safety_scan=safety_scan, reason=reason,
+        execute_tools=execute_tools, assess=assess, draft=draft,
+        review=review, finalize=finalize, abstain=abstain,
+    ))
+    return graph.invoke({}, {"recursion_limit": max(30, max_iter * 5)})
+
+
 def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     """
     Run full agent analysis for ts_code via DeepSeek API.
@@ -1615,10 +1931,12 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   以上 MX 工具是东财官方数据源，返回结构化数据，与博查 web_search 互补：\n"
                 "   查财经数据/新闻用 MX，查监管/政策用 web_search。\n"
                 "\n"
-                "2) 博查 4 类强制（缺一类 record_verdict 被拒）：earnings / shareholders / regulatory / money_flow。\n"
-                "   按需加 corporate_actions / research / industry / general。若召回为空，evidence 里明确写「该类别无召回」，**不要跳过调用**。\n"
+                "2) 联网搜索只用于查漏补缺。系统已自动执行权威黑天鹅扫描；你应先分析结构化数据，\n"
+                "   再按证据缺口自主选择 web_search / mx_news_search / mx_data_query。不要为了覆盖类别而搜索。\n"
+                "   搜索报错、空结果、串票和 Tier 3 线索都不能当成决策证据；重大事实需 Tier 1 或交叉验证。\n"
                 "   **股票类型提示**：蓝筹/白马和成长股在 earnings 类别中应额外关注营收/利润趋势的持续性；\n"
                 "   题材/游资股在 money_flow 类别中应重点关注游资动向和席位分析。\n"
+                "   每轮分析或补证后调用 submit_research_state，明确关键缺口与是否收敛。\n"
                 "\n"
                 "3) 三段式辩论（写在 message content 里）：\n"
                 "   ### 一、多头论点（≥3 条，格式：数据点 → 推论）\n"
@@ -1689,299 +2007,47 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         },
     ]
 
-    verdict_data: dict = {}
-    position_action_data: dict = {}  # v1.1.0: 持仓路径捕获（与 verdict_data 互斥，对称守卫保证）
-    analysis_text = ""
-    iteration = 0
-    searches_performed: list[str] = []  # 累计调用过的 web_search category
+    graph_result = _run_langgraph_loop(
+        ts_code=ts_code, client=client, model=model, messages=messages,
+        max_iter=max_iter, emit=_emit,
+    )
+    analysis_text = str(graph_result.get("analysis_text") or "")
+    evidence_items = list(graph_result.get("evidence") or [])
 
-    while True:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=16384,
-            temperature=0.4,
-            extra_body={"thinking": {"type": "disabled"}},
+    if graph_result.get("analysis_status") == "insufficient_evidence":
+        from apex.evidence_control import build_insufficient_entry
+        now_cn = datetime.now(_TZ_CN)
+        entry = build_insufficient_entry(
+            ts_code=ts_code, name=data.get_name_map().get(ts_code),
+            unknowns=list(graph_result.get("unknowns") or ["关键证据不足"]),
+            evidence=evidence_items,
+            attempted_tools=list(graph_result.get("attempted_tools") or []),
+            failures=list(graph_result.get("failures") or []),
+            research_summary="动态补证与独立复核后，关键证据仍不足，暂不判断。",
+            analyzed_at=now_cn.isoformat(timespec="seconds"),
+            analysis_text=analysis_text,
         )
-
-        choice = response.choices[0]
-        msg = choice.message
-
-        # Collect text content + emit as event
-        if msg.content:
-            analysis_text += msg.content
-            _emit({
-                "type": "assistant_text",
-                "iteration": iteration,
-                "content": msg.content,
-            })
-
-        # Check termination
-        if choice.finish_reason != "tool_calls":
-            if choice.finish_reason == "length":
-                raise AnalysisError(f"AI exceeded token limit at iteration {iteration}")
-            break
-
-        if iteration >= max_iter:
-            raise AnalysisError(f"Exceeded max tool iterations ({max_iter})")
-
-        # Append assistant message (with tool_calls) to history
-        messages.append(msg)
-
-        # Execute all tool calls
-        for tool_call in (msg.tool_calls or []):
-            name = tool_call.function.name
+        entry["market_context"] = market_ctx
+        entry["prompt_version"] = "3.0.0-langgraph"
+        if save:
+            journal.write_entry(entry)
             try:
-                tool_input = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                tool_input = {}
+                trace_mod.write_trace(ts_code, entry["analyzed_at"], events)
+            except Exception as exc:
+                print(f"⚠ trace 写入失败（不影响 journal）: {exc}")
+        return entry
 
-            _emit({
-                "type": "tool_call",
-                "iteration": iteration,
-                "tool_call_id": tool_call.id,
-                "name": name,
-                "args": tool_input,
-            })
-
-            if name == "record_verdict":
-                # 校验 1: 强制博查类别必须全部调用过
-                missing = [
-                    c for c in data.MANDATORY_SEARCH_CATEGORIES
-                    if c not in searches_performed
-                ]
-                # 校验 2: 看多类(看多/偏多/观望偏多)必须填具体价位,
-                # entry/stop_loss/target 任一 ≤ 0 视为漏填(0 是非看多方向的占位)
-                bad_prices = []
-                if not missing and tool_input.get("verdict") in BULLISH_VERDICTS:
-                    bad_prices = [
-                        f for f in ("entry", "stop_loss", "target")
-                        if not (
-                            isinstance(tool_input.get(f), (int, float))
-                            and tool_input.get(f) > 0
-                        )
-                    ]
-
-                # 校验 3: 成长股偏空不得仅凭静态 PE（防误杀高成长标的）
-                # 成长股 + 偏空 + valuation_basis 为 static_pe_only 或缺填 -> 拒绝，逼 AI 补前瞻估值后重调
-                static_pe_bearish = False
-                if (not missing and not bad_prices
-                        and tool_input.get("stock_type") == "成长股"
-                        and tool_input.get("verdict") in BEARISH_VERDICTS
-                        and tool_input.get("valuation_basis") in (None, "static_pe_only")):
-                    static_pe_bearish = True
-
-                # 校验 4 (v1.1.0 对称守卫): 已持仓票必须走 record_position_action，禁 record_verdict
-                held_conflict = False
-                try:
-                    from apex import watchlist as _wl_guard
-                    _held_now = next(
-                        (p for p in _wl_guard.load().get("active_positions", [])
-                         if p.get("ts_code") == ts_code), None
-                    )
-                    held_conflict = _held_now is not None
-                except Exception:
-                    held_conflict = False  # 读失败不阻断（advisory，宁可放行不误杀）
-
-                if missing or bad_prices or static_pe_bearish or held_conflict:
-                    # 拒绝记录结论, 把错误喂回 AI 逼其修正后重调 record_verdict
-                    reasons = []
-                    if missing:
-                        reasons.append(
-                            f"强制博查类别未全部调用, 缺: {missing}。"
-                            f"请先调用 web_search(category=<上述类别>) 补齐"
-                        )
-                    if bad_prices:
-                        reasons.append(
-                            f"方向为「{tool_input.get('verdict')}」属看多类, "
-                            f"价位 {bad_prices} 必须填大于 0 的具体数字, 不能填 0"
-                        )
-                    if static_pe_bearish:
-                        reasons.append(
-                            f"标的类型为「成长股」且方向偏空，但 valuation_basis="
-                            f"{tool_input.get('valuation_basis')!r}（仅静态 PE_TTM 或未填）。"
-                            "成长股估值的核心是「未来增长能否消化当前估值」，静态 PE 不得单独作为偏空主要依据。"
-                            "请用 mx_data_query 查一致预期/业绩预告，算 Forward PE / PEG 后重判："
-                            "若「利润增长明显放缓 + Forward PE 仍极高 + PEG 明显失衡」三者同时成立，"
-                            "改填 valuation_basis=forward_valuation 并在 evidence 引用前瞻数字；"
-                            "若估值非主要空头依据，改填 valuation_basis=non_valuation。"
-                        )
-                    if held_conflict:
-                        reasons.append(
-                            f"你已持有 {ts_code}，重新分析已持仓票必须调 record_position_action"
-                            "（给 hold/add/trim/exit 加减仓建议），record_verdict 会被拒绝。"
-                        )
-                    result = json.dumps({
-                        "error": "；".join(reasons) + "。请修正后重新调用 record_verdict。",
-                        "missing_categories": missing,
-                        "bad_prices": bad_prices,
-                        "static_pe_bearish": static_pe_bearish,
-                        "held_conflict": held_conflict,
-                        "performed": searches_performed,
-                    }, ensure_ascii=False)
-                    _emit({
-                        "type": "verdict_rejected",
-                        "iteration": iteration,
-                        "tool_call_id": tool_call.id,
-                        "missing": missing,
-                        "bad_prices": bad_prices,
-                        "static_pe_bearish": static_pe_bearish,
-                        "held_conflict": held_conflict,
-                        "performed": list(searches_performed),
-                    })
-                else:
-                    verdict_data = tool_input
-                    result = "verdict recorded"
-                    _emit({
-                        "type": "verdict_recorded",
-                        "iteration": iteration,
-                        "tool_call_id": tool_call.id,
-                        "verdict": verdict_data.get("verdict"),
-                        "confidence": verdict_data.get("confidence"),
-                    })
-            elif name == "record_position_action":
-                # v1.1.0 持仓路径：守卫抽离到 _validate_position_action 供单测（T6）
-                # ladder 路径模拟需现价锚定：实时价优先、日线收盘 fallback，都失败则降级（跳过路径检查）
-                _cp_pa = None
-                try:
-                    _cp_pa = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
-                except Exception:
-                    pass
-                if _cp_pa is None:
-                    try:
-                        _cp_pa = (data.get_latest_price([ts_code]) or {}).get(ts_code)
-                    except Exception:
-                        pass
-                pa_reasons, _sizing_warn = _validate_position_action(
-                    tool_input, ts_code, searches_performed, current_price=_cp_pa
-                )
-                if pa_reasons:
-                    result = json.dumps({
-                        "error": "；".join(pa_reasons) + "。请修正后重新调用 record_position_action。",
-                        "performed": list(searches_performed),
-                    }, ensure_ascii=False)
-                    _emit({
-                        "type": "position_action_rejected",
-                        "iteration": iteration,
-                        "tool_call_id": tool_call.id,
-                        "reasons": pa_reasons,
-                    })
-                else:
-                    position_action_data = tool_input
-                    result = ("position_action recorded" + (f" {_sizing_warn}" if _sizing_warn else "")).strip()
-                    _emit({
-                        "type": "position_action_recorded",
-                        "iteration": iteration,
-                        "tool_call_id": tool_call.id,
-                        "action": position_action_data.get("action"),
-                        "sizing_warn": _sizing_warn or None,
-                    })
-            else:
-                if name == "web_search":
-                    cat = tool_input.get("category", "general")
-                    if cat not in searches_performed:
-                        searches_performed.append(cat)
-                try:
-                    result = _dispatch_tool(name, tool_input)
-                except Exception as e:
-                    result = json.dumps({"error": str(e)})
-                _emit({
-                    "type": "tool_result",
-                    "iteration": iteration,
-                    "tool_call_id": tool_call.id,
-                    "name": name,
-                    "summary": trace_mod.summarize_tool_result(name, result),
-                    "raw": result,
-                })
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
-
-        iteration += 1
-
-        # Once a conclusion tool captured and no other pending tools, do one final text round
-        if verdict_data or position_action_data:
-            non_verdict = [tc for tc in (msg.tool_calls or [])
-                           if tc.function.name not in ("record_verdict", "record_position_action")]
-            if not non_verdict:
-                final = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=2048,
-                    temperature=0.4,
-                    extra_body={"thinking": {"type": "disabled"}},
-                )
-                final_text = final.choices[0].message.content
-                if final_text:
-                    analysis_text += "\n" + final_text
-                    _emit({
-                        "type": "assistant_text",
-                        "iteration": iteration,
-                        "content": final_text,
-                        "final": True,
-                    })
-                break
-
-    if not verdict_data and not position_action_data:
-        # 兜底：AI 忘了调任一记录工具，给最后一次机会
-        messages.append({
-            "role": "user",
-            "content": (
-                "⚠️ 系统提醒：你还没有调用 record_verdict 函数来提交最终判断结论。\n"
-                "纯文本分析不会被记录。请立即调用（二选一，不要再调其他工具）：\n"
-                "- 未持仓票：record_verdict(verdict=..., confidence=..., evidence=[...])\n"
-                "- 已持仓票：record_position_action(action=..., rationale=..., scale_plan=[...])"
-            ),
-        })
-        retry = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=4096,
-            temperature=0.4,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-        retry_choice = retry.choices[0]
-        retry_msg = retry_choice.message
-        if retry_choice.finish_reason == "tool_calls":
-            for tool_call in (retry_msg.tool_calls or []):
-                _fname = tool_call.function.name
-                if _fname in ("record_verdict", "record_position_action"):
-                    try:
-                        _captured = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        _captured = {}
-                    if _fname == "record_verdict":
-                        verdict_data = _captured
-                        _emit({
-                            "type": "verdict_recorded",
-                            "iteration": iteration,
-                            "tool_call_id": tool_call.id,
-                            "verdict": verdict_data.get("verdict"),
-                            "confidence": verdict_data.get("confidence"),
-                        })
-                    else:
-                        position_action_data = _captured
-                        _emit({
-                            "type": "position_action_recorded",
-                            "iteration": iteration,
-                            "tool_call_id": tool_call.id,
-                            "action": position_action_data.get("action"),
-                            "sizing_warn": None,
-                        })
-                    break
-        if not verdict_data and not position_action_data:
-            raise AnalysisError("AI did not call record_verdict or record_position_action — no verdict captured")
+    draft_kind = graph_result.get("draft_kind")
+    draft_data = dict(graph_result.get("draft_data") or {})
+    verdict_data = draft_data if draft_kind == "verdict" else {}
+    position_action_data = draft_data if draft_kind == "position_action" else {}
+    searches_performed: list[str] = []
 
     # ── v1.1.0 双路径分支：持仓路径直接收尾，不走 calibration/24h 限幅 ──
     if position_action_data:
         return _finalize_position_action(
             ts_code, position_action_data, analysis_text, events,
-            playstyle_feats, market_ctx, save,
+            playstyle_feats, market_ctx, save, evidence_items=evidence_items,
         )
 
     raw_verdict = verdict_data["verdict"]
@@ -2036,6 +2102,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "name": stock_name,
         "date": now_cn.date().isoformat(),
         "analyzed_at": now_cn.isoformat(timespec="seconds"),
+        "analysis_status": "completed",
         "verdict": limited_verdict,
         "confidence": limited_confidence,
         "calibrated_confidence": cal_score,
@@ -2049,12 +2116,15 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "position_size_pct": verdict_data.get("position_size_pct"),
         },
         "features": verdict_data.get("features", {}),
-        "evidence": verdict_data.get("evidence", []),
+        "evidence": evidence_items,
+        "evidence_text": verdict_data.get("evidence", []),
+        "unknowns": [],
+        "research_summary": "结构化数据与按需补证已收敛，并通过独立复核。",
         "searches_performed": searches_performed,
         "market_context": market_ctx,
         "analysis_text": analysis_text.strip(),
         "repeat_analysis": repeat_info,
-        "prompt_version": "2.6.0",
+        "prompt_version": "3.0.0-langgraph",
         "source": "standalone",
         "setup_tag": verdict_data.get("setup_tag"),
         "stock_type": verdict_data.get("stock_type"),
@@ -2271,17 +2341,7 @@ def _validate_position_action(
     elif action not in ("hold", "exit"):
         reasons.append(f"action 必须是 hold/add/trim/exit，got {action!r}。")
 
-    # 守卫 3 (OV#1): trim/exit 强制 regulatory+shareholders+money_flow 三类实质风险搜索
-    _mandatory_pa = ["regulatory", "shareholders", "money_flow"]
-    if action in ("trim", "exit") and _held_pa is not None:
-        _missing_pa = [c for c in _mandatory_pa if c not in searches_performed]
-        if _missing_pa:
-            reasons.append(
-                f"action={action} 涉及实质风险决策，强制搜索类别未全部调用，缺: {_missing_pa}。"
-                "请先 web_search(category=<上述类别>) 补齐。"
-            )
-
-    # 守卫 4 (OV#7): 4h 反 churn -- 距上次 position_action <4h 且无 new_info -> 拒
+    # 守卫 3 (OV#7): 4h 反 churn -- 距上次 position_action <4h 且无 new_info -> 拒
     if _held_pa is not None and not reasons:
         try:
             _pas = journal.load_position_actions(ts_code)
@@ -2363,6 +2423,7 @@ def _finalize_position_action(
     playstyle_feats: dict,
     market_ctx: dict,
     save: bool,
+    evidence_items: Optional[list[dict]] = None,
 ) -> dict:
     """v1.1.0 持仓路径收尾：写 position_action journal entry + 刷新 active_positions.plan。
 
@@ -2393,6 +2454,7 @@ def _finalize_position_action(
         "name": stock_name,
         "date": now_cn.date().isoformat(),
         "analyzed_at": now_cn.isoformat(timespec="seconds"),
+        "analysis_status": "completed",
         "source": POSITION_ACTION_SOURCE,
         "position_action": {
             "action": position_action_data.get("action"),
@@ -2405,14 +2467,16 @@ def _finalize_position_action(
             "rationale": position_action_data.get("rationale"),
         },
         "analysis_text": analysis_text.strip(),
-        "prompt_version": "2.6.0",
+        "prompt_version": "3.0.0-langgraph",
         "market_context": market_ctx,
         # P1: verdict/price_advice/features/evidence/confidence 全 None（不污染 calibration/backtest）
         "verdict": None,
         "confidence": None,
         "price_advice": None,
         "features": None,
-        "evidence": None,
+        "evidence": list(evidence_items or []),
+        "unknowns": [],
+        "research_summary": "持仓建议已完成动态补证并通过独立复核。",
         # OV#3: playstyle 例外（股票属性，非方向 call 字段）
         "playstyle": playstyle_value,
         "playstyle_fit": playstyle_fit,

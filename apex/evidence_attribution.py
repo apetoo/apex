@@ -165,6 +165,8 @@ def _path() -> Path:
 
 def _classify(text: str) -> list[str]:
     """返回该 evidence 字符串命中的所有 pattern tag。"""
+    if isinstance(text, dict):
+        text = " ".join(str(text.get(key) or "") for key in ("fact", "inference"))
     if not isinstance(text, str):
         return []
     return [tag for tag, _, pat in _PATTERNS if pat.search(text)]

@@ -1286,23 +1286,6 @@ def get_intraday_snapshot(ts_code: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-# 博查结果信任度分级：数字越小越高信任
-_SITE_TRUST: dict[str, int] = {
-    # 官方公告源
-    "cninfo.com.cn": 1, "sse.com.cn": 1, "szse.cn": 1, "bse.cn": 1,
-    # 主流财经平台
-    "eastmoney.com": 2, "10jqka.com.cn": 2, "xueqiu.com": 2,
-    "sina.com.cn": 3, "qq.com": 3, "163.com": 3,
-}
-
-def _site_trust(site: str) -> int:
-    site = (site or "").lower()
-    for k, v in _SITE_TRUST.items():
-        if k in site:
-            return v
-    return 9  # 未知来源最低优先级
-
-
 # 博查搜索类别规范（与 analyze.py 工具 schema 保持一致）
 _SEARCH_CATEGORIES: dict[str, dict] = {
     "earnings": {
@@ -1338,9 +1321,6 @@ _SEARCH_CATEGORIES: dict[str, dict] = {
         "freshness": "oneMonth",
     },
 }
-
-MANDATORY_SEARCH_CATEGORIES = ["earnings", "shareholders", "regulatory", "money_flow"]
-
 
 def web_search(
     ts_code: str,

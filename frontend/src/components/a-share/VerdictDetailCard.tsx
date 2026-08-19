@@ -25,6 +25,9 @@ export function fmtPrice(v: unknown): string {
 
 export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown> }) {
   const [addOpen, setAddOpen] = useState(false);
+  if (verdict.analysis_status === "insufficient_evidence") {
+    return <InsufficientEvidenceCard verdict={verdict} />;
+  }
   // v1.1.0: position_action 走专属持仓建议卡（当前决策 + 条件触发计划），不渲染 verdict 三宫格。
   // useState 提前无条件调用，避免 held/unheld 切换时 hooks 数量变化（同组件实例跨分支）。
   if (verdict.source === "position_action") {
@@ -120,7 +123,7 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
               {evidence.map((ev, i) => (
                 <li key={i} className="flex items-start gap-2 text-sm">
                   <span className="num mt-0.5 text-[10px] text-flat">{i + 1}.</span>
-                  <span className="text-text-primary">{String(ev)}</span>
+                  <EvidenceValue value={ev} />
                 </li>
               ))}
             </ul>
@@ -152,6 +155,60 @@ export function VerdictDetailCard({ verdict }: { verdict: Record<string, unknown
         )}
 
         <AddCandidateDialog open={addOpen} onClose={() => setAddOpen(false)} verdict={verdict} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function EvidenceValue({ value }: { value: unknown }) {
+  if (!value || typeof value !== "object") {
+    return <span className="text-text-primary">{String(value)}</span>;
+  }
+  const evidence = value as Record<string, unknown>;
+  const fact = String(evidence.fact ?? "");
+  const inference = String(evidence.inference ?? "");
+  const sourceName = String(evidence.source_name ?? "来源");
+  const sourceUrl = typeof evidence.source_url === "string" ? evidence.source_url : "";
+  return (
+    <span className="min-w-0 text-text-primary">
+      <span>{fact}{inference ? ` → ${inference}` : ""}</span>
+      <span className="ml-2 inline-flex items-center gap-1 text-[10px] text-flat">
+        <span>Tier {String(evidence.source_tier ?? "—")}</span>
+        {sourceUrl ? (
+          <a href={sourceUrl} target="_blank" rel="noreferrer" className="hover:text-text-primary hover:underline">
+            {sourceName}
+          </a>
+        ) : (
+          <span>{sourceName}</span>
+        )}
+      </span>
+    </span>
+  );
+}
+
+function InsufficientEvidenceCard({ verdict }: { verdict: Record<string, unknown> }) {
+  const unknowns = Array.isArray(verdict.unknowns) ? verdict.unknowns : [];
+  const summary = typeof verdict.research_summary === "string" ? verdict.research_summary : "";
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-2 text-amber-600">
+          <ShieldAlert className="h-4 w-4" />
+          <CardTitle>证据不足，暂不判断</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3 pt-0">
+        {summary && <p className="text-sm text-text-secondary">{summary}</p>}
+        {unknowns.length > 0 && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">关键未知项</div>
+            <ul className="space-y-1 text-sm text-text-primary">
+              {unknowns.map((unknown, index) => (
+                <li key={index}>• {String(unknown)}</li>
+              ))}
+            </ul>
+          </div>
+        )}
       </CardContent>
     </Card>
   );

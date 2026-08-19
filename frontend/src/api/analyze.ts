@@ -61,12 +61,15 @@ export async function getJournal(tsCode: string): Promise<unknown[]> {
  */
 export interface LatestJournal {
   ts_code: string;
+  analysis_status?: "completed" | "insufficient_evidence";
   analyzed_at?: string;
   source?: string;
   verdict?: string;
   confidence?: number;
   calibrated_confidence?: number;
-  evidence?: string[];
+  evidence?: Array<string | EvidenceItem>;
+  unknowns?: string[];
+  research_summary?: string;
   price_advice?: {
     entry?: number | null;
     entry_low?: number | null;
@@ -83,6 +86,20 @@ export interface LatestJournal {
     rationale?: string;
     scale_plan?: unknown[];
   };
+}
+
+export interface EvidenceItem {
+  id: string;
+  fact: string;
+  inference?: string;
+  evidence_type?: string;
+  tool_name?: string;
+  source_name?: string;
+  source_url?: string;
+  published_at?: string | null;
+  source_tier?: number;
+  entity_matched?: boolean;
+  freshness_status?: string;
 }
 
 export async function getLatestJournal(

@@ -61,6 +61,7 @@ export function LatestAnalysisBadge({
   if (!data) return null; // loading / 无记录 / 错误 -> 零占位
 
   const isPa = data.source === "position_action";
+  const insufficient = data.analysis_status === "insufficient_evidence";
   const days = daysSince(data.analyzed_at);
   const stale = days != null && days > STALE_DAYS;
   const dateLabel =
@@ -81,7 +82,9 @@ export function LatestAnalysisBadge({
         title="查看最近一次 AI 分析"
       >
         <Sparkles className="h-3 w-3 shrink-0 text-up" />
-        {isPa ? (
+        {insufficient ? (
+          <span className="font-medium text-flat">证据不足</span>
+        ) : isPa ? (
           <PaBadgeLine entry={data} stopBefore={stopBefore} />
         ) : (
           <VerdictBadgeLine entry={data} />
@@ -95,7 +98,9 @@ export function LatestAnalysisBadge({
           className="cursor-pointer rounded-md border border-border bg-bg-card p-3 text-left shadow-lg"
           onClick={() => setDrawerOpen(true)}
         >
-          {isPa ? (
+          {insufficient ? (
+            <InsufficientPopover entry={data} />
+          ) : isPa ? (
             <PaPopover entry={data} stopBefore={stopBefore} />
           ) : (
             <VerdictPopover entry={data} />
@@ -213,12 +218,36 @@ function VerdictPopover({ entry }: { entry: LatestJournal }) {
           {evidence.map((ev, i) => (
             <li key={i} className="flex items-start gap-1">
               <span className="num text-flat">{i + 1}.</span>
-              <span className="line-clamp-2">{ev}</span>
+              <span className="line-clamp-2">{evidenceText(ev)}</span>
             </li>
           ))}
         </ul>
       )}
       <p className="border-t border-border pt-1.5 text-flat">点击查看完整分析 →</p>
+    </div>
+  );
+}
+
+function evidenceText(ev: NonNullable<LatestJournal["evidence"]>[number]): string {
+  if (typeof ev === "string") return ev;
+  return ev.inference ? `${ev.fact} → ${ev.inference}` : ev.fact;
+}
+
+function InsufficientPopover({ entry }: { entry: LatestJournal }) {
+  return (
+    <div className="space-y-2 text-[11px]">
+      <p className="font-semibold text-flat">证据不足，暂不判断</p>
+      {entry.research_summary && (
+        <p className="text-text-secondary">{entry.research_summary}</p>
+      )}
+      {(entry.unknowns ?? []).length > 0 && (
+        <ul className="space-y-1 border-t border-border pt-2 text-text-primary">
+          {(entry.unknowns ?? []).slice(0, 2).map((unknown, index) => (
+            <li key={index}>• {unknown}</li>
+          ))}
+        </ul>
+      )}
+      <p className="border-t border-border pt-1.5 text-flat">点击查看补证详情 →</p>
     </div>
   );
 }
