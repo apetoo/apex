@@ -115,6 +115,26 @@ def test_critical_empty_verdicts_edge(isolated_paths):
     assert journal.load_verdicts("999999.SZ") == []  # 完全无文件
 
 
+def test_insufficient_evidence_never_enters_verdict_or_position_action_loaders(isolated_paths):
+    journal.write_entry({
+        "ts_code": "002050.SZ", "name": "三花智控",
+        "date": "2026-08-19", "analyzed_at": "2026-08-19T10:00:00+08:00",
+        "analysis_status": "insufficient_evidence", "source": "standalone",
+        "verdict": None, "confidence": None, "price_advice": None,
+        "position_action": None, "features": None, "evidence": [],
+        "unknowns": ["重大事件无法核实"], "research_summary": "暂不判断",
+    })
+
+    assert journal.load_verdicts("002050.SZ") == []
+    assert journal.load_position_actions("002050.SZ") == []
+    assert journal.load_entries("002050.SZ")[0]["analysis_status"] == "insufficient_evidence"
+
+
+def test_legacy_verdict_defaults_to_completed_status(isolated_paths):
+    _write_verdict("002050.SZ", "2026-07-01T10:00:00+08:00")
+    assert journal.load_entries("002050.SZ")[0]["analysis_status"] == "completed"
+
+
 # ── 历史展示端点含 position_action（B1 回归） ──────────────────────────────────
 
 def test_list_journal_endpoint_includes_position_action(isolated_paths):

@@ -181,6 +181,9 @@ class PositionPlanSchema(TypedDict, total=False):
 
 class JournalEntry(TypedDict, total=False):
     ts_code: str
+    analysis_status: Literal["completed", "insufficient_evidence"]
+    unknowns: list[str]
+    research_summary: str
     date: str
     verdict: str
     confidence: int

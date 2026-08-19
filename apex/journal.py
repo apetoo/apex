@@ -47,6 +47,10 @@ def _fill_playstyle_fields(entry: dict) -> dict:
     """为 pre-v9 历史 entry 补 Playstyle Engine v1 字段为 None（读时 lazy fill）。"""
     for k in _PLAYSTYLE_FIELDS:
         entry.setdefault(k, None)
+    if "analysis_status" not in entry and (
+        entry.get("verdict") is not None or entry.get("source") == POSITION_ACTION_SOURCE
+    ):
+        entry["analysis_status"] = "completed"
     return entry
 
 
@@ -108,7 +112,12 @@ def load_verdicts(ts_code: Optional[str] = None) -> list[dict]:
     （None verdict 不命中 BULLISH/BEARISH、_verdict_index 返回 -1、price_advice 缺失）。
     **历史展示（/journal、/analyze 历史列表）用 load_entries（含 position_action），不用本函数。**
     """
-    return [e for e in load_entries(ts_code) if e.get("source") != POSITION_ACTION_SOURCE]
+    return [
+        e for e in load_entries(ts_code)
+        if e.get("source") != POSITION_ACTION_SOURCE
+        and e.get("analysis_status", "completed") == "completed"
+        and e.get("verdict") is not None
+    ]
 
 
 def load_position_actions(ts_code: Optional[str] = None) -> list[dict]:
@@ -116,7 +125,12 @@ def load_position_actions(ts_code: Optional[str] = None) -> list[dict]:
 
     供 position_action 路径反查（4h 反 churn 基线 / PositionCard 展示 / B3 sim 消费）。
     """
-    return [e for e in load_entries(ts_code) if e.get("source") == POSITION_ACTION_SOURCE]
+    return [
+        e for e in load_entries(ts_code)
+        if e.get("source") == POSITION_ACTION_SOURCE
+        and e.get("analysis_status", "completed") == "completed"
+        and e.get("position_action") is not None
+    ]
 
 
 def load_latest_verdict(ts_code: str) -> Optional[dict]:
