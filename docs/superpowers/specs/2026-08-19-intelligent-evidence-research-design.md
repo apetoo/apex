@@ -12,7 +12,7 @@ The graph is:
 
 `prepare -> safety_scan -> reason -> tools -> assess -> draft -> review`
 
-Conditional routes from `assess` continue research, draft a conclusion, or abstain. Review may pass, request one targeted rework, or abstain. The legacy loop remains available behind configuration during migration.
+Conditional routes from `assess` continue research, draft a conclusion, or abstain. Review may pass, request one targeted rework, or abstain. The legacy loop is removed; no fallback switch or dual runtime path remains.
 
 The graph state contains messages, evidence, research gaps, authoritative scan status, budget counters, draft output, review outcome, and final status. The initial implementation uses process-local state; journal and trace remain the durable record.
 

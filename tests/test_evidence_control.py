@@ -48,6 +48,31 @@ def test_clean_authoritative_scan_and_no_critical_gaps_can_finalize():
     assert ctl.finalization_decision().allowed is True
 
 
+def test_tier_two_material_fact_requires_independent_corroboration():
+    ctl = EvidenceController()
+    ctl.record_safety_scan(success=True, evidence=[_ev("official_scan", tier=1)])
+    tier_two = _ev("media_claim", tier=2)
+    tier_two.update({
+        "evidence_type": "regulatory",
+        "source_name": "财经媒体甲",
+        "source_url": "https://www.eastmoney.com/a",
+    })
+    ctl.add_evidence([tier_two])
+    ctl.submit_assessment(thesis="偏空", gaps=[], ready=True)
+
+    assert ctl.finalization_decision().allowed is False
+    assert any("Tier 2 重大事实缺少交叉验证" in item for item in ctl.finalization_decision().blockers)
+
+    corroboration = _ev("media_claim_2", tier=2)
+    corroboration.update({
+        "evidence_type": "regulatory",
+        "source_name": "财经媒体乙",
+        "source_url": "https://www.stcn.com/b",
+    })
+    ctl.add_evidence([corroboration])
+    assert ctl.finalization_decision().allowed is True
+
+
 def test_tier_three_lead_cannot_resolve_critical_gap():
     ctl = EvidenceController()
     ctl.record_safety_scan(success=True, evidence=[])

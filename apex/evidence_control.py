@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,25 @@ class EvidenceController:
                 blockers.append(str(gap.get("description") or gap.get("id") or "关键证据缺口"))
         if not any(int(item.get("source_tier") or 3) <= 2 for item in self.evidence.values()):
             blockers.append("缺少可用于决策的 Tier 1/2 证据")
+        material_types = {"material_event", "earnings", "shareholders", "regulatory", "corporate_actions"}
+        by_type: dict[str, list[dict[str, Any]]] = {}
+        for item in self.evidence.values():
+            evidence_type = str(item.get("evidence_type") or "")
+            if evidence_type in material_types:
+                by_type.setdefault(evidence_type, []).append(item)
+        for evidence_type, items in by_type.items():
+            if not any(int(item.get("source_tier") or 3) == 2 for item in items):
+                continue
+            has_tier_one = any(int(item.get("source_tier") or 3) == 1 for item in items)
+            independent_sources = set()
+            for item in items:
+                if int(item.get("source_tier") or 3) != 2:
+                    continue
+                url = str(item.get("source_url") or "")
+                hostname = (urlsplit(url).hostname or "").lower().removeprefix("www.")
+                independent_sources.add(hostname or str(item.get("source_name") or ""))
+            if not has_tier_one and len(independent_sources - {""}) < 2:
+                blockers.append(f"{evidence_type}: Tier 2 重大事实缺少交叉验证")
         if not self.ready:
             blockers.append("Agent 尚未声明证据收敛")
         if self._rework_evidence_baseline is not None:

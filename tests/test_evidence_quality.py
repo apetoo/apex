@@ -76,6 +76,7 @@ def test_tier_comes_from_url_hostname_not_site_name():
     assert source_tier("https://www.cninfo.com.cn/a", "普通网页") == 1
     assert source_tier("https://finance.eastmoney.com/a", "未知站点") == 2
     assert source_tier("https://guba.eastmoney.com/news,1", "东方财富网") == 3
+    assert source_tier("https://xueqiu.com/123/456", "雪球") == 3
 
 
 def test_results_sort_by_tier_then_newest_date():
@@ -125,6 +126,22 @@ def test_rejects_future_dates_and_deduplicates_reposts():
     assert len(accepted) == 1
     assert quality["duplicate_count"] == 1
     assert quality["filtered_count"] == 1
+
+
+def test_deduplicates_same_announcement_across_different_urls():
+    rows = [
+        _result("三花智控002050收到监管函", "https://www.cninfo.com.cn/official"),
+        _result("三花智控002050收到监管函", "https://finance.eastmoney.com/repost"),
+    ]
+
+    accepted, quality = normalize_search_results(
+        rows, ts_code="002050.SZ", name="三花智控", category="regulatory",
+        today=date(2026, 8, 19),
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0]["source_tier"] == 1
+    assert quality["duplicate_count"] == 1
 
 
 def test_builds_structured_evidence_item():

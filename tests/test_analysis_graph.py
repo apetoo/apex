@@ -127,7 +127,16 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002050.SZ": "三花智控"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
-        "source": "bocha:web-search", "results": [], "quality": {"accepted_count": 0},
+        "source": "bocha:web-search", "results": [{
+            "title": "三花智控002050风险扫描公告",
+            "snippet": "未见新增重大风险事项",
+            "url": "https://www.cninfo.com.cn/scan",
+            "date": "2026-08-19",
+            "site": "巨潮资讯",
+            "source_tier": 1,
+            "entity_matched": True,
+            "freshness_status": "current",
+        }], "quality": {"accepted_count": 1},
     }))
     monkeypatch.setattr(analyze, "_dispatch_tool", lambda name, args: json.dumps({
         "valuation": {"pe_ttm": 20}, "quarters": [{"roe": 12}], "summary": {"flags": []},
@@ -144,3 +153,43 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
     assert result["draft_kind"] == "verdict"
     assert result["draft_data"]["verdict"] == "中性"
     assert any(event["type"] == "review" and event["outcome"] == "pass" for event in events)
+
+
+def test_review_failure_is_persisted_as_unknown_and_failure(monkeypatch):
+    verdict = {
+        "verdict": "中性", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,
+        "features": {
+            "ma5_position": "above", "ma20_position": "below", "volume_ratio": 1.0,
+            "rsi_14": 50, "atr_14_pct": 2.0,
+        },
+        "evidence": ["结构化数据 → 方向中性"], "stock_type": "均衡型",
+    }
+    client = _FakeClient([
+        _response(tool_name="get_fundamentals", arguments={"ts_code": "002050.SZ"}),
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "中性", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=verdict),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002050.SZ": "三花智控"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
+        "source": "bocha:web-search", "results": [{
+            "title": "三花智控002050公告", "snippet": "风险扫描",
+            "url": "https://www.cninfo.com.cn/scan", "date": "2026-08-19",
+            "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current",
+        }],
+    }))
+    monkeypatch.setattr(analyze, "_dispatch_tool", lambda *_args: json.dumps({
+        "valuation": {"pe_ttm": 20}, "quarters": [{"roe": 12}], "summary": {"flags": []},
+    }))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002050.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "insufficient_evidence"
+    assert any("独立复核失败" in unknown for unknown in result["unknowns"])
+    assert any("独立复核失败" in failure for failure in result["failures"])

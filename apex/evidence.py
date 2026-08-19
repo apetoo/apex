@@ -14,11 +14,11 @@ _TIER_1_HOSTS = (
     "gov.cn",
 )
 _TIER_2_HOSTS = (
-    "eastmoney.com", "10jqka.com.cn", "xueqiu.com", "sina.com.cn",
+    "eastmoney.com", "10jqka.com.cn", "sina.com.cn",
     "qq.com", "163.com", "ifeng.com", "stockstar.com", "stcn.com",
     "cs.com.cn", "cnstock.com",
 )
-_TIER_3_HOSTS = ("guba.eastmoney.com", "caifuhao.eastmoney.com")
+_TIER_3_HOSTS = ("guba.eastmoney.com", "caifuhao.eastmoney.com", "xueqiu.com")
 _TIER_3_MARKERS = ("股吧", "财富号", "自媒体", "博客")
 
 _CATEGORY_TERMS = {
@@ -100,10 +100,11 @@ def normalize_search_results(
     """Filter and annotate web results before they enter model context."""
     today = today or date.today()
     accepted: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
     filtered = duplicates = 0
 
-    for raw in rows:
+    for raw in sorted(rows, key=lambda row: source_tier(str(row.get("url") or ""), str(row.get("site") or ""))):
         title = str(raw.get("title") or "").strip()
         snippet = str(raw.get("snippet") or "").strip().replace("\n", " ")
         combined = f"{title} {snippet}"
@@ -117,11 +118,12 @@ def normalize_search_results(
             continue
 
         url = _canonical_url(str(raw.get("url") or ""))
-        fingerprint = (_compact(title), url)
-        if fingerprint in seen:
+        title_fingerprint = re.sub(r"[^\w\u4e00-\u9fff]", "", _compact(title))
+        if url in seen_urls or (title_fingerprint and title_fingerprint in seen_titles):
             duplicates += 1
             continue
-        seen.add(fingerprint)
+        seen_urls.add(url)
+        seen_titles.add(title_fingerprint)
         tier = source_tier(url, str(raw.get("site") or ""))
         accepted.append({
             **raw,

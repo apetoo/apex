@@ -32,13 +32,13 @@ Default storage paths (all outside the repo, in `$HOME`):
 
 ## Architecture
 
-No framework glue, no DB. `apex/` is the service layer; `backend/` is a thin HTTP routing layer over it; `frontend/` is the Vite + React UI talking to `backend/`.
+No DB. `apex/` is the service layer; `backend/` is a thin HTTP routing layer over it; `frontend/` is the Vite + React UI talking to `backend/`. Stock analysis uses LangGraph as its single orchestration path.
 
 ### `apex/` — service layer
 
 **`apex/data.py`** — outbound data layer. Tushare (primary) with akshare fallback for daily K-line; Sina Finance HTTP for realtime intraday (proxies stripped via custom opener); Bocha for web search. The `TOOL_FUNCTIONS` dict at the bottom auto-registers functions as tools for the AI agent — adding a new tool means adding to both `TOOLS` (in `analyze.py`) and `TOOL_FUNCTIONS` (here). Several functions return JSON **strings**; the backend unwraps them via `backend.core.response.parse_json` before responding.
 
-**`apex/analyze.py`** — DeepSeek agent loop using OpenAI-compatible function calling. `run(ts_code)` injects formatted journal history into the user prompt (so the AI can review past calls), spins a tool-call loop until `record_verdict` is invoked, then does one final text round to capture the analyst's narrative. `max_tool_iterations` caps the loop. Verdict + features get written to the journal jsonl. Accepts an `on_progress` callback that streams trace events — the backend bridges this to SSE.
+**`apex/analyze.py`** — DeepSeek stock-analysis agent using OpenAI-compatible function calling. `run(ts_code)` injects context, then LangGraph performs an authoritative risk scan, gap-driven tool research, evidence convergence, draft, independent review, and either completion or `insufficient_evidence`. Dynamic time/call/round budgets cap research. Accepts an `on_progress` callback that streams trace events — the backend bridges this to SSE.
 
 **`apex/journal.py`** — append-only jsonl reader/writer keyed by ts_code. `validate_entry` fills missing required feature keys with `None` and rejects unknown verdicts (`schemas.VERDICT_ENUM`). `merge_legacy_files()` is a one-shot migration that consolidates pre-suffix filenames (`603019.jsonl` → `603019.SH.jsonl`) and renames originals to `*.jsonl.legacy`.
 
@@ -125,15 +125,15 @@ SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `c
 
 **Closing a position triggers postmortem + recalibration.** `close_position` writes a closed record; the backend's `POST /api/watchlist/close` then runs `postmortem.run_and_patch` (AI diagnosis) and `calibration.compute()` when `postmortem=true` (default). `POST /api/postmortem/run` re-runs diagnosis on an existing closed record by `closed_at`.
 
-**Adding an AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The agent dispatches by name through `_dispatch_tool` which only looks at `TOOL_FUNCTIONS`.
+**Adding an external-data AI tool** requires three coordinated edits: (1) implement the function in `apex/data.py` returning a JSON string, (2) register it in `data.TOOL_FUNCTIONS`, (3) declare its schema in `analyze.TOOLS`. The graph dispatches external tools through `_dispatch_tool`. Control pseudo-tools such as `submit_research_state` are declared in `analyze.TOOLS` and handled directly by the graph; they must not be registered as outbound data functions.
 
 **SSE data contract (cross前后端).** `sse_starlette` 3.x 的 `EventSourceResponse` 对 `data` 直接 `str()` —— dict 会变 Python repr（单引号），前端 `JSON.parse` 必失败。所以 `backend/core/streaming.py` 的 `_sse()` helper 把 data 先 `json.dumps(ensure_ascii=False, default=str)` 成字符串再 yield；**新增 SSE 事件必须走 `_sse()`，不要直接 `yield {"event":..., "data": <dict>}`**。另一坑：sse_starlette 行尾是 `\r\n`（事件间 `\r\n\r\n`），而单测用例用 `\n` —— 前端 `useSSE.parseSSEChunk` 必须用 `split(/\r?\n\r?\n/)` 兼容两者，否则真后端事件全堆 buffer、单测却全过（盲区）。
 
-**analyze verdict 字段形状.** `analyze.run` 返回的 entry 是**嵌套**结构：`price_advice: {entry, stop_loss, target, position_size_pct}`、`evidence: string[]`、`analysis_text`（非 `note`）、`calibrated_confidence` / `calibration_explanation`、`analyzed_at`（非 `date`）。**写前端字段前以 `apex/analyze.py:run` 的返回 dict 为准**。`tool_result` trace 事件同理带的是 `summary`(dict) + `raw`(原始 JSON str)，不是 `result`。共享渲染走 `components/a-share/VerdictDetailCard`，AI 叙述走 `components/base/Markdown`（AI 输出含 markdown，别用 `whitespace-pre-wrap` 纯文本）。
+**analyze verdict 字段形状.** `analyze.run` 返回的 entry 是**嵌套**结构：`analysis_status: completed|insufficient_evidence`、`price_advice: {entry, stop_loss, target, position_size_pct}`、`evidence: EvidenceItem[]`、`unknowns`、`research_summary`、`analysis_text`（非 `note`）、`calibrated_confidence` / `calibration_explanation`、`analyzed_at`（非 `date`）。旧 journal 的 `evidence: string[]` 仍可读。**写前端字段前以 `apex/analyze.py:run` 的返回 dict 为准**。`tool_result` trace 事件同理带的是 `summary`(dict) + `raw`(原始 JSON str)，不是 `result`。共享渲染走 `components/a-share/VerdictDetailCard`，AI 叙述走 `components/base/Markdown`（AI 输出含 markdown，别用 `whitespace-pre-wrap` 纯文本）。
 
 **分时不是 AI 工具，且原始 bars 不落盘.** `get_intraday_snapshot` / `get_intraday_bars` 不在 `data.TOOL_FUNCTIONS` —— 别把它们注册成 AI 工具（启动时 `_format_intraday_block` 强制注入特征到 prompt，设计上不让 AI 决定调不调）。分时原始 1 分钟 bars 在 Python 压成特征后即弃，**不进 prompt、不写 trace.jsonl**；trace 里只有日线 raw（`get_daily_price` 是工具，落 `tool_result.raw`）。所以前端分时图只能实时调 `/api/market/intraday/{ts_code}/bars`，**无法从 trace 回放历史分时**。
 
-**web_search 有强制类别，别动 record_verdict 校验.** `MANDATORY_SEARCH_CATEGORIES = ["earnings","shareholders","regulatory","money_flow"]`（`data.py`）是 A 股判断地基，`record_verdict` 前强制校验 `searches_performed` 含全 4 类，缺则抛 `verdict_rejected` 逼 AI 补搜。这是有意覆盖设计，别为省调用次数放宽。
+**web_search 是查漏补缺，不做类别打卡.** 每次分析自动执行窄范围权威风险扫描；其余搜索由证据缺口驱动。搜索失败、空结果、串票或 Tier 3 线索不算覆盖，重大 Tier 2 事实需要 Tier 1 或第二独立来源佐证。最终提交由 evidence controller 和独立复核共同门控。
 
 ## Skill routing
 

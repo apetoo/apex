@@ -93,16 +93,14 @@ TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "用博查搜索股票相关信息。**必须分类搜索，不要混搜**。\n"
-                "每次调用只查一个 category，AI 应分多次调用覆盖不同维度。\n"
-                "\n"
-                "**强制类别（record_verdict 前必须全部调用过，否则系统拒绝记录结论）**：\n"
+                "用博查按证据缺口搜索股票相关信息。每次调用聚焦一个 category；已有结构化证据足够时无需调用。\n"
+                "常用类别：\n"
                 "  · earnings           — 业绩面（季报/预告/营收/净利润），oneMonth 窗口\n"
                 "  · shareholders       — 股东动态（减持/增持/解禁/大宗交易），oneMonth 窗口\n"
                 "  · regulatory         — 监管/合规（立案/处罚/诉讼/问询函），oneYear 窗口\n"
                 "  · money_flow         — 资金面（北向/龙虎榜/主力/机构），oneWeek 窗口\n"
                 "\n"
-                "**可选类别（按需追加）**：\n"
+                "其他按需类别：\n"
                 "  · corporate_actions  — 资本运作（定增/回购/重组/并购），oneYear 窗口\n"
                 "  · research           — 卖方研报（评级/目标价变化），oneMonth 窗口\n"
                 "  · industry           — 行业政策（需先用 get_stock_info 拿到 industry 后传入），oneYear 窗口\n"
@@ -1623,9 +1621,10 @@ def _run_langgraph_loop(
             parsed = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
             parsed = {"error": "返回不可解析"}
-        success = not bool(parsed.get("error"))
         evidence = [item for item in _tool_evidence("web_search", raw, ts_code)
                     if int(item.get("source_tier") or 3) <= 2]
+        authoritative = [item for item in evidence if int(item.get("source_tier") or 3) == 1]
+        success = not bool(parsed.get("error")) and bool(authoritative)
         controller.record_safety_scan(success=success, evidence=evidence)
         emit({
             "type": "tool_result", "iteration": 0, "tool_call_id": "safety-scan",
@@ -1814,7 +1813,10 @@ def _run_langgraph_loop(
         return {"analysis_status": "completed"}
 
     def abstain(state):
-        unknowns = list(state.get("unknowns") or controller.finalization_decision().blockers)
+        review_issues = list(state.get("review_issues") or controller.review_issues)
+        unknowns = list(state.get("unknowns") or review_issues or controller.finalization_decision().blockers)
+        if review_issues and any(issue.startswith("独立复核失败:") for issue in review_issues):
+            controller.failures.extend(issue for issue in review_issues if issue not in controller.failures)
         emit({"type": "analysis_abstained", "unknowns": unknowns})
         return {
             "analysis_status": "insufficient_evidence", "unknowns": unknowns,
@@ -1897,8 +1899,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"{playstyle_block}\n\n"
                 "步骤：\n"
                 "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"
-                "   先调 get_fundamentals + get_stock_info + get_dragon_tiger_list，\n"
-                "   拿到 circ_mv / PE_TTM / turnover_rate / industry / 龙虎榜上榜次数，\n"
+                "   优先利用已注入数据；若 circ_mv / PE_TTM / turnover_rate / industry / 龙虎榜频次存在关键缺口，\n"
+                "   再按缺口调用 get_fundamentals / get_stock_info / get_dragon_tiger_list，\n"
                 "   以及 quarters（最近4季财务）和 summary.flags（Python预计算的风险标记）后，\n"
                 "   对照下表自行判断标的类型并**显式声明**：\n"
                 "\n"
@@ -1917,13 +1919,12 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   分类完成后，后续所有步骤的分析深度和证据选择必须按上表权重分配精力。\n"
                 "   **成长股特别提示**：成长股估值看「未来增长能否消化当前估值」，禁止仅凭静态 PE_TTM 偏高就偏空（详见步骤 3 成长股估值约束）。\n"
                 "\n"
-                "1) 数据：调用 get_daily_price（在步骤 0 之外补充 K 线数据）\n"
+                "1) 数据：检查行情、技术、财务和资金证据是否足够；仅在缺口影响结论时调用相应结构化工具。\n"
                 "\n"
                 "   **结构化补充工具（推荐使用，但非强制）**：\n"
                 "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
-                "   · mx_data_query — 妙想金融数据查询（东方财富）。**蓝筹/白马和成长股必须至少调用 1 次**，\n"
-                "     查营收/净利润/ROE/毛利率/经营现金流等深度财务数据，否则基本面权重是空壳。\n"
-                "     题材/游资股可选，但建议查一下排除业绩暴雷风险。\n"
+                "   · mx_data_query — 妙想金融数据查询（东方财富）。当蓝筹/白马或成长股缺少营收、净利润、\n"
+                "     ROE、毛利率、经营现金流或前瞻估值等关键证据时优先调用。\n"
                 "   · mx_news_search — 妙想财经资讯搜索（东方财富），比博查更垂直精准，\n"
                 "     适合搜研报/新闻/公告\n"
                 "   · mx_stock_screen — 妙想智能选股，自然语言批量筛选候选标的，\n"
@@ -1941,7 +1942,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "3) 三段式辩论（写在 message content 里）：\n"
                 "   ### 一、多头论点（≥3 条，格式：数据点 → 推论）\n"
                 "   引用 K 线/基本面/消息面的具体数字，禁空话。\n"
-                "   **股票类型约束**：蓝筹/白马的多头论点中，至少 2 条必须来自基本面证据（mx_data_query / earnings 博查）；\n"
+                "   **股票类型约束**：蓝筹/白马的多头论点中，至少 2 条必须来自合格的结构化或权威基本面证据；\n"
                 "   题材/游资的多头论点中，资金面（龙虎榜/北向/主力流向）必须占至少 1 条。\n"
                 "   ### 二、空头论点（≥3 条，禁「虽然 X 但是 Y」）\n"
                 "   独立反方证据；至少 1 条直接反驳多头第 N 条；必须考虑估值/解禁减持/行业景气/技术背离/历史回撤。\n"
@@ -1996,7 +1997,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "\n"
                 "6) **自我检查（在调用 record_verdict 前完成，写在 message content 末尾）**：\n"
                 "   - [ ] 我的四维权重与声明的股票类型是否一致？\n"
-                "   - [ ] 蓝筹/成长股：基本面证据是否 ≥ 2 条且来自 mx_data_query 或博查 earnings？\n"
+                "   - [ ] 蓝筹/成长股：基本面证据是否 ≥ 2 条且来自合格的结构化数据或 Tier 1/2 来源？\n"
                 "   - [ ] 题材/游资股：我是否错误地把\"基本面\"当成了主要判断依据？\n"
                 "   - [ ] 周期股：我是否在 PE 很低时说\"估值便宜\"（这是周期股陷阱）？\n"
                 "   - [ ] 成长股：我是否仅凭静态 PE_TTM 偏高就偏空？是否用 mx_data_query 查了一致预期/Forward PE/PEG？只有「增长放缓 + Forward PE 极高 + PEG 失衡」三者同时成立，估值才能作为主要空头依据，否则高 PE 只能是风险提示。\n"
