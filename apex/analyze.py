@@ -19,7 +19,7 @@ from apex.schemas import (
     POSITION_ACTION_SOURCE,
 )
 from apex.analysis_graph import GraphHandlers, build_analysis_graph
-from apex.evidence import make_evidence_item
+from apex.evidence import classify_evidence_type, entity_matches, make_evidence_item, source_tier
 from apex.evidence_control import EvidenceController
 
 
@@ -1551,6 +1551,83 @@ def _format_playstyle_block(ts_code: str) -> tuple[str, dict]:
     return "\n".join(lines), feats
 
 
+def _safety_scan_outcome(parsed: dict) -> bool:
+    """权威扫描是否执行成功（与是否命中 Tier 1 无关）。"""
+    return not bool(parsed.get("error"))
+
+
+def _review_requires_revision(outcome: str, issues: list[str]) -> bool:
+    """Model reviewer may call material inconsistencies 'minor'; deterministic policy wins."""
+    if outcome != "pass":
+        return False
+    material_markers = ("矛盾", "无支撑", "自相矛盾", "口径混用", "事实错误", "持续流出")
+    return any(any(marker in str(issue) for marker in material_markers) for issue in issues)
+
+
+def _valuation_basis_conflict(candidate: dict, thesis: str) -> bool:
+    if candidate.get("verdict") not in BEARISH_VERDICTS:
+        return False
+    if candidate.get("valuation_basis") != "non_valuation":
+        return False
+    thesis_text = str(thesis or "").lower()
+    return any(marker in thesis_text for marker in ("估值", "pe", "peg", "市盈率"))
+
+
+def _final_analysis_text(existing: str, kind: str, candidate: dict) -> str:
+    """Append a complete, auditable conclusion even when forced tool calls have no content."""
+    research = (existing or "").split("\n\n---\n\n## 最终结论", 1)[0].rstrip()
+    lines = ["---", "## 最终结论"]
+    if kind == "position_action":
+        lines.extend([
+            f"- 当前建议：**{candidate.get('action') or '—'}**",
+            f"- 核心理由：{candidate.get('rationale') or '—'}",
+        ])
+    else:
+        lines.extend([
+            f"- 判断：**{candidate.get('verdict') or '—'}**",
+            f"- 置信度：**{candidate.get('confidence') if candidate.get('confidence') is not None else '—'}/10**",
+        ])
+        evidence = [str(item) for item in (candidate.get("evidence") or []) if str(item).strip()]
+        if evidence:
+            lines.append("\n### 核心证据")
+            lines.extend(f"- {item}" for item in evidence)
+        if candidate.get("verdict") in BULLISH_VERDICTS:
+            lines.extend([
+                "\n### 交易计划",
+                f"- 入场：{candidate.get('entry_low') or candidate.get('entry')}–{candidate.get('entry_high') or candidate.get('entry')}",
+                f"- 止损：{candidate.get('stop_loss')}；目标：{candidate.get('target')}；建议仓位：{candidate.get('position_size_pct', 0)}%",
+            ])
+        else:
+            lines.append("\n当前不建议新开多头仓位；等待关键证据或趋势改善后重新评估。")
+    return "\n\n".join(part for part in (research, "\n".join(lines)) if part).strip()
+
+
+def _mx_news_evidence_type(title: str, content: str) -> str:
+    """Keep navigation/sidebar text from turning ordinary investor Q&A into a material event."""
+    ordinary_qa = ("股东总户数", "股东户数", "答投资者问", "互动平台回答")
+    if any(marker in title for marker in ordinary_qa):
+        return classify_evidence_type(title, default="general")
+    return classify_evidence_type(f"{title} {content}", default="general")
+
+
+def _normalize_research_gaps(
+    gaps: list[dict], *, held: bool, safety_scan_status: str,
+) -> list[dict]:
+    """Unknown price-move attribution is reportable, but alone cannot block a held-position plan."""
+    normalized = []
+    price_markers = ("暴跌", "大跌", "下跌原因", "暴涨", "大涨", "上涨原因")
+    no_event_markers = ("无明确利空公告", "未发现明确利空", "无明确公告", "原因未明")
+    for raw in gaps:
+        gap = dict(raw)
+        description = str(gap.get("description") or "")
+        if (held and safety_scan_status == "clear" and gap.get("severity") == "critical"
+                and any(marker in description for marker in price_markers)
+                and any(marker in description for marker in no_event_markers)):
+            gap["severity"] = "noncritical"
+        normalized.append(gap)
+    return normalized
+
+
 def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
     """Convert accepted tool output into the compact evidence ledger."""
     try:
@@ -1561,24 +1638,65 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
         return []
     if name == "web_search" and isinstance(parsed, dict):
         items = []
+        query_category = str(parsed.get("category") or "")
         for row in parsed.get("results") or []:
             if not row.get("entity_matched") or int(row.get("source_tier") or 3) > 3:
                 continue
+            # 按内容归类而非查询 category：general 搜索命中的警示函归 regulatory，
+            # 否则交叉验证（按 evidence_type 分桶）会把同事实的印证拆到不同桶。
+            row_text = f"{row.get('title') or ''} {row.get('snippet') or ''}"
             items.append(make_evidence_item(
-                fact=(row.get("title") or row.get("snippet") or "")[:300],
+                # title+snippet 都进 fact：目标价等关键数值常在 snippet 里，
+                # 只取 title 会让独立复核无法验证候选引用的数值。
+                fact=row_text.strip()[:300],
                 inference="待 Agent 结合其他证据评估",
-                evidence_type=str(parsed.get("category") or "web"),
+                evidence_type=classify_evidence_type(
+                    row_text, preferred=query_category, default=query_category or "general",
+                ),
                 tool_name=name,
                 source=row,
             ))
         return items
+    if name == "mx_news_search" and isinstance(parsed, dict):
+        items, seen = [], set()
+        stock_name = data.get_name_map().get(ts_code) or ""
+        for row in parsed.get("results") or []:
+            title = str(row.get("title") or "").strip()
+            content = " ".join(str(row.get("content") or "").split())
+            entity_text = " ".join((title, content, str(row.get("entity") or "")))
+            fingerprint = (title, content[:160])
+            if (not title or fingerprint in seen
+                    or not entity_matches(entity_text, ts_code, stock_name)):
+                continue
+            seen.add(fingerprint)
+            fact = f"{title} {content}".strip()[:700]
+            items.append(make_evidence_item(
+                fact=fact,
+                inference="待 Agent 结合其他证据评估",
+                evidence_type=_mx_news_evidence_type(title, content),
+                tool_name=name,
+                source={
+                    **row, "site": row.get("institution") or "妙想财经",
+                    "source_tier": source_tier(
+                        str(row.get("url") or ""), str(row.get("institution") or ""),
+                    ),
+                    "entity_matched": True,
+                    "freshness_status": "current",
+                },
+            ))
+            if len(items) >= 8:
+                break
+        return items
     summary = trace_mod.summarize_tool_result(name, raw)
     if not isinstance(summary, dict) or summary.get("error") or summary.get("note"):
         return []
+    fact = json.dumps(summary, ensure_ascii=False, sort_keys=True)[:800]
     return [make_evidence_item(
-        fact=json.dumps(summary, ensure_ascii=False, sort_keys=True)[:800],
+        fact=fact,
         inference="结构化数据，供多空论证使用",
-        evidence_type="structured_data",
+        # 妙想等返回的公告/业绩内容按内容归入对应 material 桶（tier 1），
+        # 无类别词的纯行情/估值 JSON 保持 structured_data。
+        evidence_type=classify_evidence_type(fact, default="structured_data"),
         tool_name=name,
         source={
             "title": name, "site": name, "url": "", "date": date.today().isoformat(),
@@ -1589,6 +1707,7 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
 
 def _run_langgraph_loop(
     *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
+    system_context: str = "",
 ) -> dict:
     """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
     controller = EvidenceController()
@@ -1602,47 +1721,127 @@ def _run_langgraph_loop(
         return json.loads(cleaned or "{}")
 
     def prepare(state):
+        emit({"type": "status", "stage": "preparing", "message": "正在准备分析上下文"})
         return {
             "messages": list(messages), "analysis_text": "", "model_iterations": 0,
             "research_rounds": 0, "evidence": [], "gaps": [],
         }
 
     def safety_scan(state):
-        emit({"type": "status", "message": "正在执行权威黑天鹅扫描"})
+        emit({"type": "status", "stage": "safety_scan", "message": "正在执行权威黑天鹅扫描"})
         query = (
             f"{stock_name} {ts_code.split('.')[0]} {ts_code} "
             "重大公告 监管 立案 处罚 诉讼 停牌 业绩预警"
         )
-        raw = data.web_search(
-            ts_code, category="general", name=stock_name, query=query,
-            freshness="oneYear", count=10,
-        )
         try:
-            parsed = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            parsed = {"error": "返回不可解析"}
+            raw = data.web_search(
+                ts_code, category="general", name=stock_name, query=query,
+                freshness="oneYear", count=10,
+            )
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                parsed = {"error": "返回不可解析"}
+        except Exception as exc:
+            raw = json.dumps({"error": str(exc)}, ensure_ascii=False)
+            parsed = {"error": str(exc)}
         evidence = [item for item in _tool_evidence("web_search", raw, ts_code)
                     if int(item.get("source_tier") or 3) <= 2]
-        authoritative = [item for item in evidence if int(item.get("source_tier") or 3) == 1]
-        success = not bool(parsed.get("error")) and bool(authoritative)
+        # 扫描执行成功即成功，不要求 Tier 1 命中。旧逻辑把"只搜到 Tier 2"
+        # 误判为扫描失败（safety_scan_status=unknown -> 阻断收尾），且丢掉
+        # 已发现的风险事件（601872 双源警示函被整条丢弃）。事件是否需交叉
+        # 验证由 evidence_control 的 material 桶门控负责。
+        success = _safety_scan_outcome(parsed)
         controller.record_safety_scan(success=success, evidence=evidence)
+        if not success:
+            detail = str(parsed.get("error") or "权威数据服务返回异常")
+            controller.failures.append(f"authoritative_scan: {detail}")
         emit({
             "type": "tool_result", "iteration": 0, "tool_call_id": "safety-scan",
             "name": "authoritative_scan", "summary": trace_mod.summarize_web_search(raw),
             "raw": raw,
         })
-        return {
+        update = {
             "safety_scan_status": controller.safety_scan_status,
             "evidence": list(controller.evidence.values()),
         }
+        if not success:
+            update.update({
+                "outcome_reason": "provider_failure",
+                "next_actions": ["权威数据服务恢复后重新运行分析"],
+                "failures": list(controller.failures),
+                "research_metrics": controller.research_metrics(
+                    stop_reason="authoritative_scan_failure"
+                ),
+            })
+        return update
+
+    # LLM usage 跟踪：ark 网关超上下文会报错或静默截断，peak 不记录就无从感知。
+    usage_stats = {"peak_prompt_tokens": 0, "total_completion_tokens": 0, "calls": 0}
+
+    def _record_usage(response, *, call: str, iteration: int) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        usage_stats["peak_prompt_tokens"] = max(usage_stats["peak_prompt_tokens"], prompt_tokens)
+        usage_stats["total_completion_tokens"] += completion_tokens
+        usage_stats["calls"] += 1
+        emit({
+            "type": "usage", "call": call, "iteration": iteration,
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "peak_prompt_tokens": usage_stats["peak_prompt_tokens"],
+        })
 
     def reason(state):
         iteration = int(state.get("model_iterations", 0))
-        response = client.chat.completions.create(
-            model=model, messages=state.get("messages") or [], tools=TOOLS,
-            max_tokens=16384, temperature=0.4,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        final_assessment = bool(state.get("final_assessment_requested"))
+        status_event = {
+            "type": "status", "stage": "assessing" if final_assessment else "researching",
+            "message": "补证预算已用尽，正在最终评估" if final_assessment else "正在分析并按缺口补证",
+        }
+        if not final_assessment:
+            status_event.update({
+                "current": controller.research_rounds + 1,
+                "total": controller.config.max_research_rounds,
+            })
+        emit(status_event)
+        reason_messages = list(state.get("messages") or [])
+        reason_tools = TOOLS
+        tool_choice = None
+        if final_assessment:
+            reason_messages.append({
+                "role": "user",
+                "content": (
+                    "补证预算已用尽。不得再搜索；必须基于已有证据重新评估每个 gap，"
+                    "将已被证据覆盖的 gap 关闭，将不影响持仓风险管理的未知项降为 noncritical，"
+                    "然后只调用 submit_research_state 提交最终评估。"
+                ),
+            })
+            reason_tools = [next(
+                tool for tool in TOOLS if tool["function"]["name"] == "submit_research_state"
+            )]
+            tool_choice = {
+                "type": "function", "function": {"name": "submit_research_state"},
+            }
+        try:
+            request = {
+                "model": model, "messages": reason_messages, "tools": reason_tools,
+                "max_tokens": 16384, "temperature": 0.4,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+            if tool_choice:
+                request["tool_choice"] = tool_choice
+            response = client.chat.completions.create(**request)
+        except Exception as exc:
+            controller.failures.append(f"model: {exc}")
+            return {
+                "pending_tools": [], "outcome_reason": "provider_failure",
+                "next_actions": ["模型服务恢复后重新运行分析"],
+                "failures": list(controller.failures),
+            }
+        _record_usage(response, call="reason", iteration=iteration)
         choice = response.choices[0]
         if choice.finish_reason == "length":
             raise AnalysisError(f"AI exceeded token limit at iteration {iteration}")
@@ -1657,7 +1856,42 @@ def _run_langgraph_loop(
             "pending_tools": list(msg.tool_calls or []),
             "analysis_text": text,
             "model_iterations": iteration + 1,
+            "final_assessment_done": final_assessment,
         }
+
+    def _candidate_blockers(name: str, tool_input: dict) -> list[str]:
+        action = tool_input.get("action") if name == "record_position_action" else None
+        blockers = list(controller.finalization_decision(action=action).blockers)
+        if name == "record_verdict" and tool_input.get("verdict") in BULLISH_VERDICTS:
+            blockers.extend(
+                f"{field} 必须是大于 0 的具体价格"
+                for field in ("entry", "stop_loss", "target")
+                if not isinstance(tool_input.get(field), (int, float)) or tool_input.get(field) <= 0
+            )
+        if (name == "record_verdict" and tool_input.get("stock_type") == "成长股"
+                and tool_input.get("verdict") in BEARISH_VERDICTS
+                and tool_input.get("valuation_basis") in (None, "static_pe_only")):
+            blockers.append("成长股偏空不得仅使用静态 PE")
+        if name == "record_verdict" and _valuation_basis_conflict(tool_input, controller.thesis):
+            blockers.append("空头论点明确使用估值依据，valuation_basis 不得填 non_valuation")
+        try:
+            from apex import watchlist as _wl_graph
+            held = any(p.get("ts_code") == ts_code for p in _wl_graph.load().get("active_positions", []))
+        except Exception:
+            held = False
+        if name == "record_verdict" and held:
+            blockers.append("已持仓票必须提交 position_action")
+        if name == "record_position_action":
+            current_price = None
+            try:
+                current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+            except Exception:
+                pass
+            pa_reasons, _ = _validate_position_action(
+                tool_input, ts_code, [], current_price=current_price,
+            )
+            blockers.extend(pa_reasons)
+        return blockers
 
     def execute_tools(state):
         appended = list(state.get("messages") or [])
@@ -1675,10 +1909,23 @@ def _run_langgraph_loop(
             })
 
             if name == "submit_research_state":
+                try:
+                    from apex import watchlist as _wl_assessment
+                    held = any(
+                        p.get("ts_code") == ts_code
+                        for p in _wl_assessment.load().get("active_positions", [])
+                    )
+                except Exception:
+                    held = False
                 controller.submit_assessment(
                     thesis=str(tool_input.get("thesis") or ""),
-                    gaps=list(tool_input.get("gaps") or []),
+                    gaps=_normalize_research_gaps(
+                        list(tool_input.get("gaps") or []), held=held,
+                        safety_scan_status=controller.safety_scan_status,
+                    ),
                     ready=bool(tool_input.get("ready")),
+                    next_actions=list(tool_input.get("next_actions") or []),
+                    count_research_round=not bool(state.get("final_assessment_done")),
                 )
                 result = json.dumps({
                     "accepted": True,
@@ -1686,35 +1933,7 @@ def _run_langgraph_loop(
                     "finalization": controller.finalization_decision().allowed,
                 }, ensure_ascii=False)
             elif name in {"record_verdict", "record_position_action"}:
-                action = tool_input.get("action") if name == "record_position_action" else None
-                blockers = list(controller.finalization_decision(action=action).blockers)
-                if name == "record_verdict" and tool_input.get("verdict") in BULLISH_VERDICTS:
-                    blockers.extend(
-                        f"{field} 必须是大于 0 的具体价格"
-                        for field in ("entry", "stop_loss", "target")
-                        if not isinstance(tool_input.get(field), (int, float)) or tool_input.get(field) <= 0
-                    )
-                if (name == "record_verdict" and tool_input.get("stock_type") == "成长股"
-                        and tool_input.get("verdict") in BEARISH_VERDICTS
-                        and tool_input.get("valuation_basis") in (None, "static_pe_only")):
-                    blockers.append("成长股偏空不得仅使用静态 PE")
-                try:
-                    from apex import watchlist as _wl_graph
-                    held = any(p.get("ts_code") == ts_code for p in _wl_graph.load().get("active_positions", []))
-                except Exception:
-                    held = False
-                if name == "record_verdict" and held:
-                    blockers.append("已持仓票必须提交 position_action")
-                if name == "record_position_action":
-                    current_price = None
-                    try:
-                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
-                    except Exception:
-                        pass
-                    pa_reasons, _ = _validate_position_action(
-                        tool_input, ts_code, [], current_price=current_price,
-                    )
-                    blockers.extend(pa_reasons)
+                blockers = _candidate_blockers(name, tool_input)
                 if blockers:
                     result = json.dumps({"error": "；".join(blockers)}, ensure_ascii=False)
                 else:
@@ -1752,46 +1971,200 @@ def _run_langgraph_loop(
         }
 
     def assess(state):
+        emit({"type": "status", "stage": "assessing", "message": "正在判断证据是否收敛"})
+        if state.get("outcome_reason"):
+            return {"route": "abstain"}
         if state.get("draft_kind") and state.get("draft_data"):
             return {"route": "draft"}
+        if controller.finalization_decision().allowed:
+            return {"route": "draft"}
         stop = controller.should_stop()
+        if (stop.stop and stop.reason in {"external_call_budget", "research_round_budget", "no_progress"}
+                and not state.get("final_assessment_done")):
+            return {"route": "research", "final_assessment_requested": True}
         if stop.stop or int(state.get("model_iterations", 0)) >= max_iter:
             blockers = controller.finalization_decision().blockers
-            return {"route": "abstain", "unknowns": blockers or [stop.reason or "模型轮次耗尽"]}
+            business_unknowns = [
+                item for item in blockers
+                if item not in {"Agent 尚未声明证据收敛", "复核返工尚未取得新增证据并重新评估"}
+            ]
+            reason = "evidence_gap" if business_unknowns else (
+                "model_iteration_exhausted"
+                if not stop.stop else "research_budget_exhausted"
+            )
+            return {
+                "route": "abstain", "unknowns": business_unknowns,
+                "outcome_reason": reason,
+                "next_actions": list(controller.next_actions) or (
+                    ["补齐关键证据后重新运行分析"] if business_unknowns else ["重新运行分析"]
+                ),
+                "research_metrics": controller.research_metrics(
+                    stop_reason=stop.reason if stop.stop else "model_iteration_budget"
+                ),
+            }
         return {"route": "research"}
 
     def draft(state):
-        return {}
+        if state.get("draft_kind") and state.get("draft_data"):
+            kind = str(state.get("draft_kind"))
+            candidate = dict(state.get("draft_data") or {})
+            return {
+                "draft_route": "review",
+                "analysis_text": _final_analysis_text(state.get("analysis_text") or "", kind, candidate),
+            }
+        emit({"type": "status", "stage": "drafting", "message": "证据已收敛，正在生成结构化结论"})
+        try:
+            from apex import watchlist as _wl_draft
+            held = any(p.get("ts_code") == ts_code for p in _wl_draft.load().get("active_positions", []))
+        except Exception:
+            held = False
+        tool_name = "record_position_action" if held else "record_verdict"
+        tool = next(item for item in TOOLS if item["function"]["name"] == tool_name)
+        failure = ""
+        for attempt in range(2):
+            if attempt:
+                emit({"type": "draft_retry", "reason": failure, "attempt": attempt + 1})
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[*(state.get("messages") or []), {
+                        "role": "user",
+                        "content": (
+                            "证据门控已通过。现在必须基于已有上下文提交结构化最终结论，"
+                            f"只调用 {tool_name}，不得继续搜索或输出额外正文。"
+                            + (
+                                "上一次提交被业务校验拒绝，必须逐条修正以下问题："
+                                f"{failure}"
+                                if attempt else ""
+                            )
+                        ),
+                    }],
+                    tools=[tool],
+                    tool_choice={"type": "function", "function": {"name": tool_name}},
+                    max_tokens=16384, temperature=0.2 if attempt == 0 else 0,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(response, call="draft", iteration=int(state.get("model_iterations", 0)))
+                calls = list(response.choices[0].message.tool_calls or [])
+                if len(calls) != 1 or calls[0].function.name != tool_name:
+                    failure = f"草稿未调用要求的 {tool_name}"
+                    continue
+                candidate = json.loads(calls[0].function.arguments or "{}")
+                blockers = _candidate_blockers(tool_name, candidate)
+                if blockers:
+                    failure = "；".join(blockers)
+                    continue
+                return {
+                    "draft_kind": "position_action" if held else "verdict",
+                    "draft_data": candidate, "draft_route": "review",
+                    "analysis_text": _final_analysis_text(
+                        state.get("analysis_text") or "",
+                        "position_action" if held else "verdict", candidate,
+                    ),
+                }
+            except Exception as exc:
+                failure = str(exc)
+                if isinstance(exc, (ConnectionError, TimeoutError)):
+                    controller.failures.append(f"model: {exc}")
+        controller.failures.append(f"draft: {failure}")
+        provider_failure = any(item.startswith("model:") for item in controller.failures)
+        return {
+            "draft_route": "abstain",
+            "outcome_reason": "provider_failure" if provider_failure else "model_iteration_exhausted",
+            "next_actions": ["模型服务恢复后重新运行分析"] if provider_failure else ["重新运行分析并生成结构化结论"],
+            "failures": list(controller.failures),
+            "research_metrics": controller.research_metrics(stop_reason="draft_generation_failed"),
+        }
 
     def review(state):
+        emit({"type": "status", "stage": "reviewing", "message": "正在进行独立复核"})
         compact = {
             "candidate_kind": state.get("draft_kind"),
             "candidate": state.get("draft_data"),
             "evidence": state.get("evidence") or [],
             "gaps": state.get("gaps") or [],
             "safety_scan_status": state.get("safety_scan_status"),
+            # 系统注入的确定性数据（行情/大盘/情绪/持仓计划/历史判断）。
+            # 不给 reviewer 看就会把候选引用的大盘/持仓数据误判为"未经验证的假设"，
+            # 强制 rework 且 agent 无法通过补搜修复 -> 白耗预算后弃权。
+            "system_context": system_context,
         }
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": (
-                        "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
-                        "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, issues: string[]}。"
-                    )},
-                    {"role": "user", "content": json.dumps(compact, ensure_ascii=False)},
-                ],
-                max_tokens=2048, temperature=0,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            payload = parse_review_json(response.choices[0].message.content or "{}")
+        review_system = (
+            "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
+            "system_context 是系统注入的确定性数据（行情/技术/大盘/情绪/持仓计划/历史判断），"
+            "视为已验证：候选引用其中数据时不必要求外部证据。"
+            "rework 仅用于影响结论方向的重大外部事实主张无支撑；"
+            "技术指标等次要出入记入 issues 但不应单独导致 rework。"
+            "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, issues: string[]}。"
+        )
+        review_user = json.dumps(compact, ensure_ascii=False)
+        # 复核输出本应只有几百 token。temp=0 下模型偶发复读循环，一路写到
+        # max_tokens 上限被硬截断，JSON 断在字符串中间 -> 解析失败 -> 误弃权
+        # （600487: completion=16384 恰好等于上限，正常值 12~305）。一次解析
+        # 失败不等于证据不足：换温度重试一次打破复读，仍失败才按复核失败处理。
+        payload, failure = None, ""
+        for attempt in range(2):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": review_system + (
+                            " 输出务必极简：outcome 一个词，issues 每条一句话。"
+                            if attempt else "")},
+                        {"role": "user", "content": review_user},
+                    ],
+                    max_tokens=16384, temperature=0 if attempt == 0 else 0.3,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(response, call="review", iteration=int(state.get("model_iterations", 0)))
+                content = response.choices[0].message.content or "{}"
+                truncated = getattr(response.choices[0], "finish_reason", None) == "length"
+                payload = parse_review_json(content)
+                if truncated:
+                    # 解析侥幸成功但输出被截断，结论可能不完整，同样重试。
+                    failure = "复核输出被 max_tokens 截断"
+                    continue
+                break
+            except Exception as exc:
+                failure = str(exc)
+                payload = None
+        if payload is None:
+            emit({"type": "review_retry_failed", "reason": failure})
+            outcome, issues = "abstain", [f"独立复核失败: {failure}"]
+        else:
             outcome = str(payload.get("outcome") or "abstain")
             issues = list(payload.get("issues") or [])
-        except Exception as exc:
-            outcome, issues = "abstain", [f"独立复核失败: {exc}"]
-        outcome = controller.record_review(outcome, issues)
+        revision_count = int(state.get("review_revision_count", 0))
+        if _review_requires_revision(outcome, issues):
+            outcome = "revise" if revision_count < 1 else "abstain"
+        elif outcome != "revise":
+            outcome = controller.record_review(outcome, issues)
         emit({"type": "review", "outcome": outcome, "issues": issues})
         update = {"review_outcome": outcome, "review_issues": issues}
+        if outcome == "revise":
+            update.update({
+                "draft_kind": "", "draft_data": {},
+                "review_revision_count": revision_count + 1,
+                "messages": [*(state.get("messages") or []), {
+                    "role": "user",
+                    "content": "独立复核发现结论表达或数据口径矛盾。只修订结论，不新增事实：" + "；".join(issues),
+                }],
+            })
+        if outcome == "abstain":
+            technical_failure = any(issue.startswith("独立复核失败:") for issue in issues)
+            controller.failures.extend(
+                f"review: {issue}" for issue in issues
+                if issue and f"review: {issue}" not in controller.failures
+            )
+            update.update({
+                "outcome_reason": "review_failure",
+                "next_actions": [
+                    "独立复核服务恢复后重新运行分析"
+                    if technical_failure else "修正候选结论后重新运行独立复核"
+                ],
+                "failures": list(controller.failures),
+                "research_metrics": controller.research_metrics(stop_reason="review_failure"),
+            })
         if outcome == "rework":
             update.update({
                 "draft_kind": "", "draft_data": {},
@@ -1810,19 +2183,31 @@ def _run_langgraph_loop(
             "verdict": data_value.get("verdict"), "confidence": data_value.get("confidence"),
             "action": data_value.get("action"),
         })
-        return {"analysis_status": "completed"}
+        emit({"type": "status", "stage": "completed", "message": "分析与独立复核已完成"})
+        return {"analysis_status": "completed", "token_usage": dict(usage_stats)}
 
     def abstain(state):
         review_issues = list(state.get("review_issues") or controller.review_issues)
-        unknowns = list(state.get("unknowns") or review_issues or controller.finalization_decision().blockers)
+        outcome_reason = str(state.get("outcome_reason") or "evidence_gap")
+        unknowns = list(state.get("unknowns") or [])
+        if outcome_reason == "evidence_gap" and not unknowns:
+            unknowns = [
+                item for item in controller.finalization_decision().blockers
+                if item not in {"Agent 尚未声明证据收敛", "复核返工尚未取得新增证据并重新评估"}
+            ]
         if review_issues and any(issue.startswith("独立复核失败:") for issue in review_issues):
             controller.failures.extend(issue for issue in review_issues if issue not in controller.failures)
-        emit({"type": "analysis_abstained", "unknowns": unknowns})
+        emit({"type": "status", "stage": "abstained", "message": "分析未形成可执行结论"})
+        emit({"type": "analysis_abstained", "unknowns": unknowns, "outcome_reason": outcome_reason})
         return {
             "analysis_status": "insufficient_evidence", "unknowns": unknowns,
             "attempted_tools": list(controller.attempted_tools),
             "failures": list(controller.failures),
             "evidence": list(controller.evidence.values()),
+            "token_usage": dict(usage_stats),
+            "outcome_reason": outcome_reason,
+            "next_actions": list(state.get("next_actions") or controller.next_actions),
+            "research_metrics": dict(state.get("research_metrics") or controller.research_metrics()),
         }
 
     graph = build_analysis_graph(GraphHandlers(
@@ -2011,25 +2396,43 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     graph_result = _run_langgraph_loop(
         ts_code=ts_code, client=client, model=model, messages=messages,
         max_iter=max_iter, emit=_emit,
+        system_context="\n\n".join(
+            block for block in (
+                history_block, portfolio_block, intraday_block, market_block, playstyle_block,
+            ) if block
+        ),
     )
     analysis_text = str(graph_result.get("analysis_text") or "")
     evidence_items = list(graph_result.get("evidence") or [])
+    token_usage = graph_result.get("token_usage") or {}
 
     if graph_result.get("analysis_status") == "insufficient_evidence":
         from apex.evidence_control import build_insufficient_entry
         now_cn = datetime.now(_TZ_CN)
+        outcome_reason = str(graph_result.get("outcome_reason") or "evidence_gap")
+        summaries = {
+            "evidence_gap": "已完成可用数据核验，但关键事实仍未得到可靠证据支持，暂不判断。",
+            "research_budget_exhausted": "本轮研究未在预算内完成，请按建议动作补充信息或重新运行。",
+            "model_iteration_exhausted": "证据已完成评估，但模型未能生成有效的结构化结论。",
+            "provider_failure": "模型或数据服务暂不可用，本次未形成投资判断。",
+            "review_failure": "候选结论未能完成独立复核，本次不输出投资判断。",
+        }
         entry = build_insufficient_entry(
             ts_code=ts_code, name=data.get_name_map().get(ts_code),
-            unknowns=list(graph_result.get("unknowns") or ["关键证据不足"]),
+            unknowns=list(graph_result.get("unknowns") or []),
             evidence=evidence_items,
             attempted_tools=list(graph_result.get("attempted_tools") or []),
             failures=list(graph_result.get("failures") or []),
-            research_summary="动态补证与独立复核后，关键证据仍不足，暂不判断。",
+            research_summary=summaries.get(outcome_reason, summaries["evidence_gap"]),
             analyzed_at=now_cn.isoformat(timespec="seconds"),
             analysis_text=analysis_text,
+            outcome_reason=outcome_reason,
+            next_actions=list(graph_result.get("next_actions") or []),
+            research_metrics=dict(graph_result.get("research_metrics") or {}),
         )
         entry["market_context"] = market_ctx
         entry["prompt_version"] = "3.0.0-langgraph"
+        entry["token_usage"] = token_usage
         if save:
             journal.write_entry(entry)
             try:
@@ -2049,6 +2452,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         return _finalize_position_action(
             ts_code, position_action_data, analysis_text, events,
             playstyle_feats, market_ctx, save, evidence_items=evidence_items,
+            token_usage=token_usage,
         )
 
     raw_verdict = verdict_data["verdict"]
@@ -2127,6 +2531,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "repeat_analysis": repeat_info,
         "prompt_version": "3.0.0-langgraph",
         "source": "standalone",
+        "token_usage": token_usage,
         "setup_tag": verdict_data.get("setup_tag"),
         "stock_type": verdict_data.get("stock_type"),
         "valuation_basis": verdict_data.get("valuation_basis"),
@@ -2425,6 +2830,7 @@ def _finalize_position_action(
     market_ctx: dict,
     save: bool,
     evidence_items: Optional[list[dict]] = None,
+    token_usage: Optional[dict] = None,
 ) -> dict:
     """v1.1.0 持仓路径收尾：写 position_action journal entry + 刷新 active_positions.plan。
 
@@ -2470,6 +2876,7 @@ def _finalize_position_action(
         "analysis_text": analysis_text.strip(),
         "prompt_version": "3.0.0-langgraph",
         "market_context": market_ctx,
+        "token_usage": dict(token_usage or {}),
         # P1: verdict/price_advice/features/evidence/confidence 全 None（不污染 calibration/backtest）
         "verdict": None,
         "confidence": None,

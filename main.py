@@ -32,11 +32,30 @@ def analyze(ts_code, no_save):
     """运行 DeepSeek AI 分析单只股票"""
     _clean_proxy()
     from apex.analyze import run
-    result = run(ts_code, save=not no_save)
+
+    def _progress(event):
+        if event.get("type") != "status":
+            return
+        message = str(event.get("message") or "")
+        current, total = event.get("current"), event.get("total")
+        suffix = f" ({current}/{total})" if current is not None and total is not None else ""
+        click.echo(f"→ {message}{suffix}")
+
+    result = run(ts_code, save=not no_save, on_progress=_progress)
     if result.get("analysis_status") == "insufficient_evidence":
+        reason_labels = {
+            "evidence_gap": "关键证据尚未核实",
+            "research_budget_exhausted": "本轮研究未在预算内完成",
+            "model_iteration_exhausted": "模型未能生成有效结论",
+            "provider_failure": "模型或数据服务暂不可用",
+            "review_failure": "独立复核未完成",
+        }
         click.echo(f"\n{'='*50}")
         click.echo(f"  {ts_code} → 证据不足，暂不判断")
         click.echo(f"{'='*50}")
+        reason = reason_labels.get(result.get("outcome_reason"))
+        if reason:
+            click.echo(f"原因: {reason}")
         summary = result.get("research_summary")
         if summary:
             click.echo(summary)
@@ -45,6 +64,13 @@ def analyze(ts_code, no_save):
             click.echo("关键未知项：")
             for unknown in unknowns:
                 click.echo(f"  - {unknown}")
+        evidence = result.get("evidence") or []
+        click.echo(f"已确认事实: {len(evidence)} 条")
+        next_actions = result.get("next_actions") or []
+        if next_actions:
+            click.echo("建议下一步：")
+            for action in next_actions:
+                click.echo(f"  - {action}")
         if not no_save:
             click.echo(f"\n✓ 已保存补证记录: {ts_code}")
         return

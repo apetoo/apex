@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlsplit
+
+# 单源 Tier 2 佐证要求只作用于新鲜事实：超过 90 天的传闻窗口已过，
+# 硬阻断得不偿失（601011：7 个月前对控股股东的警示函仅新浪转发官方全文，
+# 永远凑不齐第二来源）。陈旧事实交由独立复核按重要性把关。
+CORROBORATION_FRESHNESS_DAYS = 90
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,17 @@ class FinalizationDecision:
     blockers: list[str] = field(default_factory=list)
 
 
+def _requires_corroboration(iso_date: str | None, today: date) -> bool:
+    """单源 Tier 2 事实是否仍处传闻风险窗口；日期缺失按新鲜处理（保守）。"""
+    if not iso_date:
+        return True
+    try:
+        published = datetime.fromisoformat(str(iso_date)[:10]).date()
+    except ValueError:
+        return True
+    return (today - published).days <= CORROBORATION_FRESHNESS_DAYS
+
+
 class EvidenceController:
     def __init__(
         self, *, config: BudgetConfig | None = None,
@@ -50,6 +66,7 @@ class EvidenceController:
         self.attempted_tools: list[str] = []
         self.failures: list[str] = []
         self.review_issues: list[str] = []
+        self.next_actions: list[str] = []
         self._evidence_at_last_assessment = 0
         self._rework_evidence_baseline: int | None = None
 
@@ -86,11 +103,16 @@ class EvidenceController:
 
     def submit_assessment(
         self, *, thesis: str, gaps: list[dict[str, Any]], ready: bool,
+        next_actions: list[str] | None = None,
+        count_research_round: bool = True,
     ) -> None:
-        self.research_rounds += 1
         self.thesis = thesis
         self.gaps = list(gaps)
         self.ready = bool(ready)
+        self.next_actions = [str(item) for item in (next_actions or []) if str(item).strip()]
+        if not count_research_round:
+            return
+        self.research_rounds += 1
         current = len(self.evidence)
         if current <= self._evidence_at_last_assessment:
             self.no_progress_rounds += 1
@@ -130,11 +152,17 @@ class EvidenceController:
         for evidence_type, items in by_type.items():
             if not any(int(item.get("source_tier") or 3) == 2 for item in items):
                 continue
+            today = self._clock().date()
+            fresh_tier_two = [
+                item for item in items
+                if int(item.get("source_tier") or 3) == 2
+                and _requires_corroboration(item.get("published_at"), today)
+            ]
+            if not fresh_tier_two:
+                continue  # 全部陈旧：传闻窗口已过，交由独立复核把关
             has_tier_one = any(int(item.get("source_tier") or 3) == 1 for item in items)
             independent_sources = set()
-            for item in items:
-                if int(item.get("source_tier") or 3) != 2:
-                    continue
+            for item in fresh_tier_two:
                 url = str(item.get("source_url") or "")
                 hostname = (urlsplit(url).hostname or "").lower().removeprefix("www.")
                 independent_sources.add(hostname or str(item.get("source_name") or ""))
@@ -158,12 +186,25 @@ class EvidenceController:
             self.ready = False
         return outcome
 
+    def research_metrics(self, *, stop_reason: str | None = None) -> dict[str, Any]:
+        return {
+            "research_rounds": self.research_rounds,
+            "max_research_rounds": self.config.max_research_rounds,
+            "external_calls": self.external_calls,
+            "max_external_calls": self.config.max_external_calls,
+            "elapsed_seconds": round((self._clock() - self.started_at).total_seconds(), 3),
+            "stop_reason": stop_reason,
+        }
+
 
 def build_insufficient_entry(
     *, ts_code: str, name: str | None, unknowns: list[str],
     evidence: list[dict[str, Any]], attempted_tools: list[str],
     failures: list[str], research_summary: str, analyzed_at: str,
     analysis_text: str = "",
+    outcome_reason: str = "evidence_gap",
+    next_actions: list[str] | None = None,
+    research_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "ts_code": ts_code,
@@ -182,5 +223,8 @@ def build_insufficient_entry(
         "attempted_tools": list(attempted_tools),
         "research_failures": list(failures),
         "research_summary": research_summary,
+        "outcome_reason": outcome_reason,
+        "next_actions": list(next_actions or []),
+        "research_metrics": dict(research_metrics or {}),
         "analysis_text": analysis_text,
     }

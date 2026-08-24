@@ -188,17 +188,42 @@ function EvidenceValue({ value }: { value: unknown }) {
 
 function InsufficientEvidenceCard({ verdict }: { verdict: Record<string, unknown> }) {
   const unknowns = Array.isArray(verdict.unknowns) ? verdict.unknowns : [];
+  const evidence = Array.isArray(verdict.evidence) ? verdict.evidence : [];
+  const nextActions = Array.isArray(verdict.next_actions) ? verdict.next_actions : [];
+  const failures = Array.isArray(verdict.research_failures) ? verdict.research_failures : [];
+  const metrics = (verdict.research_metrics ?? {}) as Record<string, unknown>;
   const summary = typeof verdict.research_summary === "string" ? verdict.research_summary : "";
+  const reasonLabels: Record<string, string> = {
+    evidence_gap: "关键证据尚未核实",
+    research_budget_exhausted: "本轮研究未在预算内完成",
+    model_iteration_exhausted: "模型未能生成有效结论",
+    provider_failure: "模型或数据服务暂不可用",
+    review_failure: "独立复核未完成",
+  };
+  const reason = reasonLabels[String(verdict.outcome_reason ?? "")] ?? "证据不足，暂不判断";
   return (
     <Card>
       <CardHeader className="pb-3">
         <div className="flex items-center gap-2 text-amber-600">
           <ShieldAlert className="h-4 w-4" />
-          <CardTitle>证据不足，暂不判断</CardTitle>
+          <CardTitle>{reason}</CardTitle>
         </div>
       </CardHeader>
       <CardContent className="space-y-3 pt-0">
         {summary && <p className="text-sm text-text-secondary">{summary}</p>}
+        {evidence.length > 0 && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">已确认事实</div>
+            <ul className="space-y-1">
+              {evidence.map((item, index) => (
+                <li key={index} className="flex items-start gap-2 text-sm">
+                  <span className="num mt-0.5 text-[10px] text-flat">{index + 1}.</span>
+                  <EvidenceValue value={item} />
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {unknowns.length > 0 && (
           <div>
             <div className="mb-1.5 text-xs font-medium text-text-secondary">关键未知项</div>
@@ -208,6 +233,27 @@ function InsufficientEvidenceCard({ verdict }: { verdict: Record<string, unknown
               ))}
             </ul>
           </div>
+        )}
+        {nextActions.length > 0 && (
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-text-secondary">建议下一步</div>
+            <ul className="space-y-1 text-sm text-text-primary">
+              {nextActions.map((action, index) => <li key={index}>• {String(action)}</li>)}
+            </ul>
+          </div>
+        )}
+        {failures.length > 0 && (
+          <div className="rounded-md bg-bg-base p-2 text-xs text-flat">
+            <div className="mb-1 font-medium">数据源失败摘要</div>
+            {failures.map((failure, index) => <p key={index}>{String(failure)}</p>)}
+          </div>
+        )}
+        {(metrics.research_rounds != null || metrics.elapsed_seconds != null) && (
+          <p className="text-xs text-flat">
+            {metrics.research_rounds != null && `研究 ${String(metrics.research_rounds)}/${String(metrics.max_research_rounds ?? "—")} 轮`}
+            {metrics.research_rounds != null && metrics.elapsed_seconds != null && " · "}
+            {metrics.elapsed_seconds != null && `耗时 ${String(metrics.elapsed_seconds)} 秒`}
+          </p>
         )}
       </CardContent>
     </Card>

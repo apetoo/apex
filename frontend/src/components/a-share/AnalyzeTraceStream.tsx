@@ -73,9 +73,18 @@ export function AnalyzeTraceStream({ tsCode, onVerdict, className }: AnalyzeTrac
   };
 
   const running = status === "connecting" || status === "streaming";
+  const latestStage = [...events]
+    .reverse()
+    .map((event) => event.data as TraceEvent)
+    .find((data) => data.type === "status");
+  const stageProgress = latestStage?.current != null && latestStage?.total != null
+    ? ` · ${String(latestStage.current)}/${String(latestStage.total)}`
+    : "";
 
   const statusLabel = running
-    ? "分析中…"
+    ? latestStage?.message
+      ? `${String(latestStage.message)}${stageProgress}`
+      : "分析中…"
     : status === "done"
       ? "完成"
       : status === "disconnected"

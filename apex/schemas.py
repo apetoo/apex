@@ -184,6 +184,9 @@ class JournalEntry(TypedDict, total=False):
     analysis_status: Literal["completed", "insufficient_evidence"]
     unknowns: list[str]
     research_summary: str
+    outcome_reason: Optional[str]
+    next_actions: list[str]
+    research_metrics: dict
     date: str
     verdict: str
     confidence: int

@@ -70,6 +70,22 @@ export interface LatestJournal {
   evidence?: Array<string | EvidenceItem>;
   unknowns?: string[];
   research_summary?: string;
+  outcome_reason?:
+    | "evidence_gap"
+    | "research_budget_exhausted"
+    | "model_iteration_exhausted"
+    | "provider_failure"
+    | "review_failure";
+  next_actions?: string[];
+  research_failures?: string[];
+  research_metrics?: {
+    research_rounds?: number;
+    max_research_rounds?: number;
+    external_calls?: number;
+    max_external_calls?: number;
+    elapsed_seconds?: number;
+    stop_reason?: string | null;
+  };
   price_advice?: {
     entry?: number | null;
     entry_low?: number | null;

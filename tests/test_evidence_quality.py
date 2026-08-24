@@ -1,6 +1,11 @@
 from datetime import date
 
-from apex.evidence import make_evidence_item, normalize_search_results, source_tier
+from apex.evidence import (
+    classify_evidence_type,
+    make_evidence_item,
+    normalize_search_results,
+    source_tier,
+)
 
 
 def _result(title, url, snippet="", published="2026-08-17", site=""):
@@ -164,3 +169,49 @@ def test_builds_structured_evidence_item():
     assert item["source_url"] == "https://www.cninfo.com.cn/a"
     assert item["source_tier"] == 1
     assert item["entity_matched"] is True
+
+
+def test_quote_page_with_earnings_chrome_is_not_evidence():
+    # 601872 毒证据：行情页框架含"预计净利润"被误判成 earnings Tier 2，
+    # 独占一个 material 桶后又无法交叉验证 -> 错误弃权
+    rows = [
+        _result(
+            "招商轮船 16.29 0.10(0.62%)最新价格_行情_走势图-东方财富网",
+            "https://quote.eastmoney.com/sh601872.html?date=2026-07-29",
+            "招商轮船 601872 预计净利润 市盈率 行情",
+            published="2026-07-29",
+            site="东方财富网",
+        ),
+        _result(
+            "航运业狂飙:招商轮船半年净利预计大增超200%",
+            "https://news.qq.com/rain/a/20260722A0000Q",
+            "招商轮船 业绩预告 净利润",
+            published="2026-07-22",
+            site="腾讯网",
+        ),
+    ]
+
+    accepted, quality = normalize_search_results(
+        rows, ts_code="601872.SH", name="招商轮船", category="earnings",
+        today=date(2026, 8, 19),
+    )
+
+    assert [row["site"] for row in accepted] == ["腾讯网"]
+    assert quality["filtered_count"] == 1
+
+
+def test_classify_evidence_type_by_content_with_preferred_tiebreak():
+    assert classify_evidence_type("收到上海监管局《行政监管措施决定书》") == "regulatory"
+    assert classify_evidence_type("2026年半年度业绩预增公告 归母净利润") == "earnings"
+    assert classify_evidence_type("业绩 净利润", preferred="earnings") == "earnings"
+    assert classify_evidence_type(" completely unrelated text ") == "general"
+    assert classify_evidence_type("纯行情 JSON", default="structured_data") == "structured_data"
+
+
+def test_controlling_shareholder_wording_is_regulatory_not_shareholders():
+    # 601011 根因：监管公告里"控股股东"是主体描述词，不能因"股东"二字归 shareholders
+    text = "关于对宝泰隆集团有限公司予以监管警示的决定 当事人系宝泰隆新材料股份有限公司控股股东"
+    assert classify_evidence_type(text) == "regulatory"
+    # 真正的股东动作仍归 shareholders
+    assert classify_evidence_type("控股股东质押股份") == "shareholders"
+    assert classify_evidence_type("股东减持计划公告") == "shareholders"

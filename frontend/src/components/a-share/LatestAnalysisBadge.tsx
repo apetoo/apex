@@ -62,6 +62,9 @@ export function LatestAnalysisBadge({
 
   const isPa = data.source === "position_action";
   const insufficient = data.analysis_status === "insufficient_evidence";
+  const insufficientLabel = data.outcome_reason === "evidence_gap" || !data.outcome_reason
+    ? "证据不足"
+    : "分析未完成";
   const days = daysSince(data.analyzed_at);
   const stale = days != null && days > STALE_DAYS;
   const dateLabel =
@@ -83,7 +86,7 @@ export function LatestAnalysisBadge({
       >
         <Sparkles className="h-3 w-3 shrink-0 text-up" />
         {insufficient ? (
-          <span className="font-medium text-flat">证据不足</span>
+          <span className="font-medium text-flat">{insufficientLabel}</span>
         ) : isPa ? (
           <PaBadgeLine entry={data} stopBefore={stopBefore} />
         ) : (
@@ -234,9 +237,12 @@ function evidenceText(ev: NonNullable<LatestJournal["evidence"]>[number]): strin
 }
 
 function InsufficientPopover({ entry }: { entry: LatestJournal }) {
+  const title = entry.outcome_reason === "evidence_gap" || !entry.outcome_reason
+    ? "证据不足，暂不判断"
+    : "分析流程未完成，暂不判断";
   return (
     <div className="space-y-2 text-[11px]">
-      <p className="font-semibold text-flat">证据不足，暂不判断</p>
+      <p className="font-semibold text-flat">{title}</p>
       {entry.research_summary && (
         <p className="text-text-secondary">{entry.research_summary}</p>
       )}

@@ -49,7 +49,7 @@ def test_clean_authoritative_scan_and_no_critical_gaps_can_finalize():
 
 
 def test_tier_two_material_fact_requires_independent_corroboration():
-    ctl = EvidenceController()
+    ctl = EvidenceController(clock=lambda: datetime(2026, 8, 19, tzinfo=timezone.utc))
     ctl.record_safety_scan(success=True, evidence=[_ev("official_scan", tier=1)])
     tier_two = _ev("media_claim", tier=2)
     tier_two.update({
@@ -71,6 +71,38 @@ def test_tier_two_material_fact_requires_independent_corroboration():
     })
     ctl.add_evidence([corroboration])
     assert ctl.finalization_decision().allowed is True
+
+
+def test_stale_tier_two_fact_does_not_require_corroboration():
+    # 601011 复盘：7 个月前对控股股东的监管警示仅新浪转发官方全文，
+    # 永远凑不齐第二来源 -> 陈旧豁免，交由独立复核把关
+    ctl = EvidenceController(clock=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc))
+    stale = _ev("sina_reprint", tier=2)
+    stale.update({
+        "evidence_type": "regulatory",
+        "published_at": "2026-01-06",
+        "source_name": "新浪财经",
+        "source_url": "http://vip.stock.finance.sina.com.cn/corp/view/x.html",
+    })
+    ctl.record_safety_scan(success=True, evidence=[stale])
+    ctl.submit_assessment(thesis="偏空", gaps=[], ready=True)
+
+    assert ctl.finalization_decision().allowed is True
+
+
+def test_missing_date_tier_two_fact_still_requires_corroboration():
+    ctl = EvidenceController(clock=lambda: datetime(2026, 8, 20, tzinfo=timezone.utc))
+    undated = _ev("undated_claim", tier=2)
+    undated.update({
+        "evidence_type": "regulatory",
+        "published_at": None,
+        "source_name": "财经媒体甲",
+        "source_url": "https://www.eastmoney.com/a",
+    })
+    ctl.record_safety_scan(success=True, evidence=[undated])
+    ctl.submit_assessment(thesis="偏空", gaps=[], ready=True)
+
+    assert ctl.finalization_decision().allowed is False
 
 
 def test_tier_three_lead_cannot_resolve_critical_gap():
@@ -142,6 +174,31 @@ def test_review_rework_requires_new_evidence_and_fresh_assessment():
     assert ctl.finalization_decision().allowed is True
 
 
+def test_601872_scenario_tier_two_scan_events_do_not_block():
+    # 601872 错误弃权复盘：扫描只命中 Tier 2 双源警示函（不再判失败、不再丢证据），
+    # earnings 由妙想公告 Tier 1 + 腾讯 Tier 2 印证 -> 不应再弃权
+    ctl = EvidenceController()
+    scan_events = [
+        {**_ev("scan_stcn", tier=2), "evidence_type": "regulatory",
+         "source_name": "证券时报", "source_url": "https://www.stcn.com/article/detail/3916366.html"},
+        {**_ev("scan_qq", tier=2), "evidence_type": "regulatory",
+         "source_name": "腾讯网", "source_url": "https://news.qq.com/rain/a/20260519A0962Q00"},
+    ]
+    ctl.record_safety_scan(success=True, evidence=scan_events)
+    assert ctl.safety_scan_status == "events_found"
+
+    ctl.add_evidence([
+        {**_ev("mx_announcement", tier=1), "evidence_type": "earnings",
+         "tool_name": "mx_news_search", "source_name": "mx_news_search", "source_url": None},
+        {**_ev("qq_earnings", tier=2), "evidence_type": "earnings",
+         "source_name": "腾讯网", "source_url": "https://news.qq.com/rain/a/20260722A0000Q00"},
+    ])
+    ctl.submit_assessment(thesis="偏多", gaps=[], ready=True)
+
+    decision = ctl.finalization_decision()
+    assert decision.allowed is True, decision.blockers
+
+
 def test_builds_non_actionable_insufficient_entry():
     entry = build_insufficient_entry(
         ts_code="002050.SZ",
@@ -152,6 +209,9 @@ def test_builds_non_actionable_insufficient_entry():
         failures=["web_search timeout"],
         research_summary="已尝试权威来源，仍无法确认。",
         analyzed_at="2026-08-19T10:00:00+08:00",
+        outcome_reason="evidence_gap",
+        next_actions=["核实交易所公告"],
+        research_metrics={"research_rounds": 3, "stop_reason": "research_round_budget"},
     )
 
     assert entry["analysis_status"] == "insufficient_evidence"
@@ -160,3 +220,6 @@ def test_builds_non_actionable_insufficient_entry():
     assert entry["price_advice"] is None
     assert entry["position_action"] is None
     assert entry["unknowns"] == ["重大事件无法核实"]
+    assert entry["outcome_reason"] == "evidence_gap"
+    assert entry["next_actions"] == ["核实交易所公告"]
+    assert entry["research_metrics"]["stop_reason"] == "research_round_budget"

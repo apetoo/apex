@@ -53,6 +53,32 @@ describe("VerdictDetailCard - evidence research states", () => {
     expect(screen.queryByText("加入候选")).toBeNull();
   });
 
+  it("shows actionable provider failure report with evidence actions failures and metrics", () => {
+    withClient(
+      <VerdictDetailCard
+        verdict={{
+          ts_code: "603893.SH",
+          analysis_status: "insufficient_evidence",
+          outcome_reason: "provider_failure",
+          research_summary: "模型或数据服务暂不可用，本次未形成投资判断。",
+          unknowns: [],
+          next_actions: ["模型服务恢复后重新运行分析"],
+          research_failures: ["model: connection timeout"],
+          research_metrics: { research_rounds: 2, max_research_rounds: 3, elapsed_seconds: 91.2 },
+          evidence: [{ id: "ev_1", fact: "已取得最新日线行情", source_tier: 1, source_name: "行情数据" }],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("模型或数据服务暂不可用")).toBeTruthy();
+    expect(screen.getByText(/已取得最新日线行情/)).toBeTruthy();
+    expect(screen.getByText(/模型服务恢复后重新运行分析/)).toBeTruthy();
+    expect(screen.getByText(/connection timeout/)).toBeTruthy();
+    expect(screen.getByText(/研究 2\/3 轮/)).toBeTruthy();
+    expect(screen.getByText(/91.2 秒/)).toBeTruthy();
+    expect(screen.queryByText("加入候选")).toBeNull();
+  });
+
   it("renders structured evidence fact, inference, tier and source link", () => {
     withClient(
       <VerdictDetailCard

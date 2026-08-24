@@ -20,16 +20,28 @@ _TIER_2_HOSTS = (
 )
 _TIER_3_HOSTS = ("guba.eastmoney.com", "caifuhao.eastmoney.com", "xueqiu.com")
 _TIER_3_MARKERS = ("股吧", "财富号", "自媒体", "博客")
+_TIER_1_PUBLISHERS = ("巨潮资讯", "上海证券交易所", "深圳证券交易所", "北京证券交易所", "中国证监会")
+_TIER_2_PUBLISHERS = (
+    "中国证券报", "上海证券报", "证券时报", "证券日报", "财联社",
+    "第一财经", "每日经济新闻", "南方财经", "新浪财经", "经济观察报",
+)
 
 _CATEGORY_TERMS = {
-    "earnings": ("业绩", "营收", "利润", "财报", "季报", "年报", "预告", "销售"),
-    "shareholders": ("股东", "减持", "增持", "解禁", "大宗交易", "回购"),
+    "earnings": ("业绩", "营收", "利润", "净利", "财报", "季报", "年报", "预告", "销售"),
+    # "股东"不能作 shareholders 词：监管公告里的"控股股东"是主体描述词，
+    # 会把监管警示误归 shareholders 桶（601011 弃权根因之一）。
+    "shareholders": ("减持", "增持", "解禁", "大宗交易", "回购", "质押", "冻结"),
     "regulatory": ("立案", "处罚", "诉讼", "问询", "监管", "警示", "违规", "涉税"),
     "money_flow": ("北向", "龙虎榜", "主力", "机构", "资金", "席位"),
     "corporate_actions": ("定增", "配股", "回购", "重组", "并购", "收购"),
     "research": ("研报", "评级", "目标价", "一致预期"),
     "industry": ("政策", "景气", "需求", "补贴", "供给", "价格"),
 }
+
+# 行情页不是证据：页面框架含业绩/监管词会被 _category_matches 误收，
+# 进 material 桶后又无法被交叉验证（601872 弃权根因之一）。
+_QUOTE_PAGE_HOSTS = ("quote.eastmoney.com", "q.stock.sohu.com")
+_QUOTE_TITLE_RE = re.compile(r"最新价格|行情走势|行情中心|实时行情")
 
 
 def _hostname(url: str) -> str:
@@ -50,6 +62,10 @@ def source_tier(url: str, site_name: str = "") -> int:
         return 2
     if any(marker in (site_name or "") for marker in _TIER_3_MARKERS):
         return 3
+    if any(marker in (site_name or "") for marker in _TIER_1_PUBLISHERS):
+        return 1
+    if any(marker in (site_name or "") for marker in _TIER_2_PUBLISHERS):
+        return 2
     return 3
 
 
@@ -76,9 +92,33 @@ def _entity_matches(text: str, ts_code: str, name: str) -> bool:
     return bool((name and _compact(name) in compact) or code in compact or qualified in compact)
 
 
+def entity_matches(text: str, ts_code: str, name: str) -> bool:
+    """Public entity-match policy shared by web and aggregated-news evidence."""
+    return _entity_matches(text, ts_code, name)
+
+
 def _category_matches(text: str, category: str) -> bool:
     terms = _CATEGORY_TERMS.get(category)
     return True if not terms else any(term in text for term in terms)
+
+
+def _is_quote_page(url: str, title: str) -> bool:
+    """纯行情/报价页（无编辑内容，不携带任何事实主张）。"""
+    return _hostname(url) in _QUOTE_PAGE_HOSTS or bool(_QUOTE_TITLE_RE.search(title or ""))
+
+
+def classify_evidence_type(text: str, *, preferred: str = "", default: str = "general") -> str:
+    """按内容词归类证据；preferred（查询 category）同分时优先。
+
+    证据归属由内容决定而非查询入口决定：general 搜索命中的警示函归 regulatory，
+    妙想返回的业绩预增公告归 earnings——交叉验证按桶进行，分错桶=漏验证。
+    """
+    if preferred in _CATEGORY_TERMS and any(t in text for t in _CATEGORY_TERMS[preferred]):
+        return preferred
+    for category, terms in _CATEGORY_TERMS.items():
+        if category != preferred and any(term in text for term in terms):
+            return category
+    return default
 
 
 def _freshness(value: str, today: date) -> tuple[str, str]:
@@ -110,6 +150,9 @@ def normalize_search_results(
         combined = f"{title} {snippet}"
         entity_matched = _entity_matches(combined, ts_code, name)
         freshness_status, published_at = _freshness(str(raw.get("date") or ""), today)
+        if _is_quote_page(str(raw.get("url") or ""), title):
+            filtered += 1
+            continue
         if (category != "industry" and not entity_matched) or not _category_matches(combined, category):
             filtered += 1
             continue

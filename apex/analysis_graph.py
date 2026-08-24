@@ -31,6 +31,16 @@ class AnalysisGraphState(TypedDict, total=False):
     unknowns: list[str]
     attempted_tools: list[str]
     failures: list[str]
+    # 未注册的 key 会被 LangGraph 从节点返回值里静默丢弃（token_usage 曾因此
+    # 恒为空 dict 落进 journal）。
+    token_usage: dict[str, Any]
+    outcome_reason: str | None
+    next_actions: list[str]
+    research_metrics: dict[str, Any]
+    draft_route: str
+    review_revision_count: int
+    final_assessment_requested: bool
+    final_assessment_done: bool
 
 
 Node = Callable[[AnalysisGraphState], dict[str, Any]]
@@ -53,6 +63,10 @@ def _after_reason(state: AnalysisGraphState) -> str:
     return "tools" if state.get("pending_tools") else "assess"
 
 
+def _after_safety_scan(state: AnalysisGraphState) -> str:
+    return "assess" if state.get("outcome_reason") else "reason"
+
+
 def _after_assess(state: AnalysisGraphState) -> str:
     route = state.get("route") or "abstain"
     return route if route in {"research", "draft", "abstain"} else "abstain"
@@ -63,8 +77,13 @@ def _after_review(state: AnalysisGraphState) -> str:
     return {
         "pass": "finalize",
         "rework": "research",
+        "revise": "draft",
         "abstain": "abstain",
     }.get(outcome, "abstain")
+
+
+def _after_draft(state: AnalysisGraphState) -> str:
+    return "abstain" if state.get("draft_route") == "abstain" else "review"
 
 
 def build_analysis_graph(handlers: GraphHandlers):
@@ -82,7 +101,9 @@ def build_analysis_graph(handlers: GraphHandlers):
 
     graph.add_edge(START, "prepare")
     graph.add_edge("prepare", "safety_scan")
-    graph.add_edge("safety_scan", "reason")
+    graph.add_conditional_edges("safety_scan", _after_safety_scan, {
+        "reason": "reason", "assess": "assess",
+    })
     graph.add_conditional_edges("reason", _after_reason, {
         "tools": "tools", "assess": "assess",
     })
@@ -90,9 +111,11 @@ def build_analysis_graph(handlers: GraphHandlers):
     graph.add_conditional_edges("assess", _after_assess, {
         "research": "reason", "draft": "draft", "abstain": "abstain",
     })
-    graph.add_edge("draft", "review")
+    graph.add_conditional_edges("draft", _after_draft, {
+        "review": "review", "abstain": "abstain",
+    })
     graph.add_conditional_edges("review", _after_review, {
-        "finalize": "finalize", "research": "reason", "abstain": "abstain",
+        "finalize": "finalize", "research": "reason", "draft": "draft", "abstain": "abstain",
     })
     graph.add_edge("finalize", END)
     graph.add_edge("abstain", END)

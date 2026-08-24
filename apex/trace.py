@@ -229,7 +229,24 @@ def summarize_mx_data_query(raw) -> dict:
     entities = []
     for t in tables:
         rows = t.get("rows") or []
-        entities.append({"entity": t.get("entity", ""), "rows": len(rows)})
+        # 保留行内具体数值（丢摘要/原因等长文本字段）：旧版只留 entity+行数，
+        # 独立复核对着 evidence ledger 找不到"405.8亿/66-73亿"这类关键数字，
+        # 只能判"无具体数值"并强制 rework -> 白耗预算后错误弃权。
+        compact_rows = []
+        for r in rows[:2]:
+            if not isinstance(r, dict):
+                continue
+            pairs = ";".join(
+                f"{k}={v}" for k, v in r.items()
+                if str(v) not in ("", "-", "None")
+                and "摘要" not in str(k) and "原因" not in str(k)
+            )
+            if pairs:
+                compact_rows.append(pairs[:200])
+        entities.append({
+            "entity": t.get("entity", ""),
+            "rows": compact_rows or len(rows),
+        })
     return {"source": "mx:data", "query": data.get("query"), "tables": entities}
 
 
