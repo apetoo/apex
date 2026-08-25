@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
+from types import SimpleNamespace
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from scrapy.exceptions import CloseSpider
@@ -491,14 +493,41 @@ def assert_current_public_comment_request(request, content_id: str) -> None:
     """Assert the observable public request, including the comment identity it carries."""
     assert request.cb_kwargs["job"]["kind"] == "comments"
     assert request.cb_kwargs["job"]["content_id"] == content_id
-    assert isinstance(request, FormRequest)
-    assert request.url == (
-        "https://guba.eastmoney.com/api/getData?code=bk0910&"
-        "path=reply/api/Reply/ArticleNewReplyList"
+    assert request.method == "GET"
+    parsed = urlparse(request.url)
+    assert parsed.netloc == "gbapi.eastmoney.com"
+    assert parsed.path == "/reply/JSONP/ArticleNewReplyList"
+    assert parse_qs(parsed.query)["postid"] == [content_id]
+
+
+def test_comment_parser_accepts_bounded_jsonp_reply_payload():
+    """Catches the public JSONP transport being rejected before contract validation."""
+    parser = EastmoneyParser()
+    payload = current_reply_page(first_id=1, row_count=1, total_count=1)
+    body = f"jQuery_apex({json.dumps(payload)});".encode()
+
+    page = parser.parse_comment_page(
+        body, "application/javascript", content_id="1759677380", page=1,
     )
 
+    assert [record["comment_id"] for record in page.records] == ["reply-1"]
+    assert page.has_more is False
 
-def test_legacy_comment_template_uses_public_no_cookie_reply_api_post(tmp_path: Path):
+
+def test_comment_parser_uses_json_body_when_backup_mislabels_content_type():
+    """Catches the public backup returning valid reply JSON as text/html."""
+    parser = EastmoneyParser()
+    payload = current_reply_page(first_id=1, row_count=1, total_count=1)
+
+    page = parser.parse_comment_page(
+        json.dumps(payload).encode(), "text/html; charset=utf-8",
+        content_id="1759677380", page=1,
+    )
+
+    assert [record["comment_id"] for record in page.records] == ["reply-1"]
+
+
+def test_legacy_comment_template_uses_public_no_cookie_primary_reply_api(tmp_path: Path):
     """Catches comments reverting to the retired GET endpoint or requiring browser login state."""
     manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk1106.html")
     manifest.pop("test_hosts")
@@ -513,28 +542,126 @@ def test_legacy_comment_template_uses_public_no_cookie_reply_api_post(tmp_path: 
 
     request = spider._request(comment_job)
 
-    assert isinstance(request, FormRequest)
-    assert request.method == "POST"
-    assert request.url == (
-        "https://guba.eastmoney.com/api/getData?code=bk1106&"
-        "path=reply/api/Reply/ArticleNewReplyList"
-    )
-    assert parse_qs(request.body.decode("utf-8"), keep_blank_values=True) == {
-        "param": ["postid=1759677380&sort=1&sorttype=1&p=1&ps=30&needHide=true"],
-        "plat": ["Web"],
-        "path": ["reply/api/Reply/ArticleNewReplyList"],
-        # CDP capture of the public production page: env=1 returns an unrelated
-        # security payload, while env=2 returns ArticleNewReplyList reply_* data.
-        "env": ["2"],
-        "origin": [""],
-        "version": ["2022"],
-        "product": ["Guba"],
+    assert request.method == "GET"
+    parsed = urlparse(request.url)
+    assert parsed.netloc == "gbapi.eastmoney.com"
+    assert parsed.path == "/reply/JSONP/ArticleNewReplyList"
+    assert parse_qs(parsed.query) == {
+        "callback": ["jQuery_apex"], "plat": ["web"], "version": ["300"],
+        "product": ["guba"], "postid": ["1759677380"], "sort": ["1"],
+        "sorttype": ["1"], "p": ["1"], "ps": ["30"], "type": ["0"],
+        "h": [hashlib.md5(b"1759677380").hexdigest()],
     }
-    assert request.headers.getlist(b"Origin") == [b"https://guba.eastmoney.com"]
     assert request.headers.getlist(b"Referer") == [
         b"https://guba.eastmoney.com/news,bk1106,1759677380.html",
     ]
     assert b"Cookie" not in request.headers
+
+
+def test_primary_comment_schema_failure_retries_same_post_on_backup_once(tmp_path: Path):
+    """Catches a false-success primary payload dropping comments or retrying per target."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    job = dict(manifest["jobs"][0], kind="comments", content_id="1001",
+               forum_id="bk0910", url="https://guba.eastmoney.com/comments/1001")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    request = spider._request(job)
+    response = HtmlResponse(
+        url=request.url,
+        body=json.dumps({"re": True, "result": [{"security": "1$600111$1"}]}).encode(),
+        encoding="utf-8", headers={b"Content-Type": b"application/json"},
+    )
+
+    children = list(spider.parse_job(response, request.cb_kwargs["job"]))
+
+    assert len(children) == 1
+    backup = children[0]
+    assert isinstance(backup, FormRequest)
+    assert backup.url == "https://guba.eastmoney.com/interface/GetData.aspx"
+    assert backup.cb_kwargs["job"]["comment_source"] == "backup"
+    assert spider.comment_fallback_used is True
+    assert spider.comment_source_failures == {"primary": 1, "backup": 0}
+
+
+def test_both_comment_sources_fail_once_then_open_comment_only_circuit(tmp_path: Path):
+    """Catches repeated malformed comments consuming the batch or closing the post spider."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    malformed = json.dumps({"re": True, "result": []}).encode()
+    job = dict(manifest["jobs"][0], kind="comments", content_id="1001",
+               forum_id="bk0910", url="https://guba.eastmoney.com/comments/1001")
+    primary = spider._request(job)
+    fallback = list(spider.parse_job(HtmlResponse(
+        url=primary.url, body=malformed, encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    ), primary.cb_kwargs["job"]))[0]
+
+    assert list(spider.parse_job(HtmlResponse(
+        url=fallback.url, body=malformed, encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    ), fallback.cb_kwargs["job"])) == []
+    assert spider.comment_circuit_open is True
+    assert spider.comment_source_failures == {"primary": 1, "backup": 1}
+    assert spider._request(dict(job, content_id="1002")) is None
+    assert spider.terminal_reason is None
+    spider.records = 1
+    spider.closed("finished")
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert EastmoneyRunner.classify_result(report).status == "partial"
+
+
+def test_primary_comment_network_failure_switches_to_backup(tmp_path: Path):
+    """Catches transport failures bypassing the same fallback used for bad contracts."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    primary = spider._request(dict(
+        manifest["jobs"][0], kind="comments", content_id="1001", forum_id="bk0910",
+    ))
+
+    backup = spider.request_failed(SimpleNamespace(request=primary))
+
+    assert isinstance(backup, FormRequest)
+    assert backup.url == "https://guba.eastmoney.com/interface/GetData.aspx"
+    assert spider.comment_fallback_used is True
+
+
+def test_primary_comment_access_control_switches_to_backup_without_global_close(tmp_path: Path):
+    """Catches a blocked comment endpoint closing otherwise healthy post collection."""
+    manifest = _manifest(tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html")
+    manifest.pop("test_hosts")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    primary = spider._request(dict(
+        manifest["jobs"][0], kind="comments", content_id="1001", forum_id="bk0910",
+    ))
+    response = HtmlResponse(
+        url=primary.url, body="<html>请输入验证码</html>".encode(), encoding="utf-8",
+        headers={b"Content-Type": b"text/html"},
+    )
+
+    children = list(spider.parse_job(response, primary.cb_kwargs["job"]))
+
+    assert len(children) == 1
+    assert children[0].cb_kwargs["job"]["comment_source"] == "backup"
+    assert spider.terminal_reason is None
+
+
+def test_comment_subquota_stops_comments_without_consuming_core_quota(tmp_path: Path):
+    """Catches comments exhausting the shared request budget before detail requests run."""
+    manifest = _manifest(
+        tmp_path, "https://guba.eastmoney.com", path="/list,bk0910.html",
+        settings_override={"max_requests": 10, "max_comment_requests": 1},
+    )
+    manifest.pop("test_hosts")
+    spider = EastmoneySpider(manifest=manifest, report_path=str(tmp_path / "report.json"))
+    base = manifest["jobs"][0]
+
+    assert spider._request(dict(base, kind="comments", content_id="1001")) is not None
+    assert spider._request(dict(base, kind="comments", content_id="1002")) is None
+    assert spider._request(dict(base, kind="detail", content_id="1002")) is not None
+    assert spider.quota.request_count == 2
+    assert spider.comment_quota.exhausted is True
 
 
 def test_current_reply_api_count_uses_thirty_row_pages_and_stops_at_window_floor():
@@ -587,10 +714,8 @@ def test_current_reply_api_spider_requests_page_two_and_enforces_fifty_comment_c
     children = list(spider.parse_job(first_response, job))
     assert len(children) == 1
     page_two = children[0]
-    assert isinstance(page_two, FormRequest)
-    assert parse_qs(page_two.body.decode("utf-8"))["param"] == [
-        "postid=1759677380&sort=1&sorttype=1&p=2&ps=30&needHide=true",
-    ]
+    assert page_two.method == "GET"
+    assert parse_qs(urlparse(page_two.url).query)["p"] == ["2"]
 
     second_response = HtmlResponse(
         url=page_two.url, body=json.dumps(
@@ -651,20 +776,23 @@ def test_unrelated_comment_security_payload_degrades_only_comments_and_preserves
     # This is the observed unauthenticated false-success body from the comment
     # proxy: it is JSON, but not an ArticleNewReplyList payload.
     security_payload = {"re": True, "result": [{"security": "1$600111$12050879181666"}]}
-    for content_id in ("1001", "1002"):
-        comment_job = dict(job, kind="comments", content_id=content_id,
-                           url="https://guba.eastmoney.com/api/getData")
-        response = HtmlResponse(
-            url=comment_job["url"], body=json.dumps(security_payload).encode(), encoding="utf-8",
-            headers={b"Content-Type": b"application/json"},
-        )
-        assert list(spider.parse_job(response, comment_job)) == []
+    comment_job = dict(job, kind="comments", content_id="1001",
+                       url="https://guba.eastmoney.com/comments/1001")
+    primary = spider._request(comment_job)
+    backup = list(spider.parse_job(HtmlResponse(
+        url=primary.url, body=json.dumps(security_payload).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    ), primary.cb_kwargs["job"]))[0]
+    assert list(spider.parse_job(HtmlResponse(
+        url=backup.url, body=json.dumps(security_payload).encode(), encoding="utf-8",
+        headers={b"Content-Type": b"application/json"},
+    ), backup.cb_kwargs["job"])) == []
 
     spider.closed("finished")
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["records"] == 1
     assert report["parser_errors"] == 2
-    assert report["failed_targets"] == 1
+    assert report["failed_targets"] == 0
     assert "terminal_reason" not in report
     assert EastmoneyRunner.classify_result(report).status == "partial"
 
@@ -689,18 +817,20 @@ def test_non_object_comment_row_degrades_with_audited_parser_error_and_preserves
     assert list(spider.parse_job(detail_response, detail_job)) == []
 
     comment_job = dict(job, kind="comments", content_id="1001",
-                       url="https://guba.eastmoney.com/api/getData")
+                       url="https://guba.eastmoney.com/comments/1001")
     malformed_response = HtmlResponse(
         url=comment_job["url"], body=json.dumps({"re": [True], "count": 1}).encode(),
         encoding="utf-8", headers={b"Content-Type": b"application/json"},
     )
 
-    assert list(spider.parse_job(malformed_response, comment_job)) == []
+    primary = spider._request(comment_job)
+    fallback = list(spider.parse_job(malformed_response, primary.cb_kwargs["job"]))[0]
+    assert list(spider.parse_job(malformed_response, fallback.cb_kwargs["job"])) == []
     spider.closed("finished")
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["records"] == 1
-    assert report["parser_errors"] == 1
-    assert report["failed_targets"] == 1
+    assert report["parser_errors"] == 2
+    assert report["failed_targets"] == 0
     assert "terminal_reason" not in report
     assert EastmoneyRunner.classify_result(report).status == "partial"
 

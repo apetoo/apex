@@ -298,9 +298,15 @@ function EastmoneyStatus({
           <span>帖子 {telemetry.posts}</span><span>一级评论 {telemetry.first_level_comments}</span>
           <span>独立作者 {telemetry.independent_authors}</span>
           <span>板块吧 {telemetry.sector_forum_records}</span><span>成分股吧 {telemetry.constituent_forum_records}</span>
-          <span>请求成功率 {(telemetry.request_success_rate * 100).toFixed(0)}%</span>
+          <span>HTTP 成功率 {(telemetry.request_success_rate * 100).toFixed(0)}%</span>
+          <span>业务响应成功率 {(telemetry.business_success_rate * 100).toFixed(0)}%</span>
           <span>解析成功率 {(telemetry.parse_success_rate * 100).toFixed(0)}%</span>
         </div>
+        <p className="text-xs text-text-secondary">
+          评论源 {telemetry.comment_source === "backup" ? "备用" : "主路"}
+          {telemetry.comment_fallback_used ? " · 已自动切换" : ""}
+          {telemetry.comment_circuit_open ? " · 评论采集已熔断" : ""}
+        </p>
         <p className="text-xs text-text-secondary">影子采集 {telemetry.shadow_days} / {telemetry.shadow_target_days} 个交易日</p>
         {telemetry.phase === "shadow" && <p className="text-xs text-text-secondary">尝试 {telemetry.shadow_attempt_days} 日 · 质量达标 {telemetry.shadow_qualified_days} 日；当前不参与评分</p>}
         {(telemetry.quota_exhausted || telemetry.circuit_open) && (

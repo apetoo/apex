@@ -179,7 +179,13 @@ class EastmoneyParser:
                            page: int = 1) -> CommentPage:
         text = body.decode("utf-8", errors="replace")
         self._ensure_not_blocked(text)
-        if "json" not in content_type.lower():
+        stripped = text.lstrip()
+        structured = (
+            any(marker in content_type.lower() for marker in ("json", "javascript"))
+            or stripped.startswith("{")
+            or bool(re.match(r"(?:jQuery|callback)[A-Za-z0-9_$]*\(", stripped))
+        )
+        if not structured:
             parser = _CommentHTMLParser()
             parser.feed(text)
             if not parser.comments:
@@ -246,8 +252,18 @@ class EastmoneyParser:
 
     @staticmethod
     def _json(text: str) -> dict:
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            match = re.fullmatch(
+                r"(?:jQuery|callback)[A-Za-z0-9_$]*\((\{.*\})\)\s*;?",
+                stripped,
+                flags=re.DOTALL,
+            )
+            if match is None:
+                raise SchemaChanged("invalid JSONP response")
+            stripped = match.group(1)
         try:
-            value = json.loads(text)
+            value = json.loads(stripped)
         except json.JSONDecodeError as exc:
             raise SchemaChanged("invalid JSON response") from exc
         if not isinstance(value, dict):

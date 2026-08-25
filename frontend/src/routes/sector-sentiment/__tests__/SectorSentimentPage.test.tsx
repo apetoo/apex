@@ -46,6 +46,8 @@ vi.mock("@/api/sector-sentiment", () => ({
       first_level_comments: 34, independent_authors: 9,
       sector_forum_records: 30, constituent_forum_records: 16,
       request_success_rate: 0.98, parse_success_rate: 0.96,
+      business_success_rate: 0.94, comment_source: "backup",
+      comment_fallback_used: true, comment_circuit_open: false,
       quota_exhausted: false, circuit_open: false, schema_changed: false,
       blocked: true, stale: true, current_attempt_at: "2026-08-10T10:00:00Z",
       latest_success_at: "2026-08-09T10:00:00Z", shadow_days: 5, shadow_target_days: 14,
@@ -72,6 +74,8 @@ getSectorSentimentDetail.mockResolvedValue({
     first_level_comments: 34, independent_authors: 9,
     sector_forum_records: 30, constituent_forum_records: 16,
     request_success_rate: 0.98, parse_success_rate: 0.96,
+    business_success_rate: 0.94, comment_source: "backup",
+    comment_fallback_used: true, comment_circuit_open: false,
     quota_exhausted: false, circuit_open: false, schema_changed: false,
     blocked: true, stale: true, current_attempt_at: "2026-08-10T10:00:00Z",
     latest_success_at: "2026-08-09T10:00:00Z", shadow_days: 5, shadow_target_days: 14,
@@ -233,6 +237,9 @@ test("shows Eastmoney stale telemetry and 14-day shadow progress", async () => {
   expect(screen.getByText("帖子 12")).toBeInTheDocument();
   expect(screen.getByText("一级评论 34")).toBeInTheDocument();
   expect(screen.getByText("独立作者 9")).toBeInTheDocument();
+  expect(screen.getByText("HTTP 成功率 98%")).toBeInTheDocument();
+  expect(screen.getByText("业务响应成功率 94%")).toBeInTheDocument();
+  expect(screen.getByText(/评论源 备用/)).toBeInTheDocument();
   expect(screen.getByText("影子采集 5 / 14 个交易日")).toBeInTheDocument();
 });
 
@@ -254,6 +261,8 @@ test("shows stale score date when the API fallback is stale but raw telemetry is
       posts: 0, first_level_comments: 0, independent_authors: 0,
       sector_forum_records: 0, constituent_forum_records: 0,
       request_success_rate: 0, parse_success_rate: 0,
+      business_success_rate: 0, comment_source: "primary",
+      comment_fallback_used: false, comment_circuit_open: false,
       quota_exhausted: false, circuit_open: false, schema_changed: false,
       blocked: false, stale: false, current_attempt_at: "2026-08-11T16:00:00Z",
       latest_success_at: null, shadow_days: 14, shadow_attempt_days: 14,
