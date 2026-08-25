@@ -217,6 +217,11 @@ def test_final_report_validator_accepts_complete_report_and_rejects_field_confli
     conflicting = _complete_verdict_report() + "\n\n**判断：看多**\n**置信度：8/10**"
     issues = analyze._validate_final_report(conflicting, "verdict", candidate)
     assert any("存在冲突的判断" in issue for issue in issues)
+
+    issues = analyze._validate_final_report(
+        _complete_verdict_report() + "\n\n最终置信度：8/10", "verdict", candidate,
+    )
+    assert any("存在冲突的置信度" in issue for issue in issues)
     assert any("存在冲突的置信度" in issue for issue in issues)
 
     issues = analyze._validate_final_report(
@@ -302,6 +307,11 @@ def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     )
     assert any("当前指令与结构化动作不一致" in issue for issue in issues)
 
+    issues = analyze._validate_final_report(
+        report + "\n**新目标：7.2**", "position_action", candidate,
+    )
+    assert any("新目标与结构化结果不一致" in issue for issue in issues)
+
 
 def test_final_report_validator_compares_each_ladder_level_in_order():
     candidate = {
@@ -342,6 +352,25 @@ def test_final_report_validator_enforces_bullish_trade_plan_fields():
         report + "\n**止损：9.2**", "verdict", candidate,
     )
     assert any("存在冲突的止损" in issue for issue in issues)
+
+    issues = analyze._validate_final_report(
+        report.replace("**止损：9.8**", "**止损：9.8 或 9.2**"), "verdict", candidate,
+    )
+    assert any("存在冲突的止损" in issue for issue in issues)
+
+
+def test_final_report_validator_supports_pct_ladder_without_throwing():
+    candidate = {
+        "action": "hold", "scale_plan": [
+            {"action": "trim", "trigger_price": 6.0, "pct": 0.25},
+        ],
+    }
+    report = _complete_position_report().replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "- trim @ 6.0，比例 0.25",
+    )
+
+    assert analyze._validate_final_report(report, "position_action", candidate) == []
 
 
 def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatch):

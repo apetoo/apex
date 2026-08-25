@@ -1640,12 +1640,17 @@ def _validate_labeled_number(
 ) -> None:
     values = _report_labeled_values(text, label)
     expected_number = _report_number(expected)
-    parsed = [_report_number(value) for value in values]
-    if expected_number is not None and expected_number not in parsed:
+    parsed = [
+        [float(number) for number in re.findall(r"-?\d+(?:\.\d+)?", value)]
+        for value in values
+    ]
+    if expected_number is None:
+        if values:
+            issues.append(f"{label}与结构化结果不一致")
+        return
+    if parsed != [[expected_number]]:
         issues.append(f"{label}与结构化结果不一致")
-    if expected_number is not None and (
-        len(values) != 1 or any(value != expected_number for value in parsed)
-    ):
+    if len(values) != 1 or parsed != [[expected_number]]:
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
@@ -1681,6 +1686,14 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             value != expected_confidence for value in confidence_values
         ):
             issues.append("存在冲突的置信度")
+        all_confidence_claims = [
+            float(value) for value in re.findall(
+                r"(?:最终)?置信度[：:]\s*(\d+(?:\.\d+)?)\s*/\s*10", text,
+            )
+        ]
+        if confidence is not None and any(value != float(confidence) for value in all_confidence_claims):
+            if "存在冲突的置信度" not in issues:
+                issues.append("存在冲突的置信度")
         all_verdict_claims = re.findall(
             r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", text,
         )
@@ -1700,8 +1713,7 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                 ("position_size_pct", "建议仓位"),
             ):
                 value = candidate.get(field)
-                if value is not None:
-                    _validate_labeled_number(text, label, value, issues)
+                _validate_labeled_number(text, label, value, issues)
     elif kind == "position_action":
         action = str(candidate.get("action") or "")
         action_values = _report_labeled_values(text, "当前动作")
@@ -1722,25 +1734,38 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             ("new_target", "新目标"),
         ):
             value = candidate.get(field)
-            if value is not None:
-                _validate_labeled_number(text, label, value, issues)
+            _validate_labeled_number(text, label, value, issues)
         plan_section = text.split("## 条件触发计划", 1)[-1].split("\n## ", 1)[0]
         parsed_plan = [
-            (item_action, float(trigger), int(shares), float(new_stop) if new_stop else None)
-            for item_action, trigger, shares, new_stop in re.findall(
-                r"(?m)^\s*-\s*(add|trim)\s*@\s*(\d+(?:\.\d+)?)[，,]\s*(\d+)\s*股"
+            (
+                item_action, float(trigger), "shares" if shares else "pct",
+                int(shares) if shares else float(pct),
+                float(new_stop) if new_stop else None,
+            )
+            for item_action, trigger, shares, pct, new_stop in re.findall(
+                r"(?m)^\s*-\s*(add|trim)\s*@\s*(\d+(?:\.\d+)?)[，,]\s*"
+                r"(?:(\d+)\s*股|比例\s*(\d+(?:\.\d+)?))"
                 r"(?:[，,]\s*新止损\s*(\d+(?:\.\d+)?))?",
                 plan_section,
             )
         ]
-        expected_plan = [
-            (
-                str(level.get("action")), float(level.get("trigger_price")),
-                int(level.get("shares")),
-                float(level.get("new_stop")) if level.get("new_stop") is not None else None,
-            )
-            for level in (candidate.get("scale_plan") or [])
-        ]
+        expected_plan = []
+        for level in candidate.get("scale_plan") or []:
+            try:
+                has_shares = level.get("shares") is not None
+                has_pct = level.get("pct") is not None
+                if has_shares == has_pct:
+                    raise ValueError("shares/pct 必须且只能提供一个")
+                expected_plan.append((
+                    str(level["action"]), float(level["trigger_price"]),
+                    "shares" if has_shares else "pct",
+                    int(level["shares"]) if has_shares else float(level["pct"]),
+                    float(level["new_stop"]) if level.get("new_stop") is not None else None,
+                ))
+            except (KeyError, TypeError, ValueError):
+                issues.append("结构化条件触发计划字段无效")
+                expected_plan = None
+                break
         if parsed_plan != expected_plan:
             issues.append("条件触发计划与结构化结果不一致")
     return issues
@@ -2329,7 +2354,8 @@ def _run_langgraph_loop(
                 "candidate 中非空的动作字段必须使用这些标签逐字写出："
                 "`**加仓股数：<add_shares>**`、`**减仓股数：<trim_shares>**`、"
                 "`**减仓比例：<trim_pct>**`、`**新止损：<new_stop>**`、`**新目标：<new_target>**`。"
-                "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股，新止损 <new_stop>`。"
+                "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股，新止损 <new_stop>`；"
+                "若 trim 档按比例执行，则写成 `- trim @ <trigger_price>，比例 <pct>，新止损 <new_stop>`。"
                 "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
             )
         else:
