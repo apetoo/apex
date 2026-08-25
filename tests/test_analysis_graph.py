@@ -372,6 +372,10 @@ def test_final_report_validator_supports_pct_ladder_without_throwing():
 
     assert analyze._validate_final_report(report, "position_action", candidate) == []
 
+    malformed = {"action": "hold", "scale_plan": [None]}
+    issues = analyze._validate_final_report(report, "position_action", malformed)
+    assert any("结构化条件触发计划字段无效" in issue for issue in issues)
+
 
 def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatch):
     verdict = {

@@ -1752,6 +1752,8 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
         expected_plan = []
         for level in candidate.get("scale_plan") or []:
             try:
+                if not isinstance(level, dict):
+                    raise TypeError("scale_plan 档位必须是对象")
                 has_shares = level.get("shares") is not None
                 has_pct = level.get("pct") is not None
                 if has_shares == has_pct:
@@ -2049,6 +2051,11 @@ def _run_langgraph_loop(
         if name == "record_verdict" and held:
             blockers.append("已持仓票必须提交 position_action")
         if name == "record_position_action":
+            scale_plan = tool_input.get("scale_plan", [])
+            if not isinstance(scale_plan, list):
+                blockers.append("scale_plan 必须是数组。")
+            elif any(not isinstance(level, dict) for level in scale_plan):
+                blockers.append("scale_plan 每一档必须是对象。")
             current_price = None
             try:
                 current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
@@ -2421,25 +2428,26 @@ def _run_langgraph_loop(
                     max_tokens=16384, temperature=0.2 if attempt == 0 else 0,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
-                _record_usage(response, call="report", iteration=int(state.get("model_iterations", 0)))
-                choice = response.choices[0]
-                text = str(choice.message.content or "").strip()
-                terminal_provider_failure = False
-                if getattr(choice, "finish_reason", None) == "length":
-                    issues = ["正式报告输出被 max_tokens 截断"]
-                else:
-                    issues = _validate_final_report(text, kind, candidate)
-                if not issues:
-                    emit({"type": "report_generated", "attempt": attempt + 1})
-                    return {
-                        "analysis_text": text, "report_route": "finalize",
-                        "report_validation_issues": [], "report_generation_attempts": attempt + 1,
-                        "draft_data": candidate,
-                        "finalization_metadata": finalization_metadata,
-                    }
             except Exception as exc:
                 terminal_provider_failure = True
                 issues = [f"正式报告生成失败：{exc}"]
+                continue
+            terminal_provider_failure = False
+            _record_usage(response, call="report", iteration=int(state.get("model_iterations", 0)))
+            choice = response.choices[0]
+            text = str(choice.message.content or "").strip()
+            if getattr(choice, "finish_reason", None) == "length":
+                issues = ["正式报告输出被 max_tokens 截断"]
+            else:
+                issues = _validate_final_report(text, kind, candidate)
+            if not issues:
+                emit({"type": "report_generated", "attempt": attempt + 1})
+                return {
+                    "analysis_text": text, "report_route": "finalize",
+                    "report_validation_issues": [], "report_generation_attempts": attempt + 1,
+                    "draft_data": candidate,
+                    "finalization_metadata": finalization_metadata,
+                }
 
         failures = [f"report: {issue}" for issue in issues]
         controller.failures.extend(
