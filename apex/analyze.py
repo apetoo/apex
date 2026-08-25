@@ -1630,6 +1630,25 @@ def _report_labeled_values(text: str, label: str) -> list[str]:
     return [value.strip() for value in re.findall(rf"\*\*{re.escape(label)}：([^*\n]+)\*\*", text)]
 
 
+def _report_number(value) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", "" if value is None else str(value))
+    return float(match.group()) if match else None
+
+
+def _validate_labeled_number(
+    text: str, label: str, expected, issues: list[str], *, conflict_label: str | None = None,
+) -> None:
+    values = _report_labeled_values(text, label)
+    expected_number = _report_number(expected)
+    parsed = [_report_number(value) for value in values]
+    if expected_number is not None and expected_number not in parsed:
+        issues.append(f"{label}与结构化结果不一致")
+    if expected_number is not None and (
+        len(values) != 1 or any(value != expected_number for value in parsed)
+    ):
+        issues.append(f"存在冲突的{conflict_label or label}")
+
+
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
@@ -1662,20 +1681,27 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             value != expected_confidence for value in confidence_values
         ):
             issues.append("存在冲突的置信度")
+        all_verdict_claims = re.findall(
+            r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", text,
+        )
+        if verdict and any(value != verdict for value in all_verdict_claims):
+            if "存在冲突的判断" not in issues:
+                issues.append("存在冲突的判断")
         if verdict in BULLISH_VERDICTS:
             entry_low = candidate.get("entry_low") or candidate.get("entry")
             entry_high = candidate.get("entry_high") or candidate.get("entry")
-            if entry_low is not None and (
-                "入场：" not in text or str(entry_low) not in text or str(entry_high) not in text
-            ):
+            entry_values = _report_labeled_values(text, "入场")
+            entry_numbers = [_report_number(part) for value in entry_values for part in re.findall(r"-?\d+(?:\.\d+)?", value)]
+            expected_entry = [_report_number(entry_low), _report_number(entry_high)]
+            if entry_low is not None and (len(entry_values) != 1 or entry_numbers != expected_entry):
                 issues.append("入场区间与结构化结果不一致")
             for field, label in (
                 ("stop_loss", "止损"), ("target", "目标"),
                 ("position_size_pct", "建议仓位"),
             ):
                 value = candidate.get(field)
-                if value is not None and f"{label}：{value}" not in text:
-                    issues.append(f"{label}与结构化结果不一致")
+                if value is not None:
+                    _validate_labeled_number(text, label, value, issues)
     elif kind == "position_action":
         action = str(candidate.get("action") or "")
         action_values = _report_labeled_values(text, "当前动作")
@@ -1683,25 +1709,40 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             issues.append("当前动作与结构化结果不一致")
         if action and any(value != action for value in action_values):
             issues.append("存在冲突的当前动作")
+        immediate_actions = {
+            "加仓": "add", "减仓": "trim", "清仓": "exit", "退出": "exit", "持有": "hold",
+        }
+        for word in re.findall(r"(?:当前立即|现在立即|立即)(加仓|减仓|清仓|退出|持有)", text):
+            if immediate_actions[word] != action:
+                issues.append("当前指令与结构化动作不一致")
+                break
         for field, label in (
             ("add_shares", "加仓股数"), ("trim_shares", "减仓股数"),
             ("trim_pct", "减仓比例"), ("new_stop", "新止损"),
             ("new_target", "新目标"),
         ):
             value = candidate.get(field)
-            if value is not None and str(value) not in _report_labeled_values(text, label):
-                issues.append(f"{label}与结构化结果不一致")
+            if value is not None:
+                _validate_labeled_number(text, label, value, issues)
         plan_section = text.split("## 条件触发计划", 1)[-1].split("\n## ", 1)[0]
-        for index, level in enumerate(candidate.get("scale_plan") or [], start=1):
-            expected = (
-                f"{level.get('action')} @ {level.get('trigger_price')}",
-                f"{level.get('shares')} 股",
+        parsed_plan = [
+            (item_action, float(trigger), int(shares), float(new_stop) if new_stop else None)
+            for item_action, trigger, shares, new_stop in re.findall(
+                r"(?m)^\s*-\s*(add|trim)\s*@\s*(\d+(?:\.\d+)?)[，,]\s*(\d+)\s*股"
+                r"(?:[，,]\s*新止损\s*(\d+(?:\.\d+)?))?",
+                plan_section,
             )
-            if any(token not in plan_section for token in expected):
-                issues.append(f"条件触发计划第 {index} 档与结构化结果不一致")
-                continue
-            if level.get("new_stop") is not None and f"新止损 {level.get('new_stop')}" not in plan_section:
-                issues.append(f"条件触发计划第 {index} 档新止损与结构化结果不一致")
+        ]
+        expected_plan = [
+            (
+                str(level.get("action")), float(level.get("trigger_price")),
+                int(level.get("shares")),
+                float(level.get("new_stop")) if level.get("new_stop") is not None else None,
+            )
+            for level in (candidate.get("scale_plan") or [])
+        ]
+        if parsed_plan != expected_plan:
+            issues.append("条件触发计划与结构化结果不一致")
     return issues
 
 
@@ -2335,7 +2376,7 @@ def _run_langgraph_loop(
             + json.dumps(authoritative_context, ensure_ascii=False, sort_keys=True)
         )
         issues: list[str] = []
-        provider_failures = 0
+        terminal_provider_failure = False
         for attempt in range(2):
             retry = ""
             if issues:
@@ -2357,6 +2398,7 @@ def _run_langgraph_loop(
                 _record_usage(response, call="report", iteration=int(state.get("model_iterations", 0)))
                 choice = response.choices[0]
                 text = str(choice.message.content or "").strip()
+                terminal_provider_failure = False
                 if getattr(choice, "finish_reason", None) == "length":
                     issues = ["正式报告输出被 max_tokens 截断"]
                 else:
@@ -2370,14 +2412,14 @@ def _run_langgraph_loop(
                         "finalization_metadata": finalization_metadata,
                     }
             except Exception as exc:
-                provider_failures += 1
+                terminal_provider_failure = True
                 issues = [f"正式报告生成失败：{exc}"]
 
         failures = [f"report: {issue}" for issue in issues]
         controller.failures.extend(
             failure for failure in failures if failure not in controller.failures
         )
-        provider_failed = provider_failures == 2
+        provider_failed = terminal_provider_failure
         return {
             "analysis_text": "", "report_route": "abstain",
             "report_validation_issues": issues, "report_generation_attempts": 2,

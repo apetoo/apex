@@ -219,6 +219,11 @@ def test_final_report_validator_accepts_complete_report_and_rejects_field_confli
     assert any("存在冲突的判断" in issue for issue in issues)
     assert any("存在冲突的置信度" in issue for issue in issues)
 
+    issues = analyze._validate_final_report(
+        _complete_verdict_report() + "\n\n最终判断：看多", "verdict", candidate,
+    )
+    assert any("存在冲突的判断" in issue for issue in issues)
+
 
 def test_final_report_validator_enforces_position_action_contract():
     report = """## 核心判断
@@ -292,6 +297,28 @@ def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     )
     assert any("存在冲突的当前动作" in issue for issue in issues)
 
+    issues = analyze._validate_final_report(
+        report + "\n当前立即加仓500股。", "position_action", candidate,
+    )
+    assert any("当前指令与结构化动作不一致" in issue for issue in issues)
+
+
+def test_final_report_validator_compares_each_ladder_level_in_order():
+    candidate = {
+        "action": "hold", "scale_plan": [
+            {"action": "add", "trigger_price": 5.2, "shares": 100, "new_stop": 4.9},
+            {"action": "trim", "trigger_price": 6.0, "shares": 200, "new_stop": 5.3},
+        ],
+    }
+    report = _complete_position_report().replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "- add @ 5.2，200 股，新止损 4.9\n- trim @ 6.0，100 股，新止损 5.3",
+    )
+
+    issues = analyze._validate_final_report(report, "position_action", candidate)
+
+    assert any("条件触发计划与结构化结果不一致" in issue for issue in issues)
+
 
 def test_final_report_validator_enforces_bullish_trade_plan_fields():
     report = _complete_verdict_report(verdict="偏多", confidence=6).replace(
@@ -310,6 +337,11 @@ def test_final_report_validator_enforces_bullish_trade_plan_fields():
         report.replace("**止损：9.8**", "**止损：9.2**"), "verdict", candidate,
     )
     assert any("止损与结构化结果不一致" in issue for issue in issues)
+
+    issues = analyze._validate_final_report(
+        report + "\n**止损：9.2**", "verdict", candidate,
+    )
+    assert any("存在冲突的止损" in issue for issue in issues)
 
 
 def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatch):
@@ -497,6 +529,27 @@ def test_formal_report_provider_failure_preserves_provider_failure_semantics(mon
     assert result["outcome_reason"] == "provider_failure"
     assert result["analysis_text"] == ""
     assert any("report gateway timeout" in failure for failure in result["failures"])
+
+
+def test_formal_report_retry_timeout_is_provider_failure_after_content_rejection(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    incomplete = "## 核心判断\n**判断：观望偏空**\n**置信度：4/10**"
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=incomplete),
+        TimeoutError("corrective report timed out"),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["outcome_reason"] == "provider_failure"
 
 
 def test_formal_report_uses_finalized_candidate_as_single_source_of_truth(monkeypatch):
