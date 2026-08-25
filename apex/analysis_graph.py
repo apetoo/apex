@@ -41,6 +41,9 @@ class AnalysisGraphState(TypedDict, total=False):
     review_revision_count: int
     final_assessment_requested: bool
     final_assessment_done: bool
+    report_route: str
+    report_validation_issues: list[str]
+    report_generation_attempts: int
 
 
 Node = Callable[[AnalysisGraphState], dict[str, Any]]
@@ -55,6 +58,7 @@ class GraphHandlers:
     assess: Node
     draft: Node
     review: Node
+    report: Node
     finalize: Node
     abstain: Node
 
@@ -75,11 +79,15 @@ def _after_assess(state: AnalysisGraphState) -> str:
 def _after_review(state: AnalysisGraphState) -> str:
     outcome = state.get("review_outcome") or "abstain"
     return {
-        "pass": "finalize",
+        "pass": "report",
         "rework": "research",
         "revise": "draft",
         "abstain": "abstain",
     }.get(outcome, "abstain")
+
+
+def _after_report(state: AnalysisGraphState) -> str:
+    return "finalize" if state.get("report_route") == "finalize" else "abstain"
 
 
 def _after_draft(state: AnalysisGraphState) -> str:
@@ -96,6 +104,7 @@ def build_analysis_graph(handlers: GraphHandlers):
     graph.add_node("assess", handlers.assess)
     graph.add_node("draft", handlers.draft)
     graph.add_node("review", handlers.review)
+    graph.add_node("report", handlers.report)
     graph.add_node("finalize", handlers.finalize)
     graph.add_node("abstain", handlers.abstain)
 
@@ -115,7 +124,10 @@ def build_analysis_graph(handlers: GraphHandlers):
         "review": "review", "abstain": "abstain",
     })
     graph.add_conditional_edges("review", _after_review, {
-        "finalize": "finalize", "research": "reason", "draft": "draft", "abstain": "abstain",
+        "report": "report", "research": "reason", "draft": "draft", "abstain": "abstain",
+    })
+    graph.add_conditional_edges("report", _after_report, {
+        "finalize": "finalize", "abstain": "abstain",
     })
     graph.add_edge("finalize", END)
     graph.add_edge("abstain", END)

@@ -1573,33 +1573,75 @@ def _valuation_basis_conflict(candidate: dict, thesis: str) -> bool:
     return any(marker in thesis_text for marker in ("估值", "pe", "peg", "市盈率"))
 
 
-def _final_analysis_text(existing: str, kind: str, candidate: dict) -> str:
-    """Append a complete, auditable conclusion even when forced tool calls have no content."""
-    research = (existing or "").split("\n\n---\n\n## 最终结论", 1)[0].rstrip()
-    lines = ["---", "## 最终结论"]
-    if kind == "position_action":
-        lines.extend([
-            f"- 当前建议：**{candidate.get('action') or '—'}**",
-            f"- 核心理由：{candidate.get('rationale') or '—'}",
-        ])
-    else:
-        lines.extend([
-            f"- 判断：**{candidate.get('verdict') or '—'}**",
-            f"- 置信度：**{candidate.get('confidence') if candidate.get('confidence') is not None else '—'}/10**",
-        ])
-        evidence = [str(item) for item in (candidate.get("evidence") or []) if str(item).strip()]
-        if evidence:
-            lines.append("\n### 核心证据")
-            lines.extend(f"- {item}" for item in evidence)
-        if candidate.get("verdict") in BULLISH_VERDICTS:
-            lines.extend([
-                "\n### 交易计划",
-                f"- 入场：{candidate.get('entry_low') or candidate.get('entry')}–{candidate.get('entry_high') or candidate.get('entry')}",
-                f"- 止损：{candidate.get('stop_loss')}；目标：{candidate.get('target')}；建议仓位：{candidate.get('position_size_pct', 0)}%",
-            ])
-        else:
-            lines.append("\n当前不建议新开多头仓位；等待关键证据或趋势改善后重新评估。")
-    return "\n\n".join(part for part in (research, "\n".join(lines)) if part).strip()
+_VERDICT_REPORT_SECTIONS = (
+    "## 核心判断",
+    "## 基本面分析",
+    "## 一、多头论点",
+    "## 二、空头论点",
+    "## 三、裁判结论",
+    "### 加权四维评分",
+    "### 置信度调整",
+    "## 操作建议",
+    "## 风险提示",
+)
+_POSITION_REPORT_SECTIONS = (
+    "## 核心判断",
+    "## 基本面分析",
+    "## 一、多头论点",
+    "## 二、空头论点",
+    "## 三、裁判结论",
+    "### 加权四维评分",
+    "## 当前持仓动作",
+    "## 条件触发计划",
+    "## 风险提示",
+)
+_REPORT_PROCESS_MARKERS = (
+    "让我查询", "让我补充", "现在提交", "等等，重新核算", "我先获取",
+)
+
+
+def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
+    """Return deterministic issues that prevent a model report from being published."""
+    text = str(report or "").strip()
+    issues: list[str] = []
+    required_sections = (
+        _POSITION_REPORT_SECTIONS if kind == "position_action" else _VERDICT_REPORT_SECTIONS
+    )
+    for section in required_sections:
+        if section not in text:
+            issues.append(f"缺少必需章节：{section.removeprefix('## ').removeprefix('# ')}")
+    found_process = [marker for marker in _REPORT_PROCESS_MARKERS if marker in text]
+    if found_process:
+        issues.append("包含过程性措辞：" + "、".join(found_process))
+    if len(text) < 300:
+        issues.append("正式报告过短（少于 300 字符）")
+
+    if kind == "verdict":
+        verdict = str(candidate.get("verdict") or "")
+        confidence = candidate.get("confidence")
+        if verdict and f"判断：{verdict}" not in text:
+            issues.append("判断与结构化结果不一致")
+        if confidence is not None and f"置信度：{confidence}/10" not in text:
+            issues.append("置信度与结构化结果不一致")
+        if verdict in BULLISH_VERDICTS:
+            entry_low = candidate.get("entry_low") or candidate.get("entry")
+            entry_high = candidate.get("entry_high") or candidate.get("entry")
+            if entry_low is not None and (
+                "入场：" not in text or str(entry_low) not in text or str(entry_high) not in text
+            ):
+                issues.append("入场区间与结构化结果不一致")
+            for field, label in (
+                ("stop_loss", "止损"), ("target", "目标"),
+                ("position_size_pct", "建议仓位"),
+            ):
+                value = candidate.get(field)
+                if value is not None and f"{label}：{value}" not in text:
+                    issues.append(f"{label}与结构化结果不一致")
+    elif kind == "position_action":
+        action = str(candidate.get("action") or "")
+        if action and f"当前动作：{action}" not in text:
+            issues.append("当前动作与结构化结果不一致")
+    return issues
 
 
 def _mx_news_evidence_type(title: str, content: str) -> str:
@@ -1846,15 +1888,12 @@ def _run_langgraph_loop(
         if choice.finish_reason == "length":
             raise AnalysisError(f"AI exceeded token limit at iteration {iteration}")
         msg = choice.message
-        text = state.get("analysis_text") or ""
         if msg.content:
-            text += msg.content
             emit({"type": "assistant_text", "iteration": iteration, "content": msg.content})
         return {
             "messages": [*(state.get("messages") or []), msg],
             "assistant_message": msg,
             "pending_tools": list(msg.tool_calls or []),
-            "analysis_text": text,
             "model_iterations": iteration + 1,
             "final_assessment_done": final_assessment,
         }
@@ -2010,7 +2049,6 @@ def _run_langgraph_loop(
             candidate = dict(state.get("draft_data") or {})
             return {
                 "draft_route": "review",
-                "analysis_text": _final_analysis_text(state.get("analysis_text") or "", kind, candidate),
             }
         emit({"type": "status", "stage": "drafting", "message": "证据已收敛，正在生成结构化结论"})
         try:
@@ -2057,10 +2095,6 @@ def _run_langgraph_loop(
                 return {
                     "draft_kind": "position_action" if held else "verdict",
                     "draft_data": candidate, "draft_route": "review",
-                    "analysis_text": _final_analysis_text(
-                        state.get("analysis_text") or "",
-                        "position_action" if held else "verdict", candidate,
-                    ),
                 }
             except Exception as exc:
                 failure = str(exc)
@@ -2174,6 +2208,86 @@ def _run_langgraph_loop(
             })
         return update
 
+    def report(state):
+        emit({"type": "status", "stage": "reporting", "message": "正在生成正式分析报告"})
+        kind = str(state.get("draft_kind") or "")
+        candidate = dict(state.get("draft_data") or {})
+        if kind == "position_action":
+            format_contract = (
+                "持仓动作报告必须依次包含这些标题：\n"
+                "## 核心判断\n## 基本面分析\n## 一、多头论点\n## 二、空头论点\n"
+                "## 三、裁判结论\n### 加权四维评分\n## 当前持仓动作\n## 条件触发计划\n## 风险提示\n\n"
+                "核心判断和当前持仓动作章节都必须逐字写出 `**当前动作：<action>**`。"
+                "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
+            )
+        else:
+            format_contract = (
+                "未持仓 verdict 报告必须依次包含这些标题：\n"
+                "## 核心判断\n## 基本面分析\n## 一、多头论点\n## 二、空头论点\n"
+                "## 三、裁判结论\n### 加权四维评分\n### 置信度调整\n## 操作建议\n## 风险提示\n\n"
+                "核心判断必须逐字写出 `**判断：<verdict>**` 和 `**置信度：<confidence>/10**`。"
+                "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
+                "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
+            )
+        report_contract = (
+            "你是 Apex 的正式投资分析报告编辑。候选结论已经完成证据门控和独立复核，"
+            "你只能解释它，不得改变其中任何机器字段。基于给定对话、工具结果、证据和候选结论，"
+            "输出唯一一份干净的 Markdown 正式报告；不要调用工具，不要描述查询过程或自我修正。\n\n"
+            + format_contract
+            + "基本面分析必须引用具体营收、利润、现金流、ROE、负债或估值数据；数据未知就明确写未知，禁止编造。"
+            "多头和空头各至少三条，格式为数据点 → 推论；裁判必须比较双方最硬证据。"
+            "评分和置信度调整必须列出计算过程。操作建议必须与最终方向及价格建议一致。\n\n"
+            "最终机器结果（不可修改）：\n"
+            + json.dumps({"kind": kind, "candidate": candidate}, ensure_ascii=False, sort_keys=True)
+        )
+        issues: list[str] = []
+        for attempt in range(2):
+            retry = ""
+            if issues:
+                retry = (
+                    "\n\n上一版未通过确定性质量门。必须逐条修正，且不要解释修正过程：\n- "
+                    + "\n- ".join(issues)
+                )
+                emit({"type": "report_retry", "attempt": attempt + 1, "issues": issues})
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        *(state.get("messages") or []),
+                        {"role": "user", "content": report_contract + retry},
+                    ],
+                    max_tokens=16384, temperature=0.2 if attempt == 0 else 0,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(response, call="report", iteration=int(state.get("model_iterations", 0)))
+                choice = response.choices[0]
+                text = str(choice.message.content or "").strip()
+                if getattr(choice, "finish_reason", None) == "length":
+                    issues = ["正式报告输出被 max_tokens 截断"]
+                else:
+                    issues = _validate_final_report(text, kind, candidate)
+                if not issues:
+                    emit({"type": "report_generated", "attempt": attempt + 1})
+                    return {
+                        "analysis_text": text, "report_route": "finalize",
+                        "report_validation_issues": [], "report_generation_attempts": attempt + 1,
+                    }
+            except Exception as exc:
+                issues = [f"正式报告生成失败：{exc}"]
+
+        failures = [f"report: {issue}" for issue in issues]
+        controller.failures.extend(
+            failure for failure in failures if failure not in controller.failures
+        )
+        return {
+            "analysis_text": "", "report_route": "abstain",
+            "report_validation_issues": issues, "report_generation_attempts": 2,
+            "outcome_reason": "report_validation_failed",
+            "next_actions": ["重新运行分析并生成完整正式报告"],
+            "failures": list(controller.failures),
+            "research_metrics": controller.research_metrics(stop_reason="report_validation_failed"),
+        }
+
     def finalize(state):
         kind = state.get("draft_kind")
         data_value = state.get("draft_data") or {}
@@ -2213,7 +2327,7 @@ def _run_langgraph_loop(
     graph = build_analysis_graph(GraphHandlers(
         prepare=prepare, safety_scan=safety_scan, reason=reason,
         execute_tools=execute_tools, assess=assess, draft=draft,
-        review=review, finalize=finalize, abstain=abstain,
+        review=review, report=report, finalize=finalize, abstain=abstain,
     ))
     return graph.invoke({}, {"recursion_limit": max(30, max_iter * 5)})
 

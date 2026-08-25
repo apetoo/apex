@@ -25,6 +25,7 @@ def _handlers(events, *, review_outcomes=None, force_abstain=False):
         assess=node("assess", {"route": "abstain" if force_abstain else "draft"}),
         draft=node("draft", {"draft": {"verdict": "中性"}}),
         review=node("review", lambda state: {"review_outcome": next(reviews)}),
+        report=node("report", {"report_route": "finalize", "analysis_text": "完整报告"}),
         finalize=node("finalize", {"analysis_status": "completed"}),
         abstain=node("abstain", {"analysis_status": "insufficient_evidence"}),
     )
@@ -39,7 +40,7 @@ def test_graph_routes_research_through_tools_and_review_to_finalize():
     assert result["analysis_status"] == "completed"
     assert events == [
         "prepare", "safety_scan", "reason", "tools", "assess",
-        "draft", "review", "finalize",
+        "draft", "review", "report", "finalize",
     ]
 
 
@@ -122,6 +123,159 @@ def _multi_tool_response(calls):
     return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="tool_calls")])
 
 
+def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
+    return f"""## 核心判断
+**判断：{verdict}**
+**置信度：{confidence}/10**
+
+## 基本面分析
+营收与利润数据完整，周期位置仍需谨慎。
+
+## 一、多头论点
+1. 盈利增长 → 提供安全边际。
+2. 现金流改善 → 盈利质量提升。
+3. 负债可控 → 财务风险有限。
+
+## 二、空头论点
+1. 商品价格回落 → 利润可能承压。
+2. 资金净流出 → 短线承接偏弱。
+3. 趋势未反转 → 当前不宜追高。
+
+## 三、裁判结论
+领先指标弱于滞后的利润数据，因此倾向谨慎。
+
+### 加权四维评分
+技术面 4 分，基本面 7 分，资金面 3 分，情绪面 5 分；加权总分 4.9。
+
+### 置信度调整
+初始 6，历史命中率扣 2，最终 {confidence}。
+
+## 操作建议
+当前不新开多头仓位，等待资金与趋势改善后重新评估。
+
+## 风险提示
+商品价格和市场波动可能使结论失效。"""
+
+
+def _complete_position_report(*, action="hold"):
+    return f"""## 核心判断
+**当前动作：{action}**
+
+## 基本面分析
+盈利与现金流保持稳定，资产负债表未出现新增重大风险。
+
+## 一、多头论点
+1. 盈利增长 → 支撑继续持有。
+2. 现金流改善 → 降低经营风险。
+3. 估值合理 → 保留现有仓位。
+
+## 二、空头论点
+1. 趋势偏弱 → 当前不宜加仓。
+2. 资金流出 → 短线承接不足。
+3. 波动较高 → 必须严格执行止损。
+
+## 三、裁判结论
+基本面仍可，但技术与资金尚未支持加仓，因此维持当前动作。
+
+### 加权四维评分
+技术面 4 分、基本面 7 分、资金面 4 分、情绪面 5 分，加权总分 5.2。
+
+## 当前持仓动作
+**当前动作：{action}**，保持现有仓位并执行既定风险计划。
+
+## 条件触发计划
+价格满足计划条件后才执行未来动作，当前不提前交易。
+
+## 风险提示
+趋势进一步转弱或基本面恶化可能触发止损。"""
+
+
+def test_final_report_validator_rejects_missing_sections_and_process_text():
+    issues = analyze._validate_final_report(
+        "让我查询。\n## 核心判断\n**判断：观望偏空**\n**置信度：4/10**",
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+    )
+
+    assert any("基本面分析" in issue for issue in issues)
+    assert any("过程性措辞" in issue for issue in issues)
+
+
+def test_final_report_validator_accepts_complete_report_and_rejects_field_conflicts():
+    candidate = {"verdict": "观望偏空", "confidence": 4}
+
+    assert analyze._validate_final_report(
+        _complete_verdict_report(), "verdict", candidate,
+    ) == []
+
+    issues = analyze._validate_final_report(
+        _complete_verdict_report(verdict="偏多", confidence=6), "verdict", candidate,
+    )
+    assert any("判断与结构化结果不一致" in issue for issue in issues)
+    assert any("置信度与结构化结果不一致" in issue for issue in issues)
+
+
+def test_final_report_validator_enforces_position_action_contract():
+    report = """## 核心判断
+**当前动作：hold**
+
+## 基本面分析
+盈利与现金流保持稳定，暂未发现资产负债表风险。
+
+## 一、多头论点
+1. 盈利增长 → 支撑持有。
+2. 现金流改善 → 降低风险。
+3. 估值合理 → 保留仓位。
+
+## 二、空头论点
+1. 趋势偏弱 → 不宜加仓。
+2. 资金流出 → 承接不足。
+3. 波动较高 → 严格止损。
+
+## 三、裁判结论
+基本面仍可，但技术和资金不支持加仓，因此维持持有。
+
+### 加权四维评分
+技术 4，基本 7，资金 4，情绪 5，加权总分 5.2。
+
+## 当前持仓动作
+**当前动作：hold**，保持现有仓位并执行既定止损。
+
+## 条件触发计划
+价格满足计划条件后再执行，当前不提前交易。
+
+## 风险提示
+趋势进一步转弱可能触发止损。"""
+    candidate = {"action": "hold", "rationale": "保持仓位", "scale_plan": []}
+
+    assert analyze._validate_final_report(report, "position_action", candidate) == []
+
+    issues = analyze._validate_final_report(
+        report.replace("**当前动作：hold**", "**当前动作：trim**"),
+        "position_action", candidate,
+    )
+    assert any("当前动作与结构化结果不一致" in issue for issue in issues)
+
+
+def test_final_report_validator_enforces_bullish_trade_plan_fields():
+    report = _complete_verdict_report(verdict="偏多", confidence=6).replace(
+        "当前不新开多头仓位，等待资金与趋势改善后重新评估。",
+        "**入场：10.5–11.0**\n**止损：9.8**\n**目标：13.0**\n**建议仓位：10%**",
+    )
+    candidate = {
+        "verdict": "偏多", "confidence": 6,
+        "entry": 10.8, "entry_low": 10.5, "entry_high": 11.0,
+        "stop_loss": 9.8, "target": 13.0, "position_size_pct": 10,
+    }
+
+    assert analyze._validate_final_report(report, "verdict", candidate) == []
+
+    issues = analyze._validate_final_report(
+        report.replace("**止损：9.8**", "**止损：9.2**"), "verdict", candidate,
+    )
+    assert any("止损与结构化结果不一致" in issue for issue in issues)
+
+
 def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatch):
     verdict = {
         "verdict": "中性", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,
@@ -138,6 +292,10 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
         }),
         _response(tool_name="record_verdict", arguments=verdict),
         _response(content="```json\n" + json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False) + "\n```"),
+        _response(content=_complete_verdict_report(verdict="中性", confidence=5).replace(
+            "营收与利润数据完整，周期位置仍需谨慎。",
+            "PE_TTM=20，营收与利润数据完整，估值处于中性区间。",
+        )),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002050.SZ": "三花智控"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
@@ -166,12 +324,115 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
     assert result["analysis_status"] == "completed"
     assert result["draft_kind"] == "verdict"
     assert result["draft_data"]["verdict"] == "中性"
-    assert "## 最终结论" in result["analysis_text"]
+    assert "## 核心判断" in result["analysis_text"]
     assert "PE_TTM=20" in result["analysis_text"]
     draft_call = client.calls[2]
     assert [tool["function"]["name"] for tool in draft_call["tools"]] == ["record_verdict"]
     assert draft_call["tool_choice"] == {"type": "function", "function": {"name": "record_verdict"}}
     assert any(event["type"] == "review" and event["outcome"] == "pass" for event in events)
+
+
+def _patch_report_graph_environment(monkeypatch):
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002192.SZ": "融捷股份"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
+        "source": "bocha:web-search", "results": [{
+            "title": "融捷股份002192公告", "snippet": "未见新增重大风险事项",
+            "url": "https://www.cninfo.com.cn/scan", "date": "2026-08-25",
+            "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current",
+        }],
+    }))
+    monkeypatch.setattr(analyze, "_dispatch_tool", lambda *_args: json.dumps({
+        "valuation": {"pe_ttm": 16.7}, "quarters": [{"roe": 24.8}],
+        "summary": {"flags": []},
+    }))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+
+
+def _bearish_candidate():
+    return {
+        "verdict": "观望偏空", "confidence": 4,
+        "entry": 0, "stop_loss": 0, "target": 0,
+        "features": {
+            "ma5_position": "below", "ma20_position": "above", "volume_ratio": 0.77,
+            "rsi_14": 45, "atr_14_pct": 5.0,
+        },
+        "evidence": ["锂价回落 → 周期领先指标转弱"],
+        "stock_type": "周期股", "valuation_basis": "non_valuation",
+    }
+
+
+def test_formal_report_replaces_research_process_text(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    report = _complete_verdict_report()
+    client = _FakeClient([
+        _response(
+            tool_name="get_fundamentals", arguments={"ts_code": "002192.SZ"},
+            content="让我查询基本面，等等，重新核算。",
+        ),
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=report),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["analysis_text"] == report
+    assert "让我查询" not in result["analysis_text"]
+    assert "tools" not in client.calls[-1]
+
+
+def test_formal_report_retries_once_with_validation_issues(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    incomplete = "## 核心判断\n**判断：观望偏空**\n**置信度：4/10**"
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=incomplete),
+        _response(content=_complete_verdict_report()),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert "缺少必需章节：基本面分析" in client.calls[-1]["messages"][-1]["content"]
+
+
+def test_formal_report_validation_failure_does_not_publish_partial_report(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    incomplete = "## 核心判断\n**判断：观望偏空**\n**置信度：4/10**"
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=incomplete),
+        _response(content=incomplete),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "insufficient_evidence"
+    assert result["outcome_reason"] == "report_validation_failed"
+    assert result.get("analysis_text", "") == ""
+    assert any("基本面分析" in issue for issue in result["failures"])
 
 
 def test_review_pass_with_material_contradiction_requires_draft_revision():
@@ -199,6 +460,10 @@ def test_material_review_issue_routes_back_to_draft_once(monkeypatch):
         _response(content=json.dumps({"outcome": "pass", "issues": ["资金面数据存在矛盾：单日流出不能表述为持续撤离"]}, ensure_ascii=False)),
         _response(tool_name="record_verdict", arguments={**base, "evidence": ["当日主力净流出 → 短线资金偏弱，但此前流入构成反证"]}),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="偏空", confidence=5).replace(
+            "商品价格和市场波动可能使结论失效。",
+            "当日主力净流出，但此前流入构成反证；市场波动可能使结论失效。",
+        )),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002938.SZ": "鹏鼎控股"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
@@ -458,6 +723,7 @@ def test_review_truncation_retries_once_and_recovers(monkeypatch):
         _truncated('{"outcome": "pass", "issues": ["Unterminated'),
         # 复核第 2 次（重试）：正常返回
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="中性", confidence=5)),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002050.SZ": "三花智控"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
@@ -542,6 +808,7 @@ def test_forced_draft_retries_invalid_submission_once(monkeypatch):
         _response(content="没有调用工具"),
         _response(tool_name="record_verdict", arguments=verdict),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="中性", confidence=5)),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"603893.SH": "瑞芯微"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
@@ -585,6 +852,7 @@ def test_position_draft_retry_receives_ladder_validation_reason(monkeypatch, iso
         _response(tool_name="record_position_action", arguments=invalid),
         _response(tool_name="record_position_action", arguments=valid),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_position_report()),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000725.SZ": "京东方A"})
     monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000725.SZ": 5.0})
@@ -631,6 +899,7 @@ def test_external_budget_runs_final_assessment_before_abstaining(monkeypatch, is
         }),
         _response(tool_name="record_position_action", arguments=action),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_position_report()),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
     monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 73.2})
