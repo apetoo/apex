@@ -48,6 +48,10 @@ def validate_eastmoney_config(config: dict) -> dict:
             raise ValueError(f"eastmoney {name} must be a non-negative integer")
         if name in {"timeout_seconds", "collection_timeout_seconds"} and value <= 0:
             raise ValueError(f"eastmoney {name} must be positive")
+    max_comment_requests = config.get("max_comment_requests", min(200, config["max_requests"]))
+    if (isinstance(max_comment_requests, bool) or not isinstance(max_comment_requests, int)
+            or max_comment_requests < 0):
+        raise ValueError("eastmoney max_comment_requests must be a non-negative integer")
     for name in ("schema_version", "target_pool_version", "author_salt"):
         if not isinstance(config.get(name), str) or not config[name].strip():
             raise ValueError(f"eastmoney {name} is required")
@@ -199,6 +203,9 @@ def build_frozen_manifest(
         "missing_targets": missing,
         "settings": {
             "max_requests": config["max_requests"],
+            "max_comment_requests": config.get(
+                "max_comment_requests", min(200, config["max_requests"]),
+            ),
             "requests_per_target": config["requests_per_target"],
             "posts_per_target": max(config["posts_per_sector_forum"],
                                     config["posts_per_constituent_forum"]),
@@ -239,11 +246,13 @@ def collector_health(report: dict) -> dict:
     request_errors = int(report.get("request_errors") or 0)
     parser_total = parser_successes + parser_errors
     request_total = request_successes + request_errors
+    business_total = parser_successes + parser_errors + request_errors
     return {
         "parser_successes": parser_successes, "parser_errors": parser_errors,
         "request_successes": request_successes, "request_errors": request_errors,
         "parse_success_rate": parser_successes / parser_total if parser_total else 0.0,
         "request_success_rate": request_successes / request_total if request_total else 0.0,
+        "business_success_rate": parser_successes / business_total if business_total else 0.0,
     }
 
 
@@ -251,6 +260,9 @@ _SAFE_COLLECTOR_FIELDS = (
     "records", "request_count", "failed_targets", "quota_exhausted",
     "parser_successes", "parser_errors", "request_successes", "request_errors",
     "terminal_reason",
+    "comment_request_count", "comment_quota_exhausted", "comment_source",
+    "comment_fallback_used", "comment_circuit_open", "comment_source_requests",
+    "comment_source_successes", "comment_source_failures",
 )
 
 
@@ -336,6 +348,14 @@ def collect_eastmoney(
         "constituent_forum_records": constituent_forum_records,
         "request_count": requests, "failed_targets": failed,
         "quota_exhausted": bool(getattr(result, "quota_exhausted", False)),
+        "comment_source": str(collector.get("comment_source") or "primary"),
+        "comment_fallback_used": bool(collector.get("comment_fallback_used")),
+        "comment_circuit_open": bool(collector.get("comment_circuit_open")),
+        "comment_request_count": int(collector.get("comment_request_count") or 0),
+        "comment_quota_exhausted": bool(collector.get("comment_quota_exhausted")),
+        "comment_source_requests": dict(collector.get("comment_source_requests") or {}),
+        "comment_source_successes": dict(collector.get("comment_source_successes") or {}),
+        "comment_source_failures": dict(collector.get("comment_source_failures") or {}),
         "circuit_open": result.status == "schema_changed", "target_shortfall": target_shortfall,
         "representative_constituents": manifest["representative_constituents"],
         **health,

@@ -90,6 +90,7 @@ def test_parse_health_uses_real_counters_not_request_guess():
                                "request_successes": 9, "request_errors": 1})
     assert health["parse_success_rate"] == pytest.approx(0.8)
     assert health["request_success_rate"] == pytest.approx(0.9)
+    assert health["business_success_rate"] == pytest.approx(8 / 11)
 
 
 def test_collection_timeout_is_forwarded_and_each_retry_gets_unique_batch(tmp_path: Path):
@@ -99,6 +100,12 @@ def test_collection_timeout_is_forwarded_and_each_retry_gets_unique_batch(tmp_pa
         Path(report_path).write_text(json.dumps({
             "parser_successes": 1, "parser_errors": 0,
             "request_successes": 1, "request_errors": 0,
+            "comment_request_count": 1, "comment_quota_exhausted": False,
+            "comment_source": "backup", "comment_fallback_used": True,
+            "comment_circuit_open": False,
+            "comment_source_requests": {"primary": 1, "backup": 1},
+            "comment_source_successes": {"primary": 0, "backup": 1},
+            "comment_source_failures": {"primary": 1, "backup": 0},
         }))
         return CollectionResult("empty_valid", 0, 1, 0)
     kwargs = dict(cache_dir=tmp_path, config=_config(), taxonomy=[], constituents={},
@@ -109,6 +116,8 @@ def test_collection_timeout_is_forwarded_and_each_retry_gets_unique_batch(tmp_pa
     assert seen[0][1] == 900
     assert seen[0][0] != seen[1][0]
     assert first["batch_id"] != second["batch_id"]
+    assert first["comment_request_count"] == 1
+    assert first["comment_source_requests"] == {"primary": 1, "backup": 1}
 
 
 def test_manifest_is_frozen_and_uses_explicit_targets_and_overlap_cursor(tmp_path: Path):

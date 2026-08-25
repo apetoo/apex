@@ -25,7 +25,7 @@ from .parser import BlockedResponse, EastmoneyParser, SchemaChanged
 
 _KINDS = {"list", "detail", "comments"}
 _PRODUCTION_HOSTS = {"guba.eastmoney.com", "gbapi.eastmoney.com"}
-_BUDGETS = ("max_requests", "requests_per_target", "posts_per_target", "comments_per_post",
+_BUDGETS = ("max_requests", "max_comment_requests", "requests_per_target", "posts_per_target", "comments_per_post",
             "retry_times", "timeout_seconds", "concurrent_requests_per_domain",
             "circuit_breaker_failures")
 
@@ -57,6 +57,7 @@ def _validate_manifest(value: object) -> dict:
         raise ValueError("settings must be an object")
     for key in _BUDGETS:
         _strict_nonnegative(settings, key, {"max_requests": 1000, "requests_per_target": 100,
+                                            "max_comment_requests": min(200, int(settings.get("max_requests", 1000))),
                                             "posts_per_target": 100, "comments_per_post": 50,
                                             "retry_times": 3, "timeout_seconds": 20,
                                             "concurrent_requests_per_domain": 1,
@@ -133,6 +134,9 @@ class ExponentialRetryMiddleware(RetryMiddleware):
         if retry is None:
             return None
         target_id = str(request.meta.get("quota_target_id") or "retry")
+        if (request.meta.get("quota_kind") == "comments"
+                and not spider.comment_quota.consume(target_id)):
+            return None
         if not spider.quota.consume(target_id):
             return None
         delay = self.delay_for(int(retry.meta.get("retry_times", 1)),
@@ -169,6 +173,13 @@ class EastmoneySpider(scrapy.Spider):
         settings = manifest.get("settings") or {}
         self.quota = QuotaBudget(_strict_nonnegative(settings, "max_requests", 1000),
                                  _strict_nonnegative(settings, "requests_per_target", 100))
+        self.comment_quota = QuotaBudget(
+            _strict_nonnegative(
+                settings, "max_comment_requests",
+                min(200, _strict_nonnegative(settings, "max_requests", 1000)),
+            ),
+            _strict_nonnegative(settings, "requests_per_target", 100),
+        )
         self.posts_per_target = _strict_nonnegative(settings, "posts_per_target", 100)
         self.comments_per_post = _strict_nonnegative(settings, "comments_per_post", 50)
         self.parser = EastmoneyParser()
@@ -182,6 +193,12 @@ class EastmoneySpider(scrapy.Spider):
         self.parser_errors = 0
         self.request_successes = 0
         self.request_errors = 0
+        self.comment_source = "primary"
+        self.comment_fallback_used = False
+        self.comment_circuit_open = False
+        self.comment_source_requests = {"primary": 0, "backup": 0}
+        self.comment_source_successes = {"primary": 0, "backup": 0}
+        self.comment_source_failures = {"primary": 0, "backup": 0}
         self.circuit_breaker_failures = _strict_nonnegative(
             settings, "circuit_breaker_failures", 5, positive=True,
         )
@@ -195,33 +212,52 @@ class EastmoneySpider(scrapy.Spider):
     def _request(self, job: dict):
         target_id = ",".join(sorted(str(mapping["target_id"])
                                     for mapping in job.get("mappings", [job])))
+        if job["kind"] == "comments":
+            if self.comment_circuit_open or not self.comment_quota.consume(target_id):
+                return None
         if not self.quota.consume(target_id):
             return None
         request_options = {
             "callback": self.parse_job, "errback": self.request_failed,
-            "cb_kwargs": {"job": job}, "meta": {"quota_target_id": target_id},
+            "cb_kwargs": {"job": job},
             # Explicit manifests are already URL-premerged. Reissuing requests is
             # required for safe restart when JOBDIR's dupefilter contains a request
             # that completed just before an interrupted process.
-            "dont_filter": True,
+            "dont_filter": True, "meta": {
+                "quota_target_id": target_id,
+                "quota_kind": "comments" if job["kind"] == "comments" else "core",
+            },
         }
         parsed = urlparse(job["url"])
-        if job["kind"] == "comments" and parsed.hostname == "guba.eastmoney.com":
+        if job["kind"] == "comments" and parsed.hostname in _PRODUCTION_HOSTS:
             content_id = str(job.get("content_id") or "")
             forum_id = str(job.get("forum_id") or job.get("target_id") or "")
             page = int(job.get("cursor") or 1)
+            source = str(job.get("comment_source") or self.comment_source)
+            job = dict(job, comment_source=source)
+            request_options["cb_kwargs"] = {"job": job}
+            self.comment_source_requests[source] += 1
+            if source == "primary":
+                query = urlencode({
+                    "callback": "jQuery_apex", "plat": "web", "version": "300",
+                    "product": "guba", "postid": content_id, "sort": 1,
+                    "sorttype": 1, "p": page, "ps": 30, "type": 0,
+                    "h": hashlib.md5(content_id.encode("utf-8")).hexdigest(),
+                })
+                return scrapy.Request(
+                    f"https://gbapi.eastmoney.com/reply/JSONP/ArticleNewReplyList?{query}",
+                    headers={"Referer": self._canonical_detail_url(job, content_id)},
+                    **request_options,
+                )
             path = "reply/api/Reply/ArticleNewReplyList"
-            api_url = (f"https://guba.eastmoney.com/api/getData?code={forum_id}"
-                       f"&path={path}")
+            api_url = "https://guba.eastmoney.com/interface/GetData.aspx"
             parameter = urlencode({
                 "postid": content_id, "sort": 1, "sorttype": 1,
                 "p": page, "ps": 30, "needHide": "true",
             })
             return scrapy.FormRequest(api_url, formdata={
-                "param": parameter, "plat": "Web", "path": path, "env": "2",
-                "origin": "", "version": "2022", "product": "Guba",
+                "param": parameter, "path": path, "env": "2",
             }, headers={
-                "Origin": "https://guba.eastmoney.com",
                 "Referer": self._canonical_detail_url(job, content_id),
             }, **request_options)
         return scrapy.Request(job["url"], **request_options)
@@ -230,6 +266,11 @@ class EastmoneySpider(scrapy.Spider):
         self._snapshot_response(response, job)
         if response.status == 403:
             self.request_errors += 1
+            if job.get("kind") == "comments":
+                request = self._comment_source_failed(job)
+                if request is not None:
+                    yield request
+                return
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
         self.request_successes += 1
@@ -243,6 +284,8 @@ class EastmoneySpider(scrapy.Spider):
                                                       content_id=str(job.get("content_id") or ""),
                                                       page=comment_page)
                 self.parser_successes += 1
+                source = str(job.get("comment_source") or "primary")
+                self.comment_source_successes[source] += 1
                 seen = set(job.get("seen_comment_ids") or [])
                 unique = [record for record in page.records
                           if record["comment_id"] not in seen]
@@ -268,9 +311,19 @@ class EastmoneySpider(scrapy.Spider):
                 return
             posts = self.parser.parse_posts(response.body, content_type)
         except BlockedResponse:
+            if job.get("kind") == "comments":
+                request = self._comment_source_failed(job)
+                if request is not None:
+                    yield request
+                return
             self.terminal_reason = "blocked"
             raise CloseSpider("blocked")
         except SchemaChanged:
+            if job.get("kind") == "comments":
+                request = self._comment_source_failed(job)
+                if request is not None:
+                    yield request
+                return
             self._schema_changed(job, terminal=job.get("kind") != "comments")
             return
         self.parser_successes += 1
@@ -374,6 +427,18 @@ class EastmoneySpider(scrapy.Spider):
             self.terminal_reason = "schema_changed"
             raise CloseSpider("schema_changed")
 
+    def _comment_source_failed(self, job: dict):
+        source = str(job.get("comment_source") or "primary")
+        if self.comment_source_failures[source] == 0:
+            self.comment_source_failures[source] = 1
+            self.parser_errors += 1
+        if source == "primary":
+            self.comment_source = "backup"
+            self.comment_fallback_used = True
+            return self._request(dict(job, comment_source="backup"))
+        self.comment_circuit_open = True
+        return None
+
     @staticmethod
     def _canonical_detail_url(job: dict, content_id: str) -> str:
         forum_id = str(job.get("forum_id") or job.get("target_id") or "").strip()
@@ -416,6 +481,8 @@ class EastmoneySpider(scrapy.Spider):
         self.request_errors += 1
         request = failure.request
         job = request.cb_kwargs.get("job", {})
+        if job.get("kind") == "comments":
+            return self._comment_source_failed(job)
         for mapping in job.get("mappings") or [job]:
             self.failed_targets.add(str(mapping.get("target_id") or "unknown"))
 
@@ -428,6 +495,14 @@ class EastmoneySpider(scrapy.Spider):
             "parser_errors": self.parser_errors,
             "request_successes": self.request_successes,
             "request_errors": self.request_errors,
+            "comment_request_count": self.comment_quota.request_count,
+            "comment_quota_exhausted": self.comment_quota.exhausted,
+            "comment_source": self.comment_source,
+            "comment_fallback_used": self.comment_fallback_used,
+            "comment_circuit_open": self.comment_circuit_open,
+            "comment_source_requests": self.comment_source_requests,
+            "comment_source_successes": self.comment_source_successes,
+            "comment_source_failures": self.comment_source_failures,
         }
         if self.terminal_reason:
             report["terminal_reason"] = self.terminal_reason

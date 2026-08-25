@@ -19,10 +19,11 @@ class EastmoneyRunner:
         requests = int(report.get("request_count") or 0)
         failed = int(report.get("failed_targets") or 0)
         quota = bool(report.get("quota_exhausted"))
+        comment_circuit_open = bool(report.get("comment_circuit_open"))
         terminal = report.get("terminal_reason")
         if terminal in {"blocked", "schema_changed", "failed"}:
             status = terminal
-        elif quota:
+        elif quota or comment_circuit_open:
             status = "partial"
         elif failed:
             status = "partial" if records else "failed"

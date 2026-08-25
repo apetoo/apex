@@ -145,6 +145,7 @@ sector_sentiment:
     retry_times: 3
     circuit_breaker_failures: 5
     max_requests: 500
+    max_comment_requests: 200      # 评论独立子额度；耗尽不阻断帖子列表和详情
     requests_per_target: 100
     minimum_posts: 1
     minimum_authors: 1

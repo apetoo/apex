@@ -32,6 +32,10 @@ export interface EastmoneyTelemetry {
   constituent_forum_records: number;
   request_success_rate: number;
   parse_success_rate: number;
+  business_success_rate: number;
+  comment_source: "primary" | "backup";
+  comment_fallback_used: boolean;
+  comment_circuit_open: boolean;
   quota_exhausted: boolean;
   circuit_open: boolean;
   schema_changed: boolean;
