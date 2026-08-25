@@ -9,6 +9,7 @@ from apex.analyze import (
     _apply_repeat_limit,
     _clamp_verdict_delta,
     _compute_repeat_analysis,
+    _finalize_verdict_candidate,
 )
 from apex.schemas import VERDICT_ENUM
 
@@ -114,6 +115,22 @@ def test_limit_conf_clamped():
     assert limited_c == 5  # 7 + max(-2, min(2, -4)) = 7-2 = 5
     assert ra["limited"] is True
     assert "conf_clamped" in ra["limit_rule"]
+
+
+def test_finalize_candidate_applies_repeat_limit_before_report_generation():
+    history = [_entry(verdict="偏多", confidence=7, hours_ago=3, features=_feat())]
+    raw = {
+        "verdict": "看空", "confidence": 3, "new_info": [], "features": _feat(),
+        "evidence": ["趋势走弱 → 偏空"],
+    }
+
+    final, metadata = _finalize_verdict_candidate(raw, history)
+
+    assert final["verdict"] == "观望偏多"
+    assert final["confidence"] == 5
+    assert raw["verdict"] == "看空"
+    assert metadata["repeat_analysis"]["raw_verdict"] == "看空"
+    assert metadata["repeat_analysis"]["raw_confidence"] == 3
 
 
 def test_no_limit_when_new_info_verified():

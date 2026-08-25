@@ -44,6 +44,7 @@ class AnalysisGraphState(TypedDict, total=False):
     report_route: str
     report_validation_issues: list[str]
     report_generation_attempts: int
+    finalization_metadata: dict[str, Any]
 
 
 Node = Callable[[AnalysisGraphState], dict[str, Any]]

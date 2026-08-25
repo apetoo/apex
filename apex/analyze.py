@@ -3,9 +3,10 @@ DeepSeek API (OpenAI-compatible) agent for stock analysis.
 The AI autonomously calls data tools, then records verdict via record_verdict tool.
 """
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import OpenAI
 
@@ -877,6 +878,31 @@ def _apply_repeat_limit(
     return limited_verdict, limited_confidence
 
 
+def _finalize_verdict_candidate(
+    candidate: dict, history_entries: list[dict],
+) -> tuple[dict, dict]:
+    """Apply deterministic post-model limits before prose generation and persistence."""
+    final = dict(candidate or {})
+    raw_verdict = str(final.get("verdict") or "")
+    raw_confidence = final.get("confidence")
+    if raw_confidence is not None:
+        try:
+            raw_confidence = max(1, min(10, int(raw_confidence)))
+        except (TypeError, ValueError):
+            raw_confidence = None
+    repeat_info = _compute_repeat_analysis(
+        history_entries,
+        raw_verdict,
+        raw_confidence,
+        final.get("new_info", []),
+        final.get("features", {}),
+    )
+    final["verdict"], final["confidence"] = _apply_repeat_limit(
+        repeat_info, raw_verdict, raw_confidence,
+    )
+    return final, {"repeat_analysis": repeat_info}
+
+
 def _format_history(entries: list[dict], ts_code: str, limit: int = 8) -> str:
     """Format past journal entries for injection into the user prompt.
 
@@ -1600,6 +1626,10 @@ _REPORT_PROCESS_MARKERS = (
 )
 
 
+def _report_labeled_values(text: str, label: str) -> list[str]:
+    return [value.strip() for value in re.findall(rf"\*\*{re.escape(label)}：([^*\n]+)\*\*", text)]
+
+
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
@@ -1619,10 +1649,19 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
     if kind == "verdict":
         verdict = str(candidate.get("verdict") or "")
         confidence = candidate.get("confidence")
-        if verdict and f"判断：{verdict}" not in text:
+        verdict_values = _report_labeled_values(text, "判断")
+        confidence_values = _report_labeled_values(text, "置信度")
+        if verdict and verdict not in verdict_values:
             issues.append("判断与结构化结果不一致")
-        if confidence is not None and f"置信度：{confidence}/10" not in text:
+        if verdict and any(value != verdict for value in verdict_values):
+            issues.append("存在冲突的判断")
+        expected_confidence = f"{confidence}/10" if confidence is not None else ""
+        if confidence is not None and expected_confidence not in confidence_values:
             issues.append("置信度与结构化结果不一致")
+        if confidence is not None and any(
+            value != expected_confidence for value in confidence_values
+        ):
+            issues.append("存在冲突的置信度")
         if verdict in BULLISH_VERDICTS:
             entry_low = candidate.get("entry_low") or candidate.get("entry")
             entry_high = candidate.get("entry_high") or candidate.get("entry")
@@ -1639,8 +1678,30 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                     issues.append(f"{label}与结构化结果不一致")
     elif kind == "position_action":
         action = str(candidate.get("action") or "")
-        if action and f"当前动作：{action}" not in text:
+        action_values = _report_labeled_values(text, "当前动作")
+        if action and action not in action_values:
             issues.append("当前动作与结构化结果不一致")
+        if action and any(value != action for value in action_values):
+            issues.append("存在冲突的当前动作")
+        for field, label in (
+            ("add_shares", "加仓股数"), ("trim_shares", "减仓股数"),
+            ("trim_pct", "减仓比例"), ("new_stop", "新止损"),
+            ("new_target", "新目标"),
+        ):
+            value = candidate.get(field)
+            if value is not None and str(value) not in _report_labeled_values(text, label):
+                issues.append(f"{label}与结构化结果不一致")
+        plan_section = text.split("## 条件触发计划", 1)[-1].split("\n## ", 1)[0]
+        for index, level in enumerate(candidate.get("scale_plan") or [], start=1):
+            expected = (
+                f"{level.get('action')} @ {level.get('trigger_price')}",
+                f"{level.get('shares')} 股",
+            )
+            if any(token not in plan_section for token in expected):
+                issues.append(f"条件触发计划第 {index} 档与结构化结果不一致")
+                continue
+            if level.get("new_stop") is not None and f"新止损 {level.get('new_stop')}" not in plan_section:
+                issues.append(f"条件触发计划第 {index} 档新止损与结构化结果不一致")
     return issues
 
 
@@ -1750,6 +1811,7 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
 def _run_langgraph_loop(
     *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
     system_context: str = "",
+    finalize_candidate: Callable[[str, dict], tuple[dict, dict]] | None = None,
 ) -> dict:
     """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
     controller = EvidenceController()
@@ -2212,23 +2274,54 @@ def _run_langgraph_loop(
         emit({"type": "status", "stage": "reporting", "message": "正在生成正式分析报告"})
         kind = str(state.get("draft_kind") or "")
         candidate = dict(state.get("draft_data") or {})
+        finalization_metadata: dict = {}
+        if finalize_candidate is not None:
+            candidate, finalization_metadata = finalize_candidate(kind, candidate)
+            candidate = dict(candidate or {})
+            finalization_metadata = dict(finalization_metadata or {})
         if kind == "position_action":
+            heading_contract = "\n".join(_POSITION_REPORT_SECTIONS)
             format_contract = (
                 "持仓动作报告必须依次包含这些标题：\n"
-                "## 核心判断\n## 基本面分析\n## 一、多头论点\n## 二、空头论点\n"
-                "## 三、裁判结论\n### 加权四维评分\n## 当前持仓动作\n## 条件触发计划\n## 风险提示\n\n"
+                + heading_contract + "\n\n"
                 "核心判断和当前持仓动作章节都必须逐字写出 `**当前动作：<action>**`。"
+                "candidate 中非空的动作字段必须使用这些标签逐字写出："
+                "`**加仓股数：<add_shares>**`、`**减仓股数：<trim_shares>**`、"
+                "`**减仓比例：<trim_pct>**`、`**新止损：<new_stop>**`、`**新目标：<new_target>**`。"
+                "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股，新止损 <new_stop>`。"
                 "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
             )
         else:
+            heading_contract = "\n".join(_VERDICT_REPORT_SECTIONS)
             format_contract = (
                 "未持仓 verdict 报告必须依次包含这些标题：\n"
-                "## 核心判断\n## 基本面分析\n## 一、多头论点\n## 二、空头论点\n"
-                "## 三、裁判结论\n### 加权四维评分\n### 置信度调整\n## 操作建议\n## 风险提示\n\n"
+                + heading_contract + "\n\n"
                 "核心判断必须逐字写出 `**判断：<verdict>**` 和 `**置信度：<confidence>/10**`。"
                 "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
                 "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
             )
+        confirmed_evidence = [
+            {
+                key: item.get(key)
+                for key in (
+                    "id", "fact", "inference", "evidence_type", "source_name",
+                    "source_url", "published_at", "source_tier", "freshness_status",
+                )
+                if item.get(key) is not None
+            }
+            for item in (state.get("evidence") or [])
+        ]
+        authoritative_context = {
+            "kind": kind,
+            "candidate": candidate,
+            "confirmed_evidence": confirmed_evidence,
+            "research_thesis": controller.thesis,
+            "gaps": list(state.get("gaps") or []),
+            "unknowns": list(state.get("unknowns") or []),
+            "review_outcome": state.get("review_outcome"),
+            "review_issues": list(state.get("review_issues") or []),
+            "system_context": system_context,
+        }
         report_contract = (
             "你是 Apex 的正式投资分析报告编辑。候选结论已经完成证据门控和独立复核，"
             "你只能解释它，不得改变其中任何机器字段。基于给定对话、工具结果、证据和候选结论，"
@@ -2237,10 +2330,12 @@ def _run_langgraph_loop(
             + "基本面分析必须引用具体营收、利润、现金流、ROE、负债或估值数据；数据未知就明确写未知，禁止编造。"
             "多头和空头各至少三条，格式为数据点 → 推论；裁判必须比较双方最硬证据。"
             "评分和置信度调整必须列出计算过程。操作建议必须与最终方向及价格建议一致。\n\n"
-            "最终机器结果（不可修改）：\n"
-            + json.dumps({"kind": kind, "candidate": candidate}, ensure_ascii=False, sort_keys=True)
+            "以下是正式报告的权威上下文。confirmed_evidence 与 system_context 视为已验证；"
+            "原始对话中的未收录材料不得覆盖它。candidate 是不可修改的最终机器结果：\n"
+            + json.dumps(authoritative_context, ensure_ascii=False, sort_keys=True)
         )
         issues: list[str] = []
+        provider_failures = 0
         for attempt in range(2):
             retry = ""
             if issues:
@@ -2271,21 +2366,30 @@ def _run_langgraph_loop(
                     return {
                         "analysis_text": text, "report_route": "finalize",
                         "report_validation_issues": [], "report_generation_attempts": attempt + 1,
+                        "draft_data": candidate,
+                        "finalization_metadata": finalization_metadata,
                     }
             except Exception as exc:
+                provider_failures += 1
                 issues = [f"正式报告生成失败：{exc}"]
 
         failures = [f"report: {issue}" for issue in issues]
         controller.failures.extend(
             failure for failure in failures if failure not in controller.failures
         )
+        provider_failed = provider_failures == 2
         return {
             "analysis_text": "", "report_route": "abstain",
             "report_validation_issues": issues, "report_generation_attempts": 2,
-            "outcome_reason": "report_validation_failed",
-            "next_actions": ["重新运行分析并生成完整正式报告"],
+            "outcome_reason": "provider_failure" if provider_failed else "report_validation_failed",
+            "next_actions": [
+                "模型服务恢复后重新运行分析"
+                if provider_failed else "重新运行分析并生成完整正式报告"
+            ],
             "failures": list(controller.failures),
-            "research_metrics": controller.research_metrics(stop_reason="report_validation_failed"),
+            "research_metrics": controller.research_metrics(
+                stop_reason="provider_failure" if provider_failed else "report_validation_failed"
+            ),
         }
 
     def finalize(state):
@@ -2515,6 +2619,10 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 history_block, portfolio_block, intraday_block, market_block, playstyle_block,
             ) if block
         ),
+        finalize_candidate=lambda kind, candidate: (
+            _finalize_verdict_candidate(candidate, history_entries)
+            if kind == "verdict" else (dict(candidate), {})
+        ),
     )
     analysis_text = str(graph_result.get("analysis_text") or "")
     evidence_items = list(graph_result.get("evidence") or [])
@@ -2530,6 +2638,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "model_iteration_exhausted": "证据已完成评估，但模型未能生成有效的结构化结论。",
             "provider_failure": "模型或数据服务暂不可用，本次未形成投资判断。",
             "review_failure": "候选结论未能完成独立复核，本次不输出投资判断。",
+            "report_validation_failed": "候选结论已通过复核，但正式报告未通过完整性或一致性校验。",
         }
         entry = build_insufficient_entry(
             ts_code=ts_code, name=data.get_name_map().get(ts_code),
@@ -2569,27 +2678,10 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             token_usage=token_usage,
         )
 
-    raw_verdict = verdict_data["verdict"]
-    raw_confidence = verdict_data.get("confidence")
-    # AI 自报置信度兜底：clamp 到 [1, 10]，避免扣减规则叠加把分扣穿
-    if raw_confidence is not None:
-        try:
-            raw_confidence = max(1, min(10, int(raw_confidence)))
-        except (TypeError, ValueError):
-            raw_confidence = None
-
-    # ── 24h 重复分析限幅（痛点#3：宁可错杀，防 LLM 随机漂移）──
-    # 代码层强制：24h 内重复 + 无客观新增 -> 方向 ±1 档 / conf ±2。
-    # prompt 已改成"系统自动限幅，AI 如实给判断"，避免双重限幅。
-    repeat_info = _compute_repeat_analysis(
-        history_entries,
-        raw_verdict,
-        raw_confidence,
-        verdict_data.get("new_info", []),
-        verdict_data.get("features", {}),
-    )
-    limited_verdict, limited_confidence = _apply_repeat_limit(
-        repeat_info, raw_verdict, raw_confidence,
+    limited_verdict = verdict_data["verdict"]
+    limited_confidence = verdict_data.get("confidence")
+    repeat_info = dict(
+        (graph_result.get("finalization_metadata") or {}).get("repeat_analysis") or {}
     )
 
     cal_score: Optional[float] = None

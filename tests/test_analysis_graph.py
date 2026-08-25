@@ -214,6 +214,11 @@ def test_final_report_validator_accepts_complete_report_and_rejects_field_confli
     assert any("判断与结构化结果不一致" in issue for issue in issues)
     assert any("置信度与结构化结果不一致" in issue for issue in issues)
 
+    conflicting = _complete_verdict_report() + "\n\n**判断：看多**\n**置信度：8/10**"
+    issues = analyze._validate_final_report(conflicting, "verdict", candidate)
+    assert any("存在冲突的判断" in issue for issue in issues)
+    assert any("存在冲突的置信度" in issue for issue in issues)
+
 
 def test_final_report_validator_enforces_position_action_contract():
     report = """## 核心判断
@@ -255,6 +260,37 @@ def test_final_report_validator_enforces_position_action_contract():
         "position_action", candidate,
     )
     assert any("当前动作与结构化结果不一致" in issue for issue in issues)
+
+
+def test_final_report_validator_enforces_position_risk_and_ladder_fields():
+    report = _complete_position_report().replace(
+        "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：hold**\n**新止损：4.8**\n**新目标：7.5**\n保持现有仓位。",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "- add @ 5.2，100 股，新止损 4.9；价格触发后才执行。",
+    )
+    candidate = {
+        "action": "hold", "new_stop": 4.8, "new_target": 7.5,
+        "scale_plan": [{
+            "action": "add", "trigger_price": 5.2, "shares": 100,
+            "new_stop": 4.9, "reason": "突破确认",
+        }],
+        "rationale": "保持仓位",
+    }
+
+    assert analyze._validate_final_report(report, "position_action", candidate) == []
+
+    issues = analyze._validate_final_report(
+        report.replace("**新止损：4.8**", "**新止损：4.2**"),
+        "position_action", candidate,
+    )
+    assert any("新止损与结构化结果不一致" in issue for issue in issues)
+
+    issues = analyze._validate_final_report(
+        report + "\n**当前动作：add**", "position_action", candidate,
+    )
+    assert any("存在冲突的当前动作" in issue for issue in issues)
 
 
 def test_final_report_validator_enforces_bullish_trade_plan_fields():
@@ -381,12 +417,17 @@ def test_formal_report_replaces_research_process_text(monkeypatch):
     result = analyze._run_langgraph_loop(
         ts_code="002192.SZ", client=client, model="fake",
         messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+        system_context="确定性市场上下文：沪深300五日下跌3%",
     )
 
     assert result["analysis_status"] == "completed"
     assert result["analysis_text"] == report
     assert "让我查询" not in result["analysis_text"]
     assert "tools" not in client.calls[-1]
+    report_prompt = client.calls[-1]["messages"][-1]["content"]
+    assert "融捷股份002192公告" in report_prompt
+    assert "确定性市场上下文：沪深300五日下跌3%" in report_prompt
+    assert '"review_outcome": "pass"' in report_prompt
 
 
 def test_formal_report_retries_once_with_validation_issues(monkeypatch):
@@ -433,6 +474,60 @@ def test_formal_report_validation_failure_does_not_publish_partial_report(monkey
     assert result["outcome_reason"] == "report_validation_failed"
     assert result.get("analysis_text", "") == ""
     assert any("基本面分析" in issue for issue in result["failures"])
+
+
+def test_formal_report_provider_failure_preserves_provider_failure_semantics(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        ConnectionError("report gateway unavailable"),
+        TimeoutError("report gateway timeout"),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "insufficient_evidence"
+    assert result["outcome_reason"] == "provider_failure"
+    assert result["analysis_text"] == ""
+    assert any("report gateway timeout" in failure for failure in result["failures"])
+
+
+def test_formal_report_uses_finalized_candidate_as_single_source_of_truth(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    raw = _bearish_candidate()
+    raw.update({"verdict": "看空", "confidence": 3})
+    limited = {**raw, "verdict": "观望偏空", "confidence": 5}
+    report = _complete_verdict_report(verdict="观望偏空", confidence=5)
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "看空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=raw),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=report),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12,
+        emit=lambda _event: None,
+        finalize_candidate=lambda kind, candidate: (
+            limited, {"repeat_analysis": {"limited": True, "raw_verdict": candidate["verdict"]}}
+        ),
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["draft_data"]["verdict"] == "观望偏空"
+    assert result["draft_data"]["confidence"] == 5
+    assert result["finalization_metadata"]["repeat_analysis"]["raw_verdict"] == "看空"
+    assert result["analysis_text"] == report
 
 
 def test_review_pass_with_material_contradiction_requires_draft_revision():
