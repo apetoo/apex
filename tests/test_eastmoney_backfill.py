@@ -157,3 +157,54 @@ def test_offline_replay_uses_saved_list_response_without_provider_or_network(tmp
     assert result["collection"]["eastmoney"]["posts"] == 1
     assert {job["platform"] for job in result["collection"]["jobs"]} == {"eastmoney"}
     assert result["counted_shadow_day"] is False
+
+
+def test_offline_replay_skips_newer_empty_backfill_batch_for_older_replayable_batch(tmp_path: Path):
+    """Catches selecting the newest manifest even when it has no saved list body."""
+    backfill = _backfill_module()
+    cache_dir = tmp_path / "raw" / "2026-08-17" / "eastmoney"
+    live_batch = cache_dir / "earlier-live-batch"
+    live_responses = live_batch / "responses"
+    live_responses.mkdir(parents=True)
+    list_url = "https://guba.eastmoney.com/list,bk0910.html"
+    body = b'''<html><script>var article_list={"re":[{
+      "post_id":1760184053,"post_title":"robot sentiment",
+      "stockbar_code":"bk0910","user_id":"saved-author",
+      "post_click_count":64,"post_comment_count":1,"post_like_count":0,
+      "post_publish_time":"2026-08-17 19:13:59",
+      "post_last_time":"2026-08-17 19:13:59","post_type":20
+    }]};</script></html>'''
+    response_id = hashlib.sha256(b"list\0" + list_url.encode("utf-8") + b"\0" + body).hexdigest()
+    (live_responses / f"{response_id}.body").write_bytes(body)
+    jobs = [{"kind": "list", "target_id": "bk0910", "url": list_url,
+        "list_next_url_template": "https://guba.eastmoney.com/list,bk0910_{page}.html",
+        "detail_url_template": "https://guba.eastmoney.com/news,bk0910,{content_id}.html",
+        "comments_url_template": "https://guba.eastmoney.com/comments/{content_id}",
+        "window_start": "2026-08-16T18:00:00+08:00", "page": 1, "posts_limit": 10,
+        "forum_id": "bk0910", "sector_id": "robot", "source_type": "sector_forum",
+        "stock_code": None, "pool_version": "eastmoney-target-v1"}]
+    live_manifest = {"trade_date": "2026-08-17", "batch_id": "earlier-live-batch",
+        "collected_at": "2026-08-17T20:00:00+08:00",
+        "window_start": "2026-08-16T18:00:00+08:00",
+        "output_file": str(live_batch / "records.jsonl"), "author_salt": "test-salt",
+        "raw_response_dir": str(live_responses), "representative_constituents": {},
+        "missing_targets": [], "settings": {"max_requests": 20, "requests_per_target": 10,
+            "posts_per_target": 10, "comments_per_post": 10, "download_delay_seconds": 2,
+            "timeout_seconds": 20, "retry_times": 3, "concurrent_requests_per_domain": 1,
+            "circuit_breaker_failures": 5}, "jobs": jobs}
+    (live_batch / "manifest.json").write_text(json.dumps(live_manifest), encoding="utf-8")
+
+    empty_batch = cache_dir / "newer-backfill-batch"
+    empty_responses = empty_batch / "responses"
+    empty_responses.mkdir(parents=True)
+    empty_manifest = dict(live_manifest, batch_id="newer-backfill-batch",
+                          output_file=str(empty_batch / "records.jsonl"),
+                          raw_response_dir=str(empty_responses))
+    (empty_batch / "manifest.json").write_text(json.dumps(empty_manifest), encoding="utf-8")
+
+    result = backfill.run_eastmoney_backfill(
+        _config(tmp_path), trade_date="2026-08-17", as_of="2026-08-17T20:00:00+08:00",
+        offline_replay=True,
+    )
+
+    assert result["collection"]["eastmoney"]["posts"] == 1

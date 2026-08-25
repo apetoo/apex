@@ -133,7 +133,7 @@ SSE events from backend (`backend/core/streaming.py`): `trace` / `progress` / `c
 
 **分时不是 AI 工具，且原始 bars 不落盘.** `get_intraday_snapshot` / `get_intraday_bars` 不在 `data.TOOL_FUNCTIONS` —— 别把它们注册成 AI 工具（启动时 `_format_intraday_block` 强制注入特征到 prompt，设计上不让 AI 决定调不调）。分时原始 1 分钟 bars 在 Python 压成特征后即弃，**不进 prompt、不写 trace.jsonl**；trace 里只有日线 raw（`get_daily_price` 是工具，落 `tool_result.raw`）。所以前端分时图只能实时调 `/api/market/intraday/{ts_code}/bars`，**无法从 trace 回放历史分时**。
 
-**web_search 是查漏补缺，不做类别打卡.** 每次分析自动执行窄范围权威风险扫描；其余搜索由证据缺口驱动。搜索失败、空结果、串票或 Tier 3 线索不算覆盖，重大 Tier 2 事实需要 Tier 1 或第二独立来源佐证。最终提交由 evidence controller 和独立复核共同门控。
+**web_search 是查漏补缺，不做类别打卡.** 每次分析自动执行窄范围权威风险扫描；其余搜索由证据缺口驱动。搜索失败、空结果、串票或 Tier 3 线索不算覆盖，重大 Tier 2 事实需要 Tier 1 或第二独立来源佐证（90 天内的新鲜事实；更陈旧的单源事实不硬阻断，交由独立复核按重要性把关）。最终提交由 evidence controller 和独立复核共同门控。
 
 ## Skill routing
 
