@@ -385,6 +385,16 @@ def _candidate_context(pick: dict, screener_date: str) -> dict:
     }
 
 
+def _should_promote_analysis(result: dict, bullish_verdicts: list[str],
+                             gate_mode: str) -> bool:
+    if result.get("verdict") not in bullish_verdicts:
+        return False
+    if gate_mode != "enforced":
+        return True
+    decision = result.get("trade_decision") or {}
+    return bool(decision.get("eligible") and decision.get("action") == "buy")
+
+
 def task_screener_and_promote() -> str:
     """盘后粗筛 -> 分析 top N -> bullish 自动入候选（补断层 A+B）。
 
@@ -398,7 +408,8 @@ def task_screener_and_promote() -> str:
     if not acfg["enabled"]:
         print("\n  ⏭ auto_trade 未启用，跳过粗筛入候选")
         return "screener_skip_disabled"
-    from apex import screener, analyze, watchlist, data
+    from apex import screener, analyze, watchlist, data, config
+    gate_mode = str(((((config.get().get("backtest") or {}).get("trade_signal_gate") or {}).get("mode")) or "shadow"))
     print("\n" + "=" * 50)
     print("  🔎 盘后粗筛 + 分析入候选")
     print("=" * 50)
@@ -449,7 +460,7 @@ def task_screener_and_promote() -> str:
         pa = res.get("price_advice") or {}
         entry = pa.get("entry")
         print(f"    -> {verdict} (entry={entry})")
-        if verdict not in acfg["bullish_verdicts"]:
+        if not _should_promote_analysis(res, acfg["bullish_verdicts"], gate_mode):
             continue
         if not entry or float(entry) <= 0:
             print(f"  ⏭ {code} bullish 但无有效 entry，跳过入候选")
@@ -460,7 +471,10 @@ def task_screener_and_promote() -> str:
             watchlist.add_candidate(
                 code, pick.get("name", ""),
                 trigger_price=float(entry),
-                trigger_direction="below",
+                trigger_direction=(
+                    "above" if gate_mode == "enforced" and pa.get("entry_style") == "breakout"
+                    else "below"
+                ),
                 stop_advice=stop,
                 target_advice=target,
                 strategy=pick.get("strategy"),
