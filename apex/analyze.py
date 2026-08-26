@@ -12,7 +12,7 @@ from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle, trade_signal
 from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
@@ -303,6 +303,20 @@ TOOLS = [
                         "type": "integer",
                         "description": "置信度 1-10",
                     },
+                    "proposed_trade_action": {
+                        "type": "string",
+                        "enum": ["buy", "watch", "avoid"],
+                        "description": "交易意图。公司值得跟踪但当前没有合格买点时必须填 watch，不能用 buy 代替长期看好。",
+                    },
+                    "entry_style": {
+                        "type": "string",
+                        "enum": ["pullback", "breakout"],
+                        "description": "入场方式：pullback=等待回踩区间，breakout=等待向上突破区间。",
+                    },
+                    "valid_for_days": {
+                        "type": "integer", "minimum": 1, "maximum": 10,
+                        "description": "买入区间从下一交易日起有效的交易日数，默认建议 3。",
+                    },
                     "entry": {"type": "number", "description": "建议买入价（主锚点）。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
                     "entry_low": {"type": "number", "description": "买入区间下沿（地板价）。回踩入场=下方支撑，突破入场=entry 主锚点。看多类必填，非看多方向不填。"},
                     "entry_high": {"type": "number", "description": "买入区间上沿（天花板）。回踩入场=entry 主锚点，突破入场=上方阻力。看多类必填，非看多方向不填。"},
@@ -411,7 +425,7 @@ TOOLS = [
                         "required": ["ratings", "primary", "reasons"],
                     },
                 },
-                "required": ["verdict", "confidence", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
+                "required": ["verdict", "confidence", "proposed_trade_action", "entry_style", "valid_for_days", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
             },
         },
     },
@@ -2512,7 +2526,8 @@ def _run_langgraph_loop(
     return graph.invoke({}, {"recursion_limit": max(30, max_iter * 5)})
 
 
-def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
+def run(ts_code: str, save: bool = True, on_progress=None,
+        candidate_context: Optional[dict] = None) -> dict:
     """
     Run full agent analysis for ts_code via DeepSeek API.
     on_progress(event: dict) is called for each milestone (context injection /
@@ -2525,6 +2540,12 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     history_limit = cfg["deepseek"].get("history_limit", 8)
     client = _make_client(cfg)
     system = _load_system_prompt()
+    candidate_context = dict(candidate_context or {"source_type": "manual", "red_flag": False})
+    candidate_context.setdefault("source_type", "manual")
+    candidate_context.setdefault("red_flag", False)
+    candidate_block = "## 候选来源与交易上下文\n" + json.dumps(
+        candidate_context, ensure_ascii=False, default=str,
+    )
 
     events: list[dict] = []
 
@@ -2564,6 +2585,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
     _emit({"type": "context", "name": "intraday", "content": intraday_block})
     _emit({"type": "context", "name": "market", "content": market_block})
     _emit({"type": "context", "name": "playstyle", "content": playstyle_block})
+    _emit({"type": "context", "name": "candidate", "content": candidate_block})
 
     messages = [
         {"role": "system", "content": system},
@@ -2576,6 +2598,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 f"{intraday_block}\n\n"
                 f"{market_block}\n\n"
                 f"{playstyle_block}\n\n"
+                f"{candidate_block}\n\n"
                 "步骤：\n"
                 "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"
                 "   优先利用已注入数据；若 circ_mv / PE_TTM / turnover_rate / industry / 龙虎榜频次存在关键缺口，\n"
@@ -2668,7 +2691,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
                 "   | **蓝筹/白马 + 基本面证据 < 2 条** | **−2**（基本面权重 50% 但没有实质证据，置信度必须打折扣） |\n"
                 "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
                 "\n"
-                "5) 调 record_verdict：confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。setup_tag 从种子词表（打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转）选最贴切本次驱动逻辑的一个，都不贴切填「其他:<自定义>」。\n"
+                "5) 调 record_verdict：先把公司/方向观点与当前交易时点分开。只有现在具备有效买点才 proposed_trade_action=buy；长期看好但需等确认必须 watch；应回避填 avoid。填写 entry_style 和 valid_for_days。confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。setup_tag 从种子词表（打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转）选最贴切本次驱动逻辑的一个，都不贴切填「其他:<自定义>」。\n"
                 "   **stock_type 必填**：填步骤 0 声明的标的类型（蓝筹白马/题材游资/周期股/成长股/均衡型）。\n"
                 "   **valuation_basis**（仅偏空类必填）：本次空头结论中「估值」是不是主要依据--\n"
                 "   forward_valuation=基于 Forward PE/PEG/一致预期等前瞻估值（成长股偏空唯一允许的估值依据）/ static_pe_only=仅静态 PE_TTM / non_valuation=估值非主要依据。\n"
@@ -2692,7 +2715,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         max_iter=max_iter, emit=_emit,
         system_context="\n\n".join(
             block for block in (
-                history_block, portfolio_block, intraday_block, market_block, playstyle_block,
+                history_block, portfolio_block, intraday_block, market_block, playstyle_block, candidate_block,
             ) if block
         ),
         finalize_candidate=lambda kind, candidate: (
@@ -2730,6 +2753,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             research_metrics=dict(graph_result.get("research_metrics") or {}),
         )
         entry["market_context"] = market_ctx
+        entry["candidate_context"] = candidate_context
         entry["prompt_version"] = "3.0.0-langgraph"
         entry["token_usage"] = token_usage
         if save:
@@ -2791,6 +2815,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "analyzed_at": now_cn.isoformat(timespec="seconds"),
         "analysis_status": "completed",
         "verdict": limited_verdict,
+        "opinion_verdict": limited_verdict,
+        "proposed_trade_action": verdict_data.get("proposed_trade_action") or "watch",
         "confidence": limited_confidence,
         "calibrated_confidence": cal_score,
         "calibration_explanation": cal_explanation,
@@ -2801,6 +2827,8 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
             "stop_loss": verdict_data.get("stop_loss"),
             "target": verdict_data.get("target"),
             "position_size_pct": verdict_data.get("position_size_pct"),
+            "entry_style": verdict_data.get("entry_style"),
+            "valid_for_days": verdict_data.get("valid_for_days"),
         },
         "features": verdict_data.get("features", {}),
         "evidence": evidence_items,
@@ -2812,7 +2840,9 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "analysis_text": analysis_text.strip(),
         "repeat_analysis": repeat_info,
         "prompt_version": "3.0.0-langgraph",
-        "source": "standalone",
+        "source": candidate_context.get("strategy") or candidate_context.get("source_type") or "manual",
+        "candidate_context": candidate_context,
+        "decision_schema_version": "1.0",
         "token_usage": token_usage,
         "setup_tag": verdict_data.get("setup_tag"),
         "stock_type": verdict_data.get("stock_type"),
@@ -2823,6 +2853,7 @@ def run(ts_code: str, save: bool = True, on_progress=None) -> dict:
         "playstyle_features": playstyle_feats,              # FE 10 特征 + completeness + risk_level（A2 可复现/可解释）
         "risk_level": playstyle_feats.get("risk_level"),    # low/medium/high，与 playstyle 正交（D13）
     }
+    entry["trade_decision"] = trade_signal.evaluate_trade_proposal(entry)
 
     if save:
         journal.write_entry(entry)

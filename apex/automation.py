@@ -368,6 +368,23 @@ def task_auto_trade() -> str:
     return f"autotrade_closed_{closed_n}_promoted_{promoted_n}"
 
 
+def _candidate_context(pick: dict, screener_date: str) -> dict:
+    """Preserve screener lineage for analysis, journal attribution and shadow tests."""
+    return {
+        "source_type": "screener",
+        "screener_date": screener_date,
+        "strategy": pick.get("strategy"),
+        "signals": [
+            signal.get("signal_type") for signal in (pick.get("signals") or [])
+            if signal.get("signal_type")
+        ],
+        "ai_score": pick.get("ai_score"),
+        "actionable": pick.get("actionable"),
+        "red_flag": bool(pick.get("red_flag")),
+        "regime": pick.get("regime"),
+    }
+
+
 def task_screener_and_promote() -> str:
     """盘后粗筛 -> 分析 top N -> bullish 自动入候选（补断层 A+B）。
 
@@ -421,7 +438,10 @@ def task_screener_and_promote() -> str:
             continue
         print(f"  🔍 分析 {code} {pick.get('name','')} ...")
         try:
-            res = analyze.run(code, save=True)
+            res = analyze.run(
+                code, save=True,
+                candidate_context=_candidate_context(pick, _today().replace("-", "")),
+            )
         except Exception as e:
             print(f"  ✗ 分析 {code} 失败: {e}")
             continue

@@ -1,7 +1,22 @@
 import json
+import inspect
 from pathlib import Path
 
 from apex import analyze, data
+
+
+def test_record_verdict_requires_explicit_trade_intent_and_entry_semantics():
+    tool = next(t for t in analyze.TOOLS if t["function"]["name"] == "record_verdict")
+    params = tool["function"]["parameters"]
+
+    assert params["properties"]["proposed_trade_action"]["enum"] == ["buy", "watch", "avoid"]
+    assert params["properties"]["entry_style"]["enum"] == ["pullback", "breakout"]
+    assert "valid_for_days" in params["properties"]
+    assert {"proposed_trade_action", "entry_style", "valid_for_days"} <= set(params["required"])
+
+
+def test_analyze_run_accepts_candidate_context():
+    assert "candidate_context" in inspect.signature(analyze.run).parameters
 
 
 def test_research_state_tool_replaces_mandatory_search_categories():
