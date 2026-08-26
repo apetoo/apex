@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeStats, getSignalOutcome } from "../stats";
+import { computeStats, getSignalOutcome, hasAggregateSignals } from "../stats";
 
 describe("backtest official statistics", () => {
   it("excludes pending and non-fill signals from win rate and averages", () => {
@@ -32,5 +32,9 @@ describe("backtest official statistics", () => {
 
     expect(stats.winRate).toBeNull();
     expect(stats.avgNet).toBeNull();
+  });
+
+  it("keeps aggregate status counts visible when no trade is official yet", () => {
+    expect(hasAggregateSignals({ total_signals: 3 })).toBe(true);
   });
 });

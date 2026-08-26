@@ -78,6 +78,24 @@ def test_invalid_price_advice_is_not_flipped_into_stops():
     assert row["net_return"] == pytest.approx(0.05)
 
 
+@pytest.mark.parametrize("target", [9, float("nan"), float("inf")])
+def test_price_advice_pair_is_atomic_and_finite(target):
+    bars = _bars([
+        (10, 10, 10, 10),
+        (10, 10.2, 9.8, 10),
+        (10, 10.5, 8, 10.4),
+    ])
+
+    row = bt._simulate_one(
+        _entry(stop_loss=9, target=target), bars, holding_period=1,
+        include_benchmark=False, as_of_date="2026-08-31",
+    )
+
+    assert row["invalid_price_advice"] is True
+    assert row["exit_reason"] == "time_stop"
+    assert row["net_return"] == pytest.approx(0.04)
+
+
 def test_t_plus_one_forbids_exit_on_entry_day():
     bars = _bars([
         (10, 10, 10, 10),
@@ -127,6 +145,24 @@ def test_same_bar_stop_and_target_uses_conservative_stop_first():
     assert row["exit_reason"] == "stop_hit"
     assert row["exit_price"] == 9
     assert row["net_return"] == pytest.approx(-0.1)
+
+
+def test_unresolved_limit_down_lock_remains_pending_without_fake_fill():
+    bars = _bars([
+        (10, 10, 10, 10),
+        (10, 10.2, 9.8, 10),
+        (9, 9, 9, 9),
+    ])
+
+    row = bt._simulate_one(
+        _entry(stop_loss=9.5, target=12), bars, holding_period=10,
+        include_benchmark=False, as_of_date="2026-08-05",
+    )
+
+    assert row["status"] == "pending"
+    assert row["exit_reason"] == "stop_hit_limit_locked"
+    assert row["exit_price"] is None
+    assert row["net_return"] is None
 
 
 def test_target_hit_return_direction_is_consistent():
@@ -235,6 +271,17 @@ def test_sweep_excludes_pending_from_period_metrics(monkeypatch):
     assert period["fillable_n"] == 1
     assert period["win_rate"] == 1.0
     assert period["avg_net_return"] == 0.1
+
+
+def test_sweep_emits_no_fill_data_rows(monkeypatch):
+    monkeypatch.setattr(bt.journal, "load_verdicts", lambda **kwargs: [_entry()])
+    monkeypatch.setattr(bt, "_prefetch_signals", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bt, "_load_bars_by_code", lambda *args, **kwargs: {})
+
+    result = bt.run_sweep(holding_periods=[10], include_benchmark=False)
+
+    assert result["per_signal"][0]["status"] == "no_fill_data"
+    assert result["by_period"][0]["no_fill_bar_count"] == 1
 
 
 def test_portfolio_signal_builder_leaves_unmatured_position_open():

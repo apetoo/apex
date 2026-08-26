@@ -387,13 +387,15 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
         target_price = float(raw_target) if raw_target is not None else None
     except (TypeError, ValueError):
         target_price = None
-    invalid_stop = raw_stop is not None and (stop_price is None or not 0 < stop_price < fill_price)
-    invalid_target = raw_target is not None and (target_price is None or target_price <= fill_price)
-    if invalid_stop:
-        stop_price = None
-    if invalid_target:
-        target_price = None
-    invalid_price_advice = invalid_stop or invalid_target
+    has_advice = raw_stop is not None or raw_target is not None
+    valid_pair = (
+        stop_price is not None and target_price is not None
+        and np.isfinite(stop_price) and np.isfinite(target_price)
+        and 0 < stop_price < fill_price < target_price
+    )
+    invalid_price_advice = has_advice and not valid_pair
+    if not valid_pair:
+        stop_price = target_price = None
 
     # 单一成交真相源。A 股 T+1：fill bar(index=1)当天不可卖，从 index=2 开始检查。
     exit_pos = len(window) - 1
@@ -409,21 +411,30 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
             if _limit_down_locked(bar_prev_close, lo, hi, cl, limit):
                 # 顺延：找 i 之后第一个非一字跌停的 bar 收盘退出
                 deferred = None
-                for j in range(i + 1, len(window)):
-                    j_prev = float(close.iloc[j - 1])
-                    if not _limit_down_locked(j_prev, float(low_.iloc[j]),
-                                              float(high_.iloc[j]),
-                                              float(close.iloc[j]), limit):
+                for j in range(i + 1, len(bars)):
+                    j_prev = float(bars["close"].iloc[j - 1])
+                    if not _limit_down_locked(j_prev, float(bars["low"].iloc[j]),
+                                              float(bars["high"].iloc[j]),
+                                              float(bars["close"].iloc[j]), limit):
                         deferred = j
                         break
-                exit_pos = deferred if deferred is not None else len(window) - 1
                 exit_reason = "stop_hit_limit_locked"
-                exit_price = float(close.iloc[exit_pos])
+                if deferred is None:
+                    if status == "pending":
+                        exit_price = None
+                    else:
+                        status = "data_truncated"
+                        exit_pos = len(window) - 1
+                        exit_price = float(close.iloc[exit_pos])
+                else:
+                    exit_pos = deferred
+                    exit_price = float(bars["close"].iloc[exit_pos])
             else:
                 exit_reason = "stop_hit"
                 exit_pos = i
                 exit_price = op if op <= stop_price else stop_price
-            status = "completed"
+            if exit_price is not None and status != "data_truncated":
+                status = "completed"
             break
         if target_price is not None and (op >= target_price or hi >= target_price):
             exit_reason = "target_hit"
@@ -439,14 +450,14 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     if exit_price is not None and fill_price > 0:
         total_return = _apply_costs((exit_price - fill_price) / fill_price)
 
-    hold = window.iloc[1:exit_pos + 1]
+    hold = bars.iloc[1:exit_pos + 1]
     if fill_price > 0 and len(hold) > 0:
         mae = float(((hold["low"].astype(float) / fill_price) - 1).min())
         mfe = float(((hold["high"].astype(float) / fill_price) - 1).max())
     else:
         mae = mfe = None
 
-    exit_date = window.index[exit_pos].strftime("%Y-%m-%d") if status != "pending" else None
+    exit_date = bars.index[exit_pos].strftime("%Y-%m-%d") if status != "pending" else None
     if include_benchmark and exit_date is not None:
         bench = (_benchmark_from_series(bench_series, fill_date, exit_date)
                  if bench_series is not None
@@ -548,6 +559,39 @@ def _prefetch_signals(codes, entries, holding_period: int) -> None:
         print(f"⚠ 回测预热批量拉取失败: {type(e).__name__}: {e}")
 
 
+def _no_fill_row(entry: dict, holding_period: int) -> dict:
+    """Build a visible result for a signal that has no T+1 fill bar."""
+    return {
+        "ts_code": entry.get("ts_code", ""),
+        "date": entry.get("date", ""),
+        "analyzed_at": (entry.get("analyzed_at", "") or "").replace("T", " ")[:16],
+        "verdict": entry.get("verdict", ""),
+        "confidence": entry.get("confidence"),
+        "calibrated_confidence": entry.get("calibrated_confidence"),
+        "strategy": entry.get("strategy") or entry.get("source") or "unknown",
+        "holding_period": holding_period,
+        "status": "no_fill_data",
+        "exit_reason": "no_fill_data",
+        "fill_price": None,
+        "fill_date": None,
+        "exit_price": None,
+        "exit_date": None,
+        "net_return": None,
+        "benchmark_return": None,
+        "excess_return": None,
+        "max_drawdown": None,
+        "sharpe": None,
+        "hit": None,
+        "beat_benchmark": None,
+        "mae": None,
+        "mfe": None,
+        "unfillable": False,
+        "truncated": False,
+        "invalid_price_advice": False,
+        "has_features": bool(entry.get("features")),
+    }
+
+
 def _run_entries(long_entries: list, holding_period: int,
                  include_benchmark: bool) -> tuple[list, dict]:
     """对一批多头信号逐条模拟，返回 (所有行含 unfillable/truncated, counts)。
@@ -594,35 +638,7 @@ def _run_entries(long_entries: list, holding_period: int,
             # 连 T+1 fill bar 都没有：无法成交（停牌/退市当日即终/缺数据）。
             # 不静默丢弃——计入 no_fill_bar，让 aggregate 透明披露多少信号因数据缺失无法回测。
             counts["no_fill_data"] += 1
-            rows.append({
-                "ts_code": entry.get("ts_code", ""),
-                "date": entry.get("date", ""),
-                "analyzed_at": (entry.get("analyzed_at", "") or "").replace("T", " ")[:16],
-                "verdict": entry.get("verdict", ""),
-                "confidence": entry.get("confidence"),
-                "calibrated_confidence": entry.get("calibrated_confidence"),
-                "strategy": entry.get("strategy") or entry.get("source") or "unknown",
-                "holding_period": holding_period,
-                "status": "no_fill_data",
-                "exit_reason": "no_fill_data",
-                "fill_price": None,
-                "fill_date": None,
-                "exit_price": None,
-                "exit_date": None,
-                "net_return": None,
-                "benchmark_return": None,
-                "excess_return": None,
-                "max_drawdown": None,
-                "sharpe": None,
-                "hit": None,
-                "beat_benchmark": None,
-                "mae": None,
-                "mfe": None,
-                "unfillable": False,
-                "truncated": False,
-                "invalid_price_advice": False,
-                "has_features": bool(entry.get("features")),
-            })
+            rows.append(_no_fill_row(entry, holding_period))
             continue
         row = _simulate_one(entry, bars, holding_period, include_benchmark,
                             bench_series=bench_series, as_of_date=as_of_date)
@@ -735,6 +751,8 @@ def run_sweep(ts_code: Optional[str] = None,
             # 连 T+1 fill bar 都没有：所有 hp 都计 no_fill_bar（生存者偏差透明化）
             for hp in holding_periods:
                 agg[hp]["no_fill_bar"] += 1
+                per_signal.append(_no_fill_row(entry, hp))
+                agg[hp]["n"] += 1
             continue
         for hp in holding_periods:
             row = _simulate_one(entry, bars, hp, include_benchmark,

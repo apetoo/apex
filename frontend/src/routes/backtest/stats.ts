@@ -1,4 +1,4 @@
-import type { BacktestSignal } from "@/api/backtest";
+import type { AggregateResult, BacktestSignal } from "@/api/backtest";
 
 export interface BacktestStats {
   count: number;
@@ -67,4 +67,16 @@ export function getSignalOutcome(
   return signal.hit
     ? { label: "盈利", tone: "up" }
     : { label: "亏损", tone: "down" };
+}
+
+export function hasAggregateSignals(
+  aggregate: AggregateResult | null | undefined,
+): aggregate is AggregateResult;
+export function hasAggregateSignals(
+  aggregate: { total_signals: number } | null | undefined,
+): boolean;
+export function hasAggregateSignals(
+  aggregate: { total_signals: number } | null | undefined,
+): boolean {
+  return aggregate != null && aggregate.total_signals > 0;
 }

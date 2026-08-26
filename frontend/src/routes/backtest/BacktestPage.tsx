@@ -41,7 +41,7 @@ import {
 } from "@/api/backtest";
 import { ApiError } from "@/api/client";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
-import { computeStats, getSignalOutcome } from "./stats";
+import { computeStats, getSignalOutcome, hasAggregateSignals } from "./stats";
 
 /**
  * /backtest 回测页
@@ -618,7 +618,7 @@ function AggregateCard({
       <CardContent className="pt-0">
         {query.isLoading ? (
           <p className="py-6 text-center text-sm text-flat">回测中...</p>
-        ) : !d || d.fillable_count === 0 ? (
+        ) : !hasAggregateSignals(d) ? (
           <p className="py-6 text-center text-sm text-flat">无信号</p>
         ) : (
           <div className="space-y-4">
