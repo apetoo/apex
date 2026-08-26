@@ -24,7 +24,9 @@ export function computeStats(
       (item.status === "completed" || item.status === "data_truncated") &&
       item.net_return != null && item.hit != null,
   );
-  const pendingCount = data.filter((item) => item.status === "pending").length;
+  const pendingCount = data.filter(
+    (item) => item.status === "pending" || item.status === "pending_entry",
+  ).length;
   const unfillableCount = data.filter(
     (item) => item.status === "unfillable" || item.status === "no_fill_data",
   ).length;
@@ -62,6 +64,8 @@ export function getSignalOutcome(
   signal: Pick<BacktestSignal, "status" | "hit">,
 ): { label: string; tone: "up" | "down" | "flat" } {
   if (signal.status === "pending") return { label: "进行中", tone: "flat" };
+  if (signal.status === "pending_entry") return { label: "等待入场", tone: "flat" };
+  if (signal.status === "expired_unfilled") return { label: "入场未触发", tone: "flat" };
   if (signal.status === "unfillable") return { label: "不可成交", tone: "flat" };
   if (signal.status === "no_fill_data") return { label: "无行情", tone: "flat" };
   return signal.hit

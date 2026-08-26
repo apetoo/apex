@@ -29,6 +29,7 @@ import {
   getBacktestSweep,
   getBacktestAggregate,
   getBacktestPortfolio,
+  getBacktestShadow,
   reviewBacktest,
   resolveExitReason,
   type SweepByPeriod,
@@ -38,6 +39,8 @@ import {
   type ReviewSeverity,
   type WeightHint,
   type BacktestSignal,
+  type ShadowResult,
+  type ShadowArm,
 } from "@/api/backtest";
 import { ApiError } from "@/api/client";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
@@ -85,6 +88,11 @@ export function BacktestPage() {
   const portfolio = useQuery({
     queryKey: ["backtest", "portfolio", committedCode, lookforwardDays],
     queryFn: () => getBacktestPortfolio(committedCode, lookforwardDays),
+    enabled: hasRun,
+  });
+  const shadow = useQuery({
+    queryKey: ["backtest", "shadow", committedCode],
+    queryFn: () => getBacktestShadow(committedCode),
     enabled: hasRun,
   });
 
@@ -179,6 +187,8 @@ export function BacktestPage() {
           />
         </div>
       )}
+
+      <ShadowCard query={shadow} />
 
       {/* P4: 组合净值 */}
       <PortfolioCard query={portfolio} />
@@ -350,6 +360,74 @@ export function BacktestPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+/* ── 可执行信号影子对照 ─────────────────────────────────── */
+
+function ShadowCard({
+  query,
+}: {
+  query: ReturnType<typeof useQuery<ShadowResult>>;
+}) {
+  const d = query.data;
+  const arms: Array<[string, ShadowArm | undefined]> = [
+    ["旧策略", d?.arms.baseline],
+    ["只修执行", d?.arms.execution_only],
+    ["质量门 V1", d?.arms.challenger_v1],
+  ];
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center gap-2">
+        <Activity className="h-4 w-4 text-text-secondary" />
+        <CardTitle>新旧策略影子对照</CardTitle>
+        <CardDescription>
+          同期记录，不影响正式交易 · 只统计实际成交且已结束的交易
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {query.isLoading ? (
+          <p className="py-6 text-center text-sm text-flat">计算影子成绩中...</p>
+        ) : !d || d.analyzed_count === 0 ? (
+          <p className="py-6 text-center text-sm text-flat">
+            尚无新契约信号，后续分析会从 {d?.gate_version ?? "V1"} 开始累计
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="num w-full min-w-[720px] text-sm">
+              <thead>
+                <tr className="border-b border-border text-left text-text-secondary">
+                  <th className="py-2 pr-3 font-normal">策略</th>
+                  <th className="py-2 pr-3 font-normal">通过率</th>
+                  <th className="py-2 pr-3 font-normal">成交/完成</th>
+                  <th className="py-2 pr-3 font-normal">胜率</th>
+                  <th className="py-2 pr-3 font-normal">平均净收益</th>
+                  <th className="py-2 pr-3 font-normal">Profit Factor</th>
+                  <th className="py-2 font-normal">未触发</th>
+                </tr>
+              </thead>
+              <tbody>
+                {arms.map(([label, arm]) => arm && (
+                  <tr key={label} className="border-b border-border/50">
+                    <td className="py-2 pr-3 font-medium">{label}</td>
+                    <td className="py-2 pr-3">{arm.gate_pass_rate == null ? "—" : formatRatio(arm.gate_pass_rate)}</td>
+                    <td className="py-2 pr-3">{arm.filled_count}/{arm.completed_count}</td>
+                    <td className={cn("py-2 pr-3", arm.win_rate == null ? "text-flat" : arm.win_rate >= 0.5 ? "text-up" : "text-down")}>
+                      {arm.win_rate == null ? "—" : formatRatio(arm.win_rate)}
+                    </td>
+                    <td className={cn("py-2 pr-3", arm.avg_net_return == null ? "text-flat" : arm.avg_net_return > 0 ? "text-up" : "text-down")}>
+                      {arm.avg_net_return == null ? "—" : formatPercent(arm.avg_net_return)}
+                    </td>
+                    <td className="py-2 pr-3">{arm.profit_factor?.toFixed(2) ?? "—"}</td>
+                    <td className="py-2">{arm.expired_unfilled_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

@@ -22,7 +22,14 @@ export interface BacktestSignal {
   confidence?: number;
   strategy?: string;
   fill_price?: number;
-  status: "completed" | "pending" | "data_truncated" | "unfillable" | "no_fill_data";
+  status:
+    | "completed"
+    | "pending"
+    | "pending_entry"
+    | "expired_unfilled"
+    | "data_truncated"
+    | "unfillable"
+    | "no_fill_data";
   net_return: number | null;
   benchmark_return?: number | null;
   excess_return?: number | null;
@@ -152,6 +159,44 @@ export async function getBacktestAggregate(
   if (tsCode) params.set("ts_code", tsCode);
   params.set("lookforward_days", String(lookforwardDays));
   return api.get<AggregateResult>(`/backtest/signals/aggregate?${params}`);
+}
+
+/* ── 可执行信号影子对照 ─────────────────────────────────── */
+
+export interface ShadowArm {
+  analyzed_count: number;
+  gate_passed_count: number;
+  gate_pass_rate: number | null;
+  filled_count: number;
+  completed_count: number;
+  win_rate: number | null;
+  avg_net_return: number | null;
+  profit_factor: number | null;
+  worst_max_drawdown: number | null;
+  pending_count: number;
+  pending_entry_count: number;
+  expired_unfilled_count: number;
+  unfillable_count: number;
+  no_fill_data_count: number;
+  first_30_win_rate: number | null;
+  last_30_win_rate: number | null;
+}
+
+export interface ShadowResult {
+  gate_version: string;
+  mode: "off" | "shadow" | "enforced";
+  analyzed_count: number;
+  arms: {
+    baseline: ShadowArm;
+    execution_only: ShadowArm;
+    challenger_v1: ShadowArm;
+  };
+}
+
+export async function getBacktestShadow(tsCode: string | null): Promise<ShadowResult> {
+  const params = new URLSearchParams();
+  if (tsCode) params.set("ts_code", tsCode);
+  return api.get<ShadowResult>(`/backtest/shadow?${params}`);
 }
 
 /* ── P4: 组合级净值 ─────────────────────────────────────── */

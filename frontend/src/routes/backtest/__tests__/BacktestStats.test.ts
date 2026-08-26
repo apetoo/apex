@@ -25,6 +25,17 @@ describe("backtest official statistics", () => {
     });
   });
 
+  it("presents entry-wait and expired signals without a win or loss outcome", () => {
+    expect(getSignalOutcome({ status: "pending_entry", hit: null })).toEqual({
+      label: "等待入场",
+      tone: "flat",
+    });
+    expect(getSignalOutcome({ status: "expired_unfilled", hit: null })).toEqual({
+      label: "入场未触发",
+      tone: "flat",
+    });
+  });
+
   it("does not present zero win rate when every signal is pending", () => {
     const stats = computeStats([
       { status: "pending", net_return: null, hit: null },
