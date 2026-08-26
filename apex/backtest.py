@@ -291,7 +291,8 @@ def _limit_down_locked(prev_close: float, low: float, high: float, close: float,
 
 def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                   include_benchmark: bool,
-                  bench_series: Optional[pd.Series] = None) -> Optional[dict]:
+                  bench_series: Optional[pd.Series] = None,
+                  as_of_date: Optional[str] = None) -> Optional[dict]:
     """单条信号 × 单持有期 → 一行结果。
 
     bars: DataFrame, index=trade_date(datetime, 升序), 需含 open/high/low/close。
@@ -318,14 +319,21 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     limit = _limit_pct(code)
     limit_up_price = prev_close * (1 + limit)
     # 一字板（全天封涨停）或开盘即涨停 → 买不进
-    unfillable = (t1_high == t1_low == t1_close) or \
+    unfillable = (t1_high == t1_low == t1_close and t1_close >= limit_up_price - 1e-4) or \
                  (t1_open >= limit_up_price - 1e-4 and t1_high >= limit_up_price - 1e-4)
 
     fill_price = t1_open
     fill_date = window.index[1].strftime("%Y-%m-%d")
-    # 窗口截断（退市/停牌）→ 退出日是最后一根可得 bar，而非完整持有期
-    truncated = len(window) < holding_period + 2
-    exit_date = window.index[-1].strftime("%Y-%m-%d")
+    short_window = len(window) < holding_period + 2
+    last_bar_date = window.index[-1].strftime("%Y-%m-%d")
+    as_of_date = as_of_date or last_bar_date
+    if bench_series is not None and not bench_series.empty:
+        elapsed_sessions = len(bench_series.loc[entry.get("date", last_bar_date):as_of_date])
+    else:
+        # benchmark 被显式关闭时的离线兜底；正式 API 默认使用缓存中的指数交易日。
+        elapsed_sessions = len(pd.bdate_range(entry.get("date", last_bar_date), as_of_date))
+    matured_without_bars = short_window and elapsed_sessions >= holding_period + 2
+    status = "data_truncated" if matured_without_bars else ("pending" if short_window else "completed")
 
     base = {
         "ts_code": code,
@@ -337,11 +345,14 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
         "strategy": entry.get("strategy") or entry.get("source") or "unknown",
         "fill_price": round(fill_price, 2),
         "fill_date": fill_date,
-        "exit_date": exit_date,
+        "exit_date": None,
         "holding_period": holding_period,
         "has_features": bool(entry.get("features")),
         "unfillable": False,
-        "truncated": truncated,
+        "truncated": status == "data_truncated",
+        "status": status,
+        "invalid_price_advice": False,
+        "exit_price": None,
     }
 
     if unfillable:
@@ -354,6 +365,7 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
             "hit": None,
             "beat_benchmark": None,
             "unfillable": True,
+            "status": "unfillable",
             "exit_reason": "unfillable",
             "mae": None,
             "mfe": None,
@@ -364,64 +376,35 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     open_ = window["open"].astype(float)
     high_ = window["high"].astype(float)
     low_ = window["low"].astype(float)
-    entries_sig = pd.Series(False, index=close.index)
-    exits_sig = pd.Series(False, index=close.index)
-    entries_sig.iloc[1] = True   # T+1 入场
-    exits_sig.iloc[-1] = True
-
     price_advice = entry.get("price_advice") or {}
-    stop_loss = price_advice.get("stop_loss")
-    target = price_advice.get("target")
-    sl_frac = abs(fill_price - stop_loss) / fill_price if stop_loss and fill_price > 0 else np.nan
-    tp_frac = abs(target - fill_price) / fill_price if target and fill_price > 0 else np.nan
-
-    # fill 模型：entry @ T+1 open、exit @ 末根 close；SL/TP 用 high/low intrabar 触发。
-    # vbt 的 price 决定订单成交价——构造 entry bar=open、其余=close 的 series 即可分别定价。
-    fill_price_series = close.copy()
-    fill_price_series.iloc[1] = float(open_.iloc[1])
-
-    total_return = None
-    max_dd = None
-    sharpe = None
+    raw_stop = price_advice.get("stop_loss")
+    raw_target = price_advice.get("target")
     try:
-        pf = vbt.Portfolio.from_signals(
-            close=close, open=open_, high=high_, low=low_,
-            price=fill_price_series,
-            entries=entries_sig,
-            exits=exits_sig,
-            init_cash=10000,
-            sl_stop=sl_frac if not np.isnan(sl_frac) else None,
-            tp_stop=tp_frac if not np.isnan(tp_frac) else None,
-            # 滑点不喂 vbt：统一由 _apply_costs 扣（双边），避免 vbt 内部扣一次 + _apply_costs 再扣一次的双扣。
-            # vbt total_return() 因此是毛收益（无费用），_apply_costs 一次性加 佣金来回+印花税+滑点双边。
-            freq="D",
-        )
-        total_return = float(pf.total_return())
-        max_dd = float(pf.max_drawdown())
-        if len(close) > _SHARPE_MIN_BARS:
-            sharpe = float(pf.sharpe_ratio())
-    except Exception:
-        if fill_price > 0:
-            gross = (float(close.iloc[-1]) - fill_price) / fill_price
-            total_return = gross
+        stop_price = float(raw_stop) if raw_stop is not None else None
+    except (TypeError, ValueError):
+        stop_price = None
+    try:
+        target_price = float(raw_target) if raw_target is not None else None
+    except (TypeError, ValueError):
+        target_price = None
+    invalid_stop = raw_stop is not None and (stop_price is None or not 0 < stop_price < fill_price)
+    invalid_target = raw_target is not None and (target_price is None or target_price <= fill_price)
+    if invalid_stop:
+        stop_price = None
+    if invalid_target:
+        target_price = None
+    invalid_price_advice = invalid_stop or invalid_target
 
-    if total_return is None:
-        return None
-
-    # ── 退出归因 + 跌停封板顺延 + 偏移(MAE/MFE) ──
-    # 首根触及 SL/TP 的 bar，否则持有到末根。截断窗口 → data_truncated。
-    # 跌停封板顺延：SL 触发的 bar 若一字跌停（卖不出），不顺应该 bar 成交，
-    # 继续往后找第一个非封板 bar 的收盘退出；找不到则按末根收盘。重算该笔收益
-    # 覆盖 vbt 的 stop_price 成交价（vbt 不建模跌停锁单）。语义：止损被触过但卖不掉。
-    stop_price = fill_price * (1 - sl_frac) if not np.isnan(sl_frac) else None
-    target_price = fill_price * (1 + tp_frac) if not np.isnan(tp_frac) else None
+    # 单一成交真相源。A 股 T+1：fill bar(index=1)当天不可卖，从 index=2 开始检查。
     exit_pos = len(window) - 1
-    exit_reason = "data_truncated" if truncated else "time_stop"
-    for i in range(1, len(window)):
+    exit_price = None
+    exit_reason = "pending" if status == "pending" else ("data_truncated" if status == "data_truncated" else "time_stop")
+    for i in range(2, len(window)):
+        op = float(open_.iloc[i])
         lo = float(low_.iloc[i])
         hi = float(high_.iloc[i])
         cl = float(close.iloc[i])
-        if stop_price is not None and lo <= stop_price:
+        if stop_price is not None and (op <= stop_price or lo <= stop_price):
             bar_prev_close = float(close.iloc[i - 1])  # i>=1 恒成立
             if _limit_down_locked(bar_prev_close, lo, hi, cl, limit):
                 # 顺延：找 i 之后第一个非一字跌停的 bar 收盘退出
@@ -435,16 +418,26 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                         break
                 exit_pos = deferred if deferred is not None else len(window) - 1
                 exit_reason = "stop_hit_limit_locked"
-                defer_close = float(close.iloc[exit_pos])
-                total_return = (defer_close - fill_price) / fill_price  # 毛收益，下方统一 _apply_costs
+                exit_price = float(close.iloc[exit_pos])
             else:
-                exit_reason = "stop_hit"; exit_pos = i
+                exit_reason = "stop_hit"
+                exit_pos = i
+                exit_price = op if op <= stop_price else stop_price
+            status = "completed"
             break
-        if target_price is not None and hi >= target_price:
-            exit_reason = "target_hit"; exit_pos = i; break
+        if target_price is not None and (op >= target_price or hi >= target_price):
+            exit_reason = "target_hit"
+            exit_pos = i
+            exit_price = op if op >= target_price else target_price
+            status = "completed"
+            break
 
-    # 统一扣成本（佣金来回 + 印花税 + 滑点双边）；vbt 路径与跌停顺延路径口径一致
-    total_return = _apply_costs(total_return)
+    if exit_price is None and status != "pending":
+        exit_price = float(close.iloc[exit_pos])
+
+    total_return = None
+    if exit_price is not None and fill_price > 0:
+        total_return = _apply_costs((exit_price - fill_price) / fill_price)
 
     hold = window.iloc[1:exit_pos + 1]
     if fill_price > 0 and len(hold) > 0:
@@ -453,23 +446,35 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     else:
         mae = mfe = None
 
-    if include_benchmark:
+    exit_date = window.index[exit_pos].strftime("%Y-%m-%d") if status != "pending" else None
+    if include_benchmark and exit_date is not None:
         bench = (_benchmark_from_series(bench_series, fill_date, exit_date)
                  if bench_series is not None
                  else _benchmark_return(fill_date, exit_date))
     else:
         bench = None
-    excess = round(total_return - bench, 4) if bench is not None else None
+    excess = round(total_return - bench, 4) if bench is not None and total_return is not None else None
+
+    max_dd = None
+    sharpe = None
+    if len(hold) > 0 and fill_price > 0:
+        path = hold["close"].astype(float) / fill_price
+        max_dd = float((path / path.cummax() - 1).min())
 
     base.update({
-        "net_return": round(total_return, 4),
+        "net_return": round(total_return, 4) if total_return is not None else None,
         "benchmark_return": round(bench, 4) if bench is not None else None,
         "excess_return": excess,
         "max_drawdown": round(max_dd, 4) if max_dd is not None else None,
         "sharpe": round(sharpe, 2) if sharpe is not None else None,
-        "hit": total_return > 0,
+        "hit": total_return > 0 if total_return is not None else None,
         "beat_benchmark": (excess or 0) > 0 if bench is not None else None,
         "exit_reason": exit_reason,
+        "exit_date": exit_date,
+        "exit_price": round(exit_price, 2) if exit_price is not None else None,
+        "status": status,
+        "truncated": status == "data_truncated",
+        "invalid_price_advice": invalid_price_advice,
         "mae": round(mae, 4) if mae is not None else None,
         "mfe": round(mfe, 4) if mfe is not None else None,
     })
@@ -547,12 +552,12 @@ def _run_entries(long_entries: list, holding_period: int,
                  include_benchmark: bool) -> tuple[list, dict]:
     """对一批多头信号逐条模拟，返回 (所有行含 unfillable/truncated, counts)。
 
-    counts: {unfillable, truncated, no_fill_bar}
+    counts: {completed, pending, data_truncated, unfillable, no_fill_data}
       - unfillable: 涨停封板买不进（net_return=None）
       - truncated:  窗口被截断（退市/停牌）但仍按最后收盘退出（net_return 有值，标 data_truncated）
       - no_fill_bar: 连 T+1 fill bar 都没有（停牌/缺数据），无法成交，不进样本但计数（生存者偏差透明化）
 
-    run() 只取 fillable；aggregate/sweep 各取所需。失败案例不再静默丢弃。
+    run() 返回所有状态供 CLI/UI 展示；aggregate/sweep 只把正式结束样本计入指标。
     """
     # per-code 去重：同 code 多信号共享一次全段拉取，各信号 loc[entry_date:] 切片复用，
     # 消除同 code 重复后补 adj_factor。bench 全段一次拉，替代 per-signal index_daily。
@@ -568,8 +573,17 @@ def _run_entries(long_entries: list, holding_period: int,
             except Exception:
                 bench_series = None
 
+    date_candidates = []
+    if bench_series is not None and not bench_series.empty:
+        date_candidates.append(bench_series.index.max())
+    for loaded in bars_by_code.values():
+        if loaded is not None and not loaded.empty:
+            date_candidates.append(loaded.index.max())
+    as_of_date = max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None
+
     rows = []
-    counts = {"unfillable": 0, "truncated": 0, "no_fill_bar": 0}
+    counts = {"completed": 0, "pending": 0, "data_truncated": 0,
+              "unfillable": 0, "no_fill_data": 0}
     for entry in long_entries:
         entry_date = entry.get("date", "")
         if not entry_date:
@@ -579,17 +593,45 @@ def _run_entries(long_entries: list, holding_period: int,
         if bars.empty or len(bars) < 2:
             # 连 T+1 fill bar 都没有：无法成交（停牌/退市当日即终/缺数据）。
             # 不静默丢弃——计入 no_fill_bar，让 aggregate 透明披露多少信号因数据缺失无法回测。
-            counts["no_fill_bar"] += 1
+            counts["no_fill_data"] += 1
+            rows.append({
+                "ts_code": entry.get("ts_code", ""),
+                "date": entry.get("date", ""),
+                "analyzed_at": (entry.get("analyzed_at", "") or "").replace("T", " ")[:16],
+                "verdict": entry.get("verdict", ""),
+                "confidence": entry.get("confidence"),
+                "calibrated_confidence": entry.get("calibrated_confidence"),
+                "strategy": entry.get("strategy") or entry.get("source") or "unknown",
+                "holding_period": holding_period,
+                "status": "no_fill_data",
+                "exit_reason": "no_fill_data",
+                "fill_price": None,
+                "fill_date": None,
+                "exit_price": None,
+                "exit_date": None,
+                "net_return": None,
+                "benchmark_return": None,
+                "excess_return": None,
+                "max_drawdown": None,
+                "sharpe": None,
+                "hit": None,
+                "beat_benchmark": None,
+                "mae": None,
+                "mfe": None,
+                "unfillable": False,
+                "truncated": False,
+                "invalid_price_advice": False,
+                "has_features": bool(entry.get("features")),
+            })
             continue
         row = _simulate_one(entry, bars, holding_period, include_benchmark,
-                            bench_series=bench_series)
+                            bench_series=bench_series, as_of_date=as_of_date)
         if row is None:
-            counts["no_fill_bar"] += 1
+            counts["no_fill_data"] += 1
             continue
-        if row.get("unfillable"):
-            counts["unfillable"] += 1
-        if row.get("truncated"):
-            counts["truncated"] += 1
+        status = row.get("status") or "completed"
+        if status in counts:
+            counts[status] += 1
         rows.append(row)
     return rows, counts
 
@@ -612,10 +654,8 @@ def run(ts_code: Optional[str] = None,
         include_benchmark: bool = True) -> pd.DataFrame:
     """
     Simulate P&L of bullish journal entries.
-    T+1 开盘入场，持有 lookforward_days 出场。Returns one row per **fillable** entry.
-
-    契约不变：只返回可成交行（net_return 恒为 float），unfillable 不进逐笔表
-    （无法成交，计入 aggregate/sweep 的 unfillable_count）。
+    T+1 开盘入场，持有 lookforward_days 出场。每个信号返回一行，并用 status
+    区分 completed/pending/data_truncated/unfillable/no_fill_data。
     """
     cfg = config.get()
     if lookforward_days is None:
@@ -632,8 +672,7 @@ def run(ts_code: Optional[str] = None,
     _prefetch_signals(codes, long_entries, lookforward_days)
 
     all_rows, _counts = _run_entries(long_entries, lookforward_days, include_benchmark)
-    fillable = [r for r in all_rows if not r.get("unfillable")]
-    return pd.DataFrame(fillable)
+    return pd.DataFrame(all_rows)
 
 
 # ── P2: 持有期扫描 ────────────────────────────────────────────────────────────
@@ -662,7 +701,8 @@ def run_sweep(ts_code: Optional[str] = None,
 
     per_signal = []
     # by_period 聚合
-    agg: dict = {hp: {"n": 0, "fillable_n": 0, "unfillable_count": 0,
+    agg: dict = {hp: {"n": 0, "fillable_n": 0, "completed_count": 0,
+                      "pending_count": 0, "unfillable_count": 0,
                       "truncated_count": 0, "no_fill_bar": 0,
                       "wins": 0, "net_sum": 0.0, "dd_sum": 0.0, "dd_n": 0,
                       "excess_sum": 0.0, "excess_n": 0}
@@ -680,6 +720,11 @@ def run_sweep(ts_code: Optional[str] = None,
                     _add_days(max(dates), max_hp + 20))
             except Exception:
                 bench_series = None
+    date_candidates = [df.index.max() for df in bars_by_code.values()
+                       if df is not None and not df.empty]
+    if bench_series is not None and not bench_series.empty:
+        date_candidates.append(bench_series.index.max())
+    as_of_date = max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None
     for entry in long_entries:
         entry_date = entry.get("date", "")
         if not entry_date:
@@ -693,18 +738,24 @@ def run_sweep(ts_code: Optional[str] = None,
             continue
         for hp in holding_periods:
             row = _simulate_one(entry, bars, hp, include_benchmark,
-                                bench_series=bench_series)
+                                bench_series=bench_series, as_of_date=as_of_date)
             if row is None:
                 agg[hp]["no_fill_bar"] += 1
                 continue
             per_signal.append(row)
             a = agg[hp]
             a["n"] += 1
-            if row.get("unfillable"):
+            status = row.get("status") or "completed"
+            if status == "unfillable":
                 a["unfillable_count"] += 1
                 continue
-            if row.get("truncated"):
+            if status == "pending":
+                a["pending_count"] += 1
+                continue
+            if status == "data_truncated":
                 a["truncated_count"] += 1
+            else:
+                a["completed_count"] += 1
             a["fillable_n"] += 1
             if row.get("hit"):
                 a["wins"] += 1
@@ -724,6 +775,8 @@ def run_sweep(ts_code: Optional[str] = None,
             "holding_period": hp,
             "n": a["n"],
             "fillable_n": fn,
+            "completed_count": a["completed_count"],
+            "pending_count": a["pending_count"],
             "unfillable_count": a["unfillable_count"],
             "truncated_count": a["truncated_count"],
             "no_fill_bar_count": a["no_fill_bar"],
@@ -831,7 +884,7 @@ def aggregate(ts_code: Optional[str] = None,
     _prefetch_signals(codes, long_entries, lookforward_days)
 
     all_rows, counts = _run_entries(long_entries, lookforward_days, include_benchmark)
-    fillable = [r for r in all_rows if not r.get("unfillable")]
+    official = [r for r in all_rows if r.get("status") in ("completed", "data_truncated")]
 
     def _conf_key(r):
         return _conf_bucket(r.get("calibrated_confidence")) or _conf_bucket(r.get("confidence"))
@@ -839,15 +892,18 @@ def aggregate(ts_code: Optional[str] = None,
     return {
         "lookforward_days": lookforward_days,
         "total_signals": len(all_rows),
-        "fillable_count": len(fillable),
+        "fillable_count": len(official),
+        "completed_count": counts["completed"],
+        "pending_count": counts["pending"],
         "unfillable_count": counts["unfillable"],
-        "truncated_count": counts["truncated"],
-        "no_fill_bar_count": counts["no_fill_bar"],
-        "by_confidence_bucket": _slice_bucket(fillable, _conf_key),
-        "by_verdict": _slice_bucket(fillable, lambda r: r.get("verdict")),
-        "by_strategy": _slice_bucket(fillable, lambda r: r.get("strategy") or "unknown"),
-        "by_exit_reason": _slice_bucket(fillable, lambda r: r.get("exit_reason")),
-        "excursion": _excursion(fillable),
+        "truncated_count": counts["data_truncated"],
+        "no_fill_bar_count": counts["no_fill_data"],
+        "no_fill_data_count": counts["no_fill_data"],
+        "by_confidence_bucket": _slice_bucket(official, _conf_key),
+        "by_verdict": _slice_bucket(official, lambda r: r.get("verdict")),
+        "by_strategy": _slice_bucket(official, lambda r: r.get("strategy") or "unknown"),
+        "by_exit_reason": _slice_bucket(official, lambda r: r.get("exit_reason")),
+        "excursion": _excursion(official),
     }
 
 
@@ -926,19 +982,20 @@ def _build_signals(entries: list, price_index: pd.DatetimeIndex,
         fill_idx = future[0]
         fill_pos = price_index.get_loc(fill_idx)
         exit_pos = fill_pos + holding_period
-        if exit_pos >= len(price_index):
-            exit_pos = len(price_index) - 1
+        pending = exit_pos >= len(price_index)
         # 仅空仓入场：若该 code 当前已在持仓，跳过
         if code in open_until and open_until[code] > fill_pos:
             continue
         entries_df.loc[fill_idx, code] = True
-        exit_ts = price_index[exit_pos]
-        exits_df.loc[exit_ts, code] = True
-        open_until[code] = exit_pos + 1
+        exit_ts = None if pending else price_index[exit_pos]
+        if exit_ts is not None:
+            exits_df.loc[exit_ts, code] = True
+        open_until[code] = len(price_index) + 1 if pending else exit_pos + 1
         trades_meta.append({
             "ts_code": code,
             "fill_date": fill_idx.strftime("%Y-%m-%d"),
-            "exit_date": exit_ts.strftime("%Y-%m-%d"),
+            "exit_date": exit_ts.strftime("%Y-%m-%d") if exit_ts is not None else None,
+            "status": "pending" if pending else "completed",
             "verdict": entry.get("verdict"),
             "confidence": entry.get("confidence"),
             "holding_period": holding_period,
@@ -1005,12 +1062,21 @@ def run_portfolio(ts_code: Optional[str] = None,
         for d, v in equity.items() if not np.isnan(v)
     ]
 
+    try:
+        trec = pf.trades.records_readable
+    except Exception:
+        trec = pd.DataFrame()
+    closed_records = trec[trec["Status"] == "Closed"] if "Status" in trec.columns else trec
+    open_positions = int((trec["Status"] == "Open").sum()) if "Status" in trec.columns else 0
+    closed_returns = closed_records["Return"].astype(float) if "Return" in closed_records.columns else pd.Series(dtype=float)
+
     stats = {
         "total_return": round(float(pf.total_return()), 4),
         "max_drawdown": round(float(pf.max_drawdown()), 4),
         "sharpe": round(float(pf.sharpe_ratio()), 4),
-        "n_trades": int(pf.trades.count()),
-        "win_rate": round(float(pf.trades.win_rate()), 4),
+        "n_trades": int(len(closed_records)),
+        "open_positions": open_positions,
+        "win_rate": round(float((closed_returns > 0).mean()), 4) if len(closed_returns) else None,
         "init_cash": 1_000_000,
         "final_equity": round(float(equity.iloc[-1]), 2) if len(equity) else None,
     }
@@ -1018,8 +1084,7 @@ def run_portfolio(ts_code: Optional[str] = None,
     # 每笔成交明细（从 vbt trades 提取实际收益）
     trades = []
     try:
-        trec = pf.trades.records_readable
-        for _, t in trec.iterrows():
+        for _, t in closed_records.iterrows():
             trades.append({
                 "ts_code": str(t.get("Column", "")),
                 "entry_date": str(t.get("Entry Timestamp", ""))[:10],
@@ -1041,20 +1106,34 @@ def print_summary(df: pd.DataFrame) -> None:
         return
 
     col = "net_return" if "net_return" in df.columns else "total_return"
+    if "status" in df.columns:
+        official = df[df["status"].isin(["completed", "data_truncated"])].copy()
+        pending_count = int((df["status"] == "pending").sum())
+        unfillable_count = int(df["status"].isin(["unfillable", "no_fill_data"]).sum())
+    else:
+        official = df.copy()
+        pending_count = unfillable_count = 0
     print(f"\n{'='*50}")
     print(f"  apex 回测报告 — 多头信号 P&L（含成本）")
     print(f"{'='*50}")
     print(f"  总多头信号数   : {len(df)}")
-    print(f"  胜率           : {df['hit'].mean():.1%}")
-    print(f"  平均净收益     : {df[col].mean():.2%}")
-    if "benchmark_return" in df.columns and df["benchmark_return"].notna().any():
-        bench_mean = df["benchmark_return"].mean()
+    print(f"  已完成交易     : {len(official)}")
+    print(f"  进行中         : {pending_count}")
+    print(f"  不可成交/无数据: {unfillable_count}")
+    if official.empty:
+        print("  胜率           : —")
+        print(f"{'='*50}\n")
+        return
+    print(f"  胜率           : {official['hit'].mean():.1%}")
+    print(f"  平均净收益     : {official[col].mean():.2%}")
+    if "benchmark_return" in official.columns and official["benchmark_return"].notna().any():
+        bench_mean = official["benchmark_return"].mean()
         print(f"  基准平均收益   : {bench_mean:.2%}")
-        print(f"  平均超额收益   : {(df[col].mean() - bench_mean):.2%}")
-    best_idx = df[col].idxmax()
-    worst_idx = df[col].idxmin()
-    print(f"  最大单次盈利   : {df.loc[best_idx, col]:.2%}  ({df.loc[best_idx, 'ts_code']} {df.loc[best_idx, 'date']})")
-    print(f"  最大单次亏损   : {df.loc[worst_idx, col]:.2%}  ({df.loc[worst_idx, 'ts_code']} {df.loc[worst_idx, 'date']})")
-    if df["max_drawdown"].notna().any():
-        print(f"  平均最大回撤   : {df['max_drawdown'].mean():.2%}")
+        print(f"  平均超额收益   : {(official[col].mean() - bench_mean):.2%}")
+    best_idx = official[col].idxmax()
+    worst_idx = official[col].idxmin()
+    print(f"  最大单次盈利   : {official.loc[best_idx, col]:.2%}  ({official.loc[best_idx, 'ts_code']} {official.loc[best_idx, 'date']})")
+    print(f"  最大单次亏损   : {official.loc[worst_idx, col]:.2%}  ({official.loc[worst_idx, 'ts_code']} {official.loc[worst_idx, 'date']})")
+    if "max_drawdown" in official.columns and official["max_drawdown"].notna().any():
+        print(f"  平均最大回撤   : {official['max_drawdown'].mean():.2%}")
     print(f"{'='*50}\n")

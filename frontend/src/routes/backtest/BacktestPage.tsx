@@ -37,9 +37,11 @@ import {
   type PortfolioResult,
   type ReviewSeverity,
   type WeightHint,
+  type BacktestSignal,
 } from "@/api/backtest";
 import { ApiError } from "@/api/client";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
+import { computeStats, getSignalOutcome } from "./stats";
 
 /**
  * /backtest 回测页
@@ -88,6 +90,11 @@ export function BacktestPage() {
 
   const data = signals.data ?? [];
   const stats = computeStats(data);
+  const officialData = data.filter(
+    (signal): signal is BacktestSignal & { net_return: number } =>
+      (signal.status === "completed" || signal.status === "data_truncated") &&
+      signal.net_return != null,
+  );
 
   const triggerRun = () => {
     setCommittedCode(tsCode.trim() || null);
@@ -155,35 +162,20 @@ export function BacktestPage() {
         <>
       {/* 统计卡 */}
       {data.length > 0 && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <StatCard label="信号数" value={String(data.length)} />
+          <StatCard label="已完成" value={String(stats.count)} />
+          <StatCard label="进行中" value={String(stats.pendingCount)} tone="flat" />
+          <StatCard label="不可成交" value={String(stats.unfillableCount)} tone="flat" />
           <StatCard
             label="胜率"
-            value={formatRatio(stats.winRate)}
-            tone={stats.winRate >= 0.5 ? "up" : "down"}
+            value={stats.winRate == null ? "—" : formatRatio(stats.winRate)}
+            tone={stats.winRate == null ? "flat" : stats.winRate >= 0.5 ? "up" : "down"}
           />
           <StatCard
             label="平均净收益"
-            value={formatPercent(stats.avgNet)}
-            tone={stats.avgNet >= 0 ? "up" : "down"}
-          />
-          <StatCard
-            label="平均超额"
-            value={
-              stats.avgExcess == null ? "—" : formatPercent(stats.avgExcess)
-            }
-            tone={
-              stats.avgExcess == null
-                ? "flat"
-                : stats.avgExcess >= 0
-                  ? "up"
-                  : "down"
-            }
-          />
-          <StatCard
-            label="平均夏普"
-            value={stats.avgSharpe?.toFixed(2) ?? "—"}
-            tone="flat"
+            value={stats.avgNet == null ? "—" : formatPercent(stats.avgNet)}
+            tone={stats.avgNet == null ? "flat" : stats.avgNet >= 0 ? "up" : "down"}
           />
         </div>
       )}
@@ -206,7 +198,7 @@ export function BacktestPage() {
           <BarChart3 className="h-4 w-4 text-text-secondary" />
           <CardTitle>逐笔收益</CardTitle>
           <CardDescription>
-            {data.length} 笔 · T+1 开盘入场 · 涨停不可成交已剔除
+            {officialData.length} 笔已完成 · T+1 开盘入场 · 进行中未计入统计
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-0">
@@ -216,8 +208,12 @@ export function BacktestPage() {
             <p className="py-8 text-center text-sm text-flat">
               无信号 · 调大 lookforward 或换标的
             </p>
+          ) : officialData.length === 0 ? (
+            <p className="py-8 text-center text-sm text-flat">
+              暂无已完成交易 · 进行中信号未计入收益图
+            </p>
           ) : (
-            <BarChart signals={data} />
+            <BarChart signals={officialData} />
           )}
         </CardContent>
       </Card>
@@ -233,7 +229,9 @@ export function BacktestPage() {
             <p className="py-4 text-center text-sm text-flat">暂无信号</p>
           ) : (
             <div className="divide-y divide-border">
-              {data.map((s, i) => (
+              {data.map((s, i) => {
+                const outcome = getSignalOutcome(s);
+                return (
                 <div
                   key={i}
                   className="flex items-center justify-between gap-3 py-3"
@@ -242,10 +240,15 @@ export function BacktestPage() {
                     <div className="flex items-center gap-2">
                       <p className="truncate font-medium">{s.name ?? s.ts_code}</p>
                       <VerdictTag verdict={s.verdict} />
-                      {s.hit ? (
+                      {outcome.label === "盈利" ? (
                         <CheckCircle2 className="h-3.5 w-3.5 text-up" />
-                      ) : (
+                      ) : outcome.label === "亏损" ? (
                         <XCircle className="h-3.5 w-3.5 text-down" />
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-xs text-flat">
+                          <Clock className="h-3.5 w-3.5" />
+                          {outcome.label}
+                        </span>
                       )}
                     </div>
                     <p className="num mt-0.5 text-xs text-text-secondary">
@@ -254,12 +257,11 @@ export function BacktestPage() {
                   </div>
                   <div className="text-right">
                     <p
-                      className={cn(
-                        "num font-medium",
-                        s.net_return >= 0 ? "text-up" : "text-down",
-                      )}
+                      className={cn("num font-medium", s.net_return == null
+                        ? "text-flat"
+                        : s.net_return >= 0 ? "text-up" : "text-down")}
                     >
-                      {formatPercent(s.net_return)}
+                      {s.net_return == null ? "—" : formatPercent(s.net_return)}
                     </p>
                     {s.excess_return != null && (
                       <p
@@ -273,7 +275,7 @@ export function BacktestPage() {
                     )}
                   </div>
                 </div>
-              ))}
+              );})}
             </div>
           )}
         </CardContent>
@@ -391,19 +393,12 @@ function PortfolioCard({
                 tone="down"
               />
               <StatCard label="夏普" value={(d.stats.sharpe ?? 0).toFixed(2)} />
-              <StatCard label="交易数" value={String(d.stats.n_trades ?? 0)} />
+              <StatCard label="已平仓" value={String(d.stats.n_trades ?? 0)} />
+              <StatCard label="持仓中" value={String(d.stats.open_positions ?? 0)} />
               <StatCard
                 label="胜率"
-                value={formatRatio(d.stats.win_rate ?? 0)}
-                tone={(d.stats.win_rate ?? 0) >= 0.5 ? "up" : "down"}
-              />
-              <StatCard
-                label="终值"
-                value={
-                  d.stats.final_equity != null
-                    ? d.stats.final_equity.toLocaleString()
-                    : "—"
-                }
+                value={d.stats.win_rate == null ? "—" : formatRatio(d.stats.win_rate)}
+                tone={d.stats.win_rate == null ? "flat" : d.stats.win_rate >= 0.5 ? "up" : "down"}
               />
             </div>
             {d.trades.length > 0 && (
@@ -525,6 +520,7 @@ function SweepCard({
                 <tr className="border-b border-border text-left text-xs text-text-secondary">
                   <th className="py-2 pr-3 font-normal">持有天数</th>
                   <th className="py-2 pr-3 font-normal">可成交</th>
+                  <th className="py-2 pr-3 font-normal">进行中</th>
                   <th className="py-2 pr-3 font-normal">不可成交</th>
                   <th className="py-2 pr-3 font-normal">胜率</th>
                   <th className="py-2 pr-3 font-normal">平均净收益</th>
@@ -545,6 +541,9 @@ function SweepCard({
                         {isBest && <span className="ml-1 text-up">★</span>}
                       </td>
                       <td className="py-2 pr-3 text-text-secondary">{r.fillable_n}</td>
+                      <td className="py-2 pr-3 text-text-secondary">
+                        {r.pending_count || "—"}
+                      </td>
                       <td className="py-2 pr-3 text-text-secondary">
                         {r.unfillable_count || "—"}
                       </td>
@@ -624,7 +623,10 @@ function AggregateCard({
         ) : (
           <div className="space-y-4">
             <p className="text-xs text-text-secondary">
-              共 {d.total_signals} 条信号 · 可成交 {d.fillable_count}
+              共 {d.total_signals} 条信号 · 正式样本 {d.fillable_count}
+              {d.pending_count > 0 && (
+                <span> · 进行中 {d.pending_count}（未计入胜率）</span>
+              )}
               {d.unfillable_count > 0 && (
                 <span className="text-down">
                   {" "}· 涨停不可成交 {d.unfillable_count}（已剔出胜率分母）
@@ -903,38 +905,6 @@ function ReviewCard({
 }
 
 /* ── 统计计算 ──────────────────────────────────────────────── */
-
-interface Stats {
-  count: number;
-  winRate: number;
-  avgNet: number;
-  avgExcess: number | null;
-  avgSharpe: number | null;
-}
-
-function computeStats(
-  data: Array<{ net_return: number; excess_return?: number | null; sharpe?: number | null; hit: boolean }>,
-): Stats {
-  if (data.length === 0) {
-    return { count: 0, winRate: 0, avgNet: 0, avgExcess: null, avgSharpe: null };
-  }
-  const hits = data.filter((d) => d.hit).length;
-  const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
-  const nets = data.map((d) => d.net_return);
-  const excesses = data
-    .map((d) => d.excess_return)
-    .filter((x): x is number => x != null);
-  const sharpes = data
-    .map((d) => d.sharpe)
-    .filter((x): x is number => x != null);
-  return {
-    count: data.length,
-    winRate: hits / data.length,
-    avgNet: avg(nets),
-    avgExcess: excesses.length > 0 ? avg(excesses) : null,
-    avgSharpe: sharpes.length > 0 ? avg(sharpes) : null,
-  };
-}
 
 /* ── 柱状图(纯 SVG, ED11 决策轻量) ─────────────────────────── */
 

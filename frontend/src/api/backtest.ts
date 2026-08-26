@@ -22,12 +22,16 @@ export interface BacktestSignal {
   confidence?: number;
   strategy?: string;
   fill_price?: number;
-  net_return: number;
+  status: "completed" | "pending" | "data_truncated" | "unfillable" | "no_fill_data";
+  net_return: number | null;
   benchmark_return?: number | null;
   excess_return?: number | null;
   max_drawdown?: number | null;
   sharpe?: number | null;
-  hit: boolean;
+  hit: boolean | null;
+  exit_date?: string | null;
+  exit_price?: number | null;
+  invalid_price_advice?: boolean;
   beat_benchmark?: boolean | null;
 }
 
@@ -91,6 +95,8 @@ export interface SweepByPeriod {
   holding_period: number;
   n: number;
   fillable_n: number;
+  completed_count: number;
+  pending_count: number;
   unfillable_count: number;
   win_rate: number | null;
   avg_net_return: number | null;
@@ -128,7 +134,11 @@ export interface AggregateResult {
   lookforward_days: number;
   total_signals: number;
   fillable_count: number;
+  completed_count: number;
+  pending_count: number;
   unfillable_count: number;
+  truncated_count: number;
+  no_fill_data_count: number;
   by_confidence_bucket: AggregateBucket[];
   by_verdict: AggregateBucket[];
   by_strategy: AggregateBucket[];
@@ -163,7 +173,8 @@ export interface PortfolioStats {
   max_drawdown: number;
   sharpe: number;
   n_trades: number;
-  win_rate: number;
+  win_rate: number | null;
+  open_positions: number;
   init_cash: number;
   final_equity: number | null;
 }
