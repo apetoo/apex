@@ -60,6 +60,15 @@ def backtest_aggregate(
     return bt.aggregate(ts_code=code, lookforward_days=lookforward_days)
 
 
+@router.get("/shadow")
+def backtest_shadow(
+    ts_code: Optional[str] = Query(None, description="留空=全部"),
+):
+    """同一批新契约信号的旧执行、条件入场与 V1 质量门影子对照。"""
+    code = data_mod.normalize_ts_code(ts_code) if ts_code else None
+    return bt.run_shadow(ts_code=code)
+
+
 @router.get("/portfolio")
 def backtest_portfolio(
     ts_code: Optional[str] = Query(None, description="留空=全部"),

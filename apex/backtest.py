@@ -289,10 +289,72 @@ def _limit_down_locked(prev_close: float, low: float, high: float, close: float,
     return (low == high == close) and (close <= limit_down_price + 1e-4)
 
 
+def _find_conditional_fill(entry: dict, bars: pd.DataFrame,
+                           as_of_date: Optional[str] = None) -> dict:
+    """Find the first fill inside a declared entry window without chasing gaps."""
+    decision = entry.get("trade_decision") or {}
+    plan = decision.get("entry_plan") or {}
+    advice = entry.get("price_advice") or {}
+    style = plan.get("style") or advice.get("entry_style")
+    try:
+        low = float(plan.get("low", advice.get("entry_low")))
+        high = float(plan.get("high", advice.get("entry_high")))
+        valid_days = int(plan.get("valid_for_days", advice.get("valid_for_days", 3)))
+    except (TypeError, ValueError):
+        return {"status": "expired_unfilled", "fill_pos": None, "fill_price": None}
+    if style not in {"pullback", "breakout"} or not 0 < low <= high or valid_days < 1:
+        return {"status": "expired_unfilled", "fill_pos": None, "fill_price": None}
+
+    available = max(0, len(bars) - 1)
+    for pos in range(1, min(len(bars), valid_days + 1)):
+        op = float(bars["open"].iloc[pos])
+        hi = float(bars["high"].iloc[pos])
+        lo = float(bars["low"].iloc[pos])
+        if low <= op <= high:
+            return {"status": "filled", "fill_pos": pos, "fill_price": op}
+        if style == "pullback" and op > high and lo <= high:
+            return {"status": "filled", "fill_pos": pos, "fill_price": high}
+        if style == "breakout" and op < low and hi >= low:
+            return {"status": "filled", "fill_pos": pos, "fill_price": low}
+
+    status = "expired_unfilled" if available >= valid_days else "pending_entry"
+    return {"status": status, "fill_pos": None, "fill_price": None}
+
+
+def _entry_wait_row(entry: dict, status: str, holding_period: Optional[int]) -> dict:
+    row = _no_fill_row(entry, holding_period or 0)
+    row.update({"status": status, "exit_reason": status})
+    return row
+
+
+def _simulate_conditional_one(entry: dict, bars: pd.DataFrame,
+                              include_benchmark: bool = True,
+                              bench_series: Optional[pd.Series] = None,
+                              as_of_date: Optional[str] = None) -> dict:
+    """Wait for the AI entry band, then delegate exits to the single fill engine."""
+    decision = entry.get("trade_decision") or {}
+    holding_period = decision.get("holding_period_days")
+    if holding_period is None:
+        from apex.trade_signal import holding_period_for_setup
+        holding_period = holding_period_for_setup(entry.get("setup_tag"))
+    if holding_period is None:
+        return _entry_wait_row(entry, "expired_unfilled", None)
+    fill = _find_conditional_fill(entry, bars, as_of_date)
+    if fill["status"] != "filled":
+        return _entry_wait_row(entry, fill["status"], int(holding_period))
+    fill_pos = int(fill["fill_pos"])
+    return _simulate_one(
+        entry, bars.iloc[fill_pos - 1:], int(holding_period), include_benchmark,
+        bench_series=bench_series, as_of_date=as_of_date,
+        fill_price_override=float(fill["fill_price"]),
+    )
+
+
 def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                   include_benchmark: bool,
                   bench_series: Optional[pd.Series] = None,
-                  as_of_date: Optional[str] = None) -> Optional[dict]:
+                  as_of_date: Optional[str] = None,
+                  fill_price_override: Optional[float] = None) -> Optional[dict]:
     """单条信号 × 单持有期 → 一行结果。
 
     bars: DataFrame, index=trade_date(datetime, 升序), 需含 open/high/low/close。
@@ -322,7 +384,7 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
     unfillable = (t1_high == t1_low == t1_close and t1_close >= limit_up_price - 1e-4) or \
                  (t1_open >= limit_up_price - 1e-4 and t1_high >= limit_up_price - 1e-4)
 
-    fill_price = t1_open
+    fill_price = float(fill_price_override) if fill_price_override is not None else t1_open
     fill_date = window.index[1].strftime("%Y-%m-%d")
     short_window = len(window) < holding_period + 2
     last_bar_date = window.index[-1].strftime("%Y-%m-%d")
@@ -921,6 +983,121 @@ def aggregate(ts_code: Optional[str] = None,
         "by_strategy": _slice_bucket(official, lambda r: r.get("strategy") or "unknown"),
         "by_exit_reason": _slice_bucket(official, lambda r: r.get("exit_reason")),
         "excursion": _excursion(official),
+    }
+
+
+# ── 可执行信号影子对照 ───────────────────────────────────────────────────────
+
+def _run_conditional_entries(entries: list, include_benchmark: bool) -> list[dict]:
+    if not entries:
+        return []
+    max_window = max(
+        int(((entry.get("trade_decision") or {}).get("holding_period_days") or 10))
+        + int((((entry.get("trade_decision") or {}).get("entry_plan") or {}).get("valid_for_days") or 3))
+        for entry in entries
+    )
+    bars_by_code = _load_bars_by_code(entries, max_window)
+    bench_series = None
+    if include_benchmark:
+        dates = [entry.get("date") for entry in entries if entry.get("date")]
+        if dates:
+            try:
+                bench_series = market_cache.load_index_daily(
+                    _BENCHMARK_CODE, min(dates), _add_days(max(dates), max_window + 20),
+                )
+            except Exception:
+                bench_series = None
+    date_candidates = [
+        frame.index.max() for frame in bars_by_code.values()
+        if frame is not None and not frame.empty
+    ]
+    if bench_series is not None and not bench_series.empty:
+        date_candidates.append(bench_series.index.max())
+    as_of_date = max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None
+
+    rows: list[dict] = []
+    for entry in entries:
+        frame = bars_by_code.get(entry.get("ts_code"))
+        date = entry.get("date", "")
+        bars = frame.loc[date:] if frame is not None and not frame.empty and date else pd.DataFrame()
+        if bars.empty or len(bars) < 2:
+            rows.append(_no_fill_row(entry, int((entry.get("trade_decision") or {}).get("holding_period_days") or 0)))
+            continue
+        rows.append(_simulate_conditional_one(
+            entry, bars, include_benchmark=include_benchmark,
+            bench_series=bench_series, as_of_date=as_of_date,
+        ))
+    return rows
+
+
+def _shadow_arm_stats(rows: list[dict], analyzed_count: int,
+                      gate_passed_count: int) -> dict:
+    official = [row for row in rows if row.get("status") in {"completed", "data_truncated"}]
+    filled = [row for row in rows if row.get("fill_price") is not None]
+    returns = [float(row["net_return"]) for row in official if row.get("net_return") is not None]
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value <= 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    completed_hits = [bool(row.get("hit")) for row in official if row.get("hit") is not None]
+    drawdowns = [float(row["max_drawdown"]) for row in official if row.get("max_drawdown") is not None]
+    first_30 = completed_hits[:30]
+    last_30 = completed_hits[30:60]
+    status_counts = pd.Series([row.get("status") for row in rows], dtype="object").value_counts().to_dict()
+    return {
+        "analyzed_count": analyzed_count,
+        "gate_passed_count": gate_passed_count,
+        "gate_pass_rate": round(gate_passed_count / analyzed_count, 4) if analyzed_count else None,
+        "filled_count": len(filled),
+        "completed_count": len(completed_hits),
+        "win_rate": round(sum(completed_hits) / len(completed_hits), 4) if completed_hits else None,
+        "avg_net_return": round(sum(returns) / len(returns), 4) if returns else None,
+        "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
+        "worst_max_drawdown": round(min(drawdowns), 4) if drawdowns else None,
+        "pending_count": int(status_counts.get("pending", 0)),
+        "pending_entry_count": int(status_counts.get("pending_entry", 0)),
+        "expired_unfilled_count": int(status_counts.get("expired_unfilled", 0)),
+        "unfillable_count": int(status_counts.get("unfillable", 0)),
+        "no_fill_data_count": int(status_counts.get("no_fill_data", 0)),
+        "first_30_win_rate": round(sum(first_30) / 30, 4) if len(first_30) == 30 else None,
+        "last_30_win_rate": round(sum(last_30) / 30, 4) if len(last_30) == 30 else None,
+    }
+
+
+def run_shadow(ts_code: Optional[str] = None,
+               include_benchmark: bool = True) -> dict:
+    """Compare frozen baseline, entry-semantics-only and V1 gate on new-schema rows."""
+    entries = journal.load_verdicts(ts_code=ts_code)
+    versioned = _dedupe_signals([
+        entry for entry in entries if entry.get("decision_schema_version") == "1.0"
+    ])
+    baseline_entries = [entry for entry in versioned if _is_bullish(entry.get("verdict", ""))]
+    proposed_entries = [
+        entry for entry in versioned
+        if (entry.get("proposed_trade_action")
+            or (entry.get("trade_decision") or {}).get("proposed_action")) == "buy"
+    ]
+    challenger_entries = [
+        entry for entry in proposed_entries
+        if bool((entry.get("trade_decision") or {}).get("eligible"))
+    ]
+    _prefetch_signals(
+        sorted({entry.get("ts_code") for entry in versioned if entry.get("ts_code")}),
+        versioned, 13,
+    )
+    baseline_rows, _ = _run_entries(baseline_entries, 10, include_benchmark)
+    execution_rows = _run_conditional_entries(proposed_entries, include_benchmark)
+    challenger_rows = _run_conditional_entries(challenger_entries, include_benchmark)
+    analyzed_count = len(versioned)
+    return {
+        "gate_version": "v1",
+        "mode": (((config.get().get("backtest") or {}).get("trade_signal_gate") or {}).get("mode") or "shadow"),
+        "analyzed_count": analyzed_count,
+        "arms": {
+            "baseline": _shadow_arm_stats(baseline_rows, analyzed_count, len(baseline_entries)),
+            "execution_only": _shadow_arm_stats(execution_rows, analyzed_count, len(proposed_entries)),
+            "challenger_v1": _shadow_arm_stats(challenger_rows, analyzed_count, len(challenger_entries)),
+        },
     }
 
 

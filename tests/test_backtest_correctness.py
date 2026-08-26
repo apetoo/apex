@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from apex import backtest as bt
+from backend.routers import backtest as backtest_router
 
 
 def _bars(rows: list[tuple[float, float, float, float]], start: str = "2026-08-03") -> pd.DataFrame:
@@ -24,6 +25,161 @@ def _entry(*, stop_loss=None, target=None) -> dict:
         "confidence": 5,
         "price_advice": {"stop_loss": stop_loss, "target": target},
     }
+
+
+def _conditional_entry(*, style="pullback", valid_for_days=3, holding_period=1) -> dict:
+    return {
+        **_entry(stop_loss=9, target=12),
+        "setup_tag": "首板" if holding_period == 1 else "趋势突破",
+        "price_advice": {
+            "entry": 10,
+            "entry_low": 9.8,
+            "entry_high": 10.2,
+            "stop_loss": 9,
+            "target": 12,
+            "entry_style": style,
+            "valid_for_days": valid_for_days,
+            "position_size_pct": 10,
+        },
+        "trade_decision": {
+            "eligible": True,
+            "action": "buy",
+            "holding_period_days": holding_period,
+            "entry_plan": {
+                "style": style, "low": 9.8, "high": 10.2, "anchor": 10,
+                "valid_for_days": valid_for_days, "stop_loss": 9, "target": 12,
+            },
+        },
+    }
+
+
+def test_conditional_entry_fills_at_open_inside_band():
+    bars = _bars([(10.5, 10.6, 10.4, 10.5), (10.1, 10.4, 9.9, 10.2)])
+    result = bt._find_conditional_fill(_conditional_entry(), bars, "2026-08-04")
+    assert result == {"status": "filled", "fill_pos": 1, "fill_price": 10.1}
+
+
+def test_pullback_entry_fills_at_upper_boundary_when_price_falls_into_band():
+    bars = _bars([(10.5, 10.6, 10.4, 10.5), (10.5, 10.6, 10.0, 10.1)])
+    result = bt._find_conditional_fill(_conditional_entry(style="pullback"), bars, "2026-08-04")
+    assert result["fill_price"] == 10.2
+
+
+def test_breakout_entry_fills_at_lower_boundary_when_price_rises_into_band():
+    bars = _bars([(9.5, 9.6, 9.4, 9.5), (9.5, 10.0, 9.4, 9.9)])
+    result = bt._find_conditional_fill(_conditional_entry(style="breakout"), bars, "2026-08-04")
+    assert result["fill_price"] == 9.8
+
+
+@pytest.mark.parametrize(
+    ("style", "row"),
+    [
+        ("pullback", (9.5, 9.7, 9.2, 9.4)),
+        ("breakout", (10.5, 10.8, 10.4, 10.7)),
+    ],
+)
+def test_conditional_entry_does_not_chase_gap_through_band(style, row):
+    bars = _bars([(10, 10, 10, 10), row])
+    result = bt._find_conditional_fill(_conditional_entry(style=style), bars, "2026-08-04")
+    assert result["status"] == "pending_entry"
+
+
+def test_conditional_entry_expires_after_valid_sessions():
+    bars = _bars([(11, 11, 11, 11), (11, 11, 10.8, 10.9), (10.8, 10.9, 10.5, 10.7), (10.7, 10.8, 10.4, 10.5)])
+    result = bt._find_conditional_fill(_conditional_entry(valid_for_days=3), bars, "2026-08-06")
+    assert result["status"] == "expired_unfilled"
+
+
+def test_conditional_fill_day_cannot_exit_until_following_session():
+    bars = _bars([
+        (10.5, 10.6, 10.4, 10.5),
+        (10.1, 12.5, 8.5, 10.2),
+        (10.4, 10.8, 10.1, 10.6),
+    ])
+    row = bt._simulate_conditional_one(
+        _conditional_entry(), bars, include_benchmark=False, as_of_date="2026-08-31",
+    )
+    assert row["fill_price"] == 10.1
+    assert row["exit_reason"] == "time_stop"
+    assert row["exit_date"] == "2026-08-05"
+
+
+def test_shadow_arm_stats_only_counts_filled_closed_trades():
+    rows = [
+        {"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.02},
+        {"status": "completed", "fill_price": 10, "hit": False, "net_return": -0.05, "max_drawdown": -0.08},
+        {"status": "pending", "fill_price": 10, "hit": None, "net_return": None, "max_drawdown": None},
+        {"status": "pending_entry", "fill_price": None, "hit": None, "net_return": None, "max_drawdown": None},
+        {"status": "expired_unfilled", "fill_price": None, "hit": None, "net_return": None, "max_drawdown": None},
+    ]
+
+    stats = bt._shadow_arm_stats(rows, analyzed_count=10, gate_passed_count=5)
+
+    assert stats["gate_pass_rate"] == 0.5
+    assert stats["filled_count"] == 3
+    assert stats["completed_count"] == 2
+    assert stats["win_rate"] == 0.5
+    assert stats["avg_net_return"] == 0.025
+    assert stats["profit_factor"] == 2.0
+    assert stats["pending_entry_count"] == 1
+    assert stats["expired_unfilled_count"] == 1
+    assert stats["worst_max_drawdown"] == -0.08
+
+
+def test_run_shadow_separates_baseline_proposals_and_gate_passes(monkeypatch):
+    base = _conditional_entry()
+    versioned = {
+        **base,
+        "decision_schema_version": "1.0",
+        "proposed_trade_action": "buy",
+        "trade_decision": {**base["trade_decision"], "eligible": True},
+    }
+    rejected = {
+        **versioned,
+        "ts_code": "600002.SH",
+        "trade_decision": {**versioned["trade_decision"], "eligible": False, "action": "watch"},
+    }
+    observed = {
+        **versioned,
+        "ts_code": "600003.SH",
+        "proposed_trade_action": "watch",
+        "trade_decision": {**versioned["trade_decision"], "proposed_action": "watch", "eligible": False},
+    }
+    monkeypatch.setattr(bt.journal, "load_verdicts", lambda **kwargs: [versioned, rejected, observed])
+    monkeypatch.setattr(bt, "_prefetch_signals", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bt, "_run_entries", lambda entries, *args, **kwargs: (
+        [{"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.01} for _ in entries],
+        {},
+    ))
+    seen = []
+
+    def conditional(entries, include_benchmark):
+        seen.append([entry["ts_code"] for entry in entries])
+        return [{"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.01} for _ in entries]
+
+    monkeypatch.setattr(bt, "_run_conditional_entries", conditional)
+
+    result = bt.run_shadow(include_benchmark=False)
+
+    assert result["analyzed_count"] == 3
+    assert result["arms"]["baseline"]["completed_count"] == 3
+    assert seen == [["600001.SH", "600002.SH"], ["600001.SH"]]
+    assert result["arms"]["challenger_v1"]["gate_passed_count"] == 1
+
+
+def test_shadow_api_normalizes_code_and_returns_service_result(monkeypatch):
+    seen = {}
+
+    def run_shadow(ts_code=None):
+        seen["ts_code"] = ts_code
+        return {"gate_version": "v1", "arms": {}}
+
+    monkeypatch.setattr(backtest_router.bt, "run_shadow", run_shadow)
+
+    result = backtest_router.backtest_shadow(ts_code="600001")
+
+    assert seen["ts_code"] == "600001.SH"
+    assert result["gate_version"] == "v1"
 
 
 @pytest.fixture(autouse=True)
