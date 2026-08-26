@@ -257,6 +257,42 @@ def test_run_entries_keeps_no_fill_signal_visible(monkeypatch):
     assert counts["no_fill_data"] == 1
 
 
+def test_run_dedupes_same_stock_same_day_before_simulation(monkeypatch):
+    older = {
+        **_entry(),
+        "analyzed_at": "2026-08-01T10:00:00+08:00",
+        "confidence": 2,
+    }
+    newer = {
+        **_entry(),
+        "analyzed_at": "2026-08-01T14:00:00+08:00",
+        "confidence": 7,
+    }
+    simulated = []
+
+    monkeypatch.setattr(bt.journal, "load_verdicts", lambda **kwargs: [older, newer])
+    monkeypatch.setattr(bt, "_prefetch_signals", lambda *args, **kwargs: None)
+
+    def capture(entries, holding_period, include_benchmark):
+        simulated.extend(entries)
+        return entries, {
+            "completed": 0,
+            "pending": 0,
+            "data_truncated": 0,
+            "unfillable": 0,
+            "no_fill_data": 0,
+        }
+
+    monkeypatch.setattr(bt, "_run_entries", capture)
+
+    result = bt.run(lookforward_days=10, include_benchmark=False)
+
+    assert len(result) == 1
+    assert len(simulated) == 1
+    assert simulated[0]["analyzed_at"] == newer["analyzed_at"]
+    assert simulated[0]["confidence"] == 7
+
+
 def test_sweep_excludes_pending_from_period_metrics(monkeypatch):
     entries = [_entry(), {**_entry(), "ts_code": "600002.SH"}]
     sample_bars = _bars([(10, 10, 10, 10), (10, 10, 10, 10)])

@@ -678,6 +678,7 @@ def run(ts_code: Optional[str] = None,
 
     entries = journal.load_verdicts(ts_code=ts_code)
     long_entries = [e for e in entries if _is_bullish(e.get("verdict", ""))]
+    long_entries = _dedupe_signals(long_entries)
 
     if len(long_entries) < min_entries:
         print(f"⚠ 多头信号只有 {len(long_entries)} 条，少于最小要求 {min_entries}，仍继续但结果仅供参考。")
