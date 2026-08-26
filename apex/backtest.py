@@ -420,12 +420,10 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                         break
                 exit_reason = "stop_hit_limit_locked"
                 if deferred is None:
-                    if status == "pending":
-                        exit_price = None
-                    else:
-                        status = "data_truncated"
-                        exit_pos = len(window) - 1
-                        exit_price = float(close.iloc[exit_pos])
+                    # 没有真实可卖 bar 时持仓仍未关闭；无论名义窗口是否成熟，
+                    # 都不能用封死跌停价虚构成交并纳入正式胜率。
+                    status = "pending"
+                    exit_price = None
                 else:
                     exit_pos = deferred
                     exit_price = float(bars["close"].iloc[exit_pos])

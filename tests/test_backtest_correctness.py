@@ -165,6 +165,24 @@ def test_unresolved_limit_down_lock_remains_pending_without_fake_fill():
     assert row["net_return"] is None
 
 
+def test_mature_window_still_cannot_fake_exit_on_locked_limit_down():
+    bars = _bars([
+        (10, 10, 10, 10),
+        (10, 10.2, 9.8, 10),
+        (9, 9, 9, 9),
+    ])
+
+    row = bt._simulate_one(
+        _entry(stop_loss=9.5, target=12), bars, holding_period=1,
+        include_benchmark=False, as_of_date="2026-08-31",
+    )
+
+    assert row["status"] == "pending"
+    assert row["exit_reason"] == "stop_hit_limit_locked"
+    assert row["exit_price"] is None
+    assert row["net_return"] is None
+
+
 def test_target_hit_return_direction_is_consistent():
     bars = _bars([
         (10, 10, 10, 10),
