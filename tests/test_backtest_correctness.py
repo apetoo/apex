@@ -126,6 +126,25 @@ def test_shadow_arm_stats_only_counts_filled_closed_trades():
     assert stats["worst_max_drawdown"] == -0.08
 
 
+def test_shadow_stats_use_latest_thirty_and_report_regime_and_equity_drawdown():
+    rows = []
+    for index in range(70):
+        rows.append({
+            "status": "completed", "fill_price": 10,
+            "hit": index >= 40, "net_return": 0.1 if index >= 40 else -0.05,
+            "max_drawdown": -0.02,
+            "exit_date": f"2026-09-{index + 1:02d}",
+            "regime": "亢奋" if index < 35 else "中性",
+        })
+
+    stats = bt._shadow_arm_stats(rows, analyzed_count=100, gate_passed_count=70)
+
+    assert stats["last_30_win_rate"] == 1.0
+    assert stats["by_regime"]["risk_on"]["completed_count"] == 35
+    assert stats["by_regime"]["neutral"]["completed_count"] == 35
+    assert stats["max_drawdown"] < 0
+
+
 def test_run_shadow_separates_baseline_proposals_and_gate_passes(monkeypatch):
     base = _conditional_entry()
     versioned = {
@@ -147,14 +166,22 @@ def test_run_shadow_separates_baseline_proposals_and_gate_passes(monkeypatch):
     }
     monkeypatch.setattr(bt.journal, "load_verdicts", lambda **kwargs: [versioned, rejected, observed])
     monkeypatch.setattr(bt, "_prefetch_signals", lambda *args, **kwargs: None)
-    monkeypatch.setattr(bt, "_run_entries", lambda entries, *args, **kwargs: (
-        [{"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.01} for _ in entries],
-        {},
-    ))
+    snapshot = {"600001.SH": _bars([(10, 10, 10, 10), (10, 10, 10, 10)])}
+    monkeypatch.setattr(bt, "_shadow_snapshot", lambda entries: (snapshot, "2026-08-31"))
+    baseline_snapshot = []
+
+    def baseline(entries, *args, **kwargs):
+        baseline_snapshot.append((kwargs.get("bars_by_code_override"), kwargs.get("as_of_date_override")))
+        return ([{"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.01} for _ in entries], {})
+
+    monkeypatch.setattr(bt, "_run_entries", baseline)
     seen = []
 
-    def conditional(entries, include_benchmark):
+    conditional_snapshot = []
+
+    def conditional(entries, include_benchmark, **kwargs):
         seen.append([entry["ts_code"] for entry in entries])
+        conditional_snapshot.append((kwargs.get("bars_by_code_override"), kwargs.get("as_of_date_override")))
         return [{"status": "completed", "fill_price": 10, "hit": True, "net_return": 0.1, "max_drawdown": -0.01} for _ in entries]
 
     monkeypatch.setattr(bt, "_run_conditional_entries", conditional)
@@ -165,6 +192,8 @@ def test_run_shadow_separates_baseline_proposals_and_gate_passes(monkeypatch):
     assert result["arms"]["baseline"]["completed_count"] == 3
     assert seen == [["600001.SH", "600002.SH"], ["600001.SH"]]
     assert result["arms"]["challenger_v1"]["gate_passed_count"] == 1
+    assert baseline_snapshot == [(snapshot, "2026-08-31")]
+    assert conditional_snapshot == [(snapshot, "2026-08-31"), (snapshot, "2026-08-31")]
 
 
 def test_shadow_api_normalizes_code_and_returns_service_result(monkeypatch):

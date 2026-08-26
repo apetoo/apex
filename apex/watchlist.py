@@ -1452,7 +1452,10 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
                   strategy: Optional[str] = None,
                   setup: Optional[str] = None,
                   trigger_low: Optional[float] = None,
-                  trigger_high: Optional[float] = None) -> dict:
+                  trigger_high: Optional[float] = None,
+                  entry_style: Optional[str] = None,
+                  gate_version: Optional[str] = None,
+                  valid_for_days: Optional[int] = None) -> dict:
     from datetime import timedelta
     data = _load()
     if expires_days is None:
@@ -1482,6 +1485,12 @@ def add_candidate(ts_code: str, name: str, trigger_price: float,
         entry["trigger_low"] = float(trigger_low)
     if trigger_high is not None:
         entry["trigger_high"] = float(trigger_high)
+    if entry_style:
+        entry["entry_style"] = str(entry_style)
+    if gate_version:
+        entry["gate_version"] = str(gate_version)
+    if valid_for_days is not None:
+        entry["valid_for_days"] = int(valid_for_days)
     # upsert: 同 ts_code 已有候选则原地替换（保留 renew_count 不丢手动续期历史），
     # 否则 append。避免 candidates 出现重复 ts_code -> 前端 key 冲突 + 触发歧义。
     renew_count = None

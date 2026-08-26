@@ -350,6 +350,18 @@ def _simulate_conditional_one(entry: dict, bars: pd.DataFrame,
     )
 
 
+def _entry_regime(entry: dict) -> str:
+    """Return the signal-time market regime without consulting future data."""
+    candidate = entry.get("candidate_context") or {}
+    regime = candidate.get("regime")
+    if isinstance(regime, dict):
+        regime = regime.get("label") or regime.get("regime")
+    if not regime:
+        sentiment = ((entry.get("market_context") or {}).get("market_sentiment") or {})
+        regime = sentiment.get("regime") or sentiment.get("label")
+    return str(regime or "unknown")
+
+
 def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
                   include_benchmark: bool,
                   bench_series: Optional[pd.Series] = None,
@@ -402,6 +414,10 @@ def _simulate_one(entry: dict, bars: pd.DataFrame, holding_period: int,
         "date": entry.get("date", ""),
         "analyzed_at": (entry.get("analyzed_at", "") or "").replace("T", " ")[:16],
         "verdict": entry["verdict"],
+        "opinion_verdict": entry.get("opinion_verdict"),
+        "trade_action": (entry.get("trade_decision") or {}).get("action"),
+        "gate_reasons": list((entry.get("trade_decision") or {}).get("reasons") or []),
+        "regime": _entry_regime(entry),
         "confidence": entry.get("confidence"),
         "calibrated_confidence": entry.get("calibrated_confidence"),
         "strategy": entry.get("strategy") or entry.get("source") or "unknown",
@@ -626,6 +642,10 @@ def _no_fill_row(entry: dict, holding_period: int) -> dict:
         "date": entry.get("date", ""),
         "analyzed_at": (entry.get("analyzed_at", "") or "").replace("T", " ")[:16],
         "verdict": entry.get("verdict", ""),
+        "opinion_verdict": entry.get("opinion_verdict"),
+        "trade_action": (entry.get("trade_decision") or {}).get("action"),
+        "gate_reasons": list((entry.get("trade_decision") or {}).get("reasons") or []),
+        "regime": _entry_regime(entry),
         "confidence": entry.get("confidence"),
         "calibrated_confidence": entry.get("calibrated_confidence"),
         "strategy": entry.get("strategy") or entry.get("source") or "unknown",
@@ -653,7 +673,9 @@ def _no_fill_row(entry: dict, holding_period: int) -> dict:
 
 
 def _run_entries(long_entries: list, holding_period: int,
-                 include_benchmark: bool) -> tuple[list, dict]:
+                 include_benchmark: bool,
+                 bars_by_code_override: Optional[dict] = None,
+                 as_of_date_override: Optional[str] = None) -> tuple[list, dict]:
     """对一批多头信号逐条模拟，返回 (所有行含 unfillable/truncated, counts)。
 
     counts: {completed, pending, data_truncated, unfillable, no_fill_data}
@@ -665,7 +687,8 @@ def _run_entries(long_entries: list, holding_period: int,
     """
     # per-code 去重：同 code 多信号共享一次全段拉取，各信号 loc[entry_date:] 切片复用，
     # 消除同 code 重复后补 adj_factor。bench 全段一次拉，替代 per-signal index_daily。
-    bars_by_code = _load_bars_by_code(long_entries, holding_period)
+    bars_by_code = (bars_by_code_override if bars_by_code_override is not None
+                    else _load_bars_by_code(long_entries, holding_period))
     bench_series = None
     if include_benchmark:
         dates = [e.get("date", "") for e in long_entries if e.get("date")]
@@ -683,7 +706,8 @@ def _run_entries(long_entries: list, holding_period: int,
     for loaded in bars_by_code.values():
         if loaded is not None and not loaded.empty:
             date_candidates.append(loaded.index.max())
-    as_of_date = max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None
+    as_of_date = (as_of_date_override or
+                  (max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None))
 
     rows = []
     counts = {"completed": 0, "pending": 0, "data_truncated": 0,
@@ -988,7 +1012,9 @@ def aggregate(ts_code: Optional[str] = None,
 
 # ── 可执行信号影子对照 ───────────────────────────────────────────────────────
 
-def _run_conditional_entries(entries: list, include_benchmark: bool) -> list[dict]:
+def _run_conditional_entries(entries: list, include_benchmark: bool,
+                             bars_by_code_override: Optional[dict] = None,
+                             as_of_date_override: Optional[str] = None) -> list[dict]:
     if not entries:
         return []
     max_window = max(
@@ -996,7 +1022,8 @@ def _run_conditional_entries(entries: list, include_benchmark: bool) -> list[dic
         + int((((entry.get("trade_decision") or {}).get("entry_plan") or {}).get("valid_for_days") or 3))
         for entry in entries
     )
-    bars_by_code = _load_bars_by_code(entries, max_window)
+    bars_by_code = (bars_by_code_override if bars_by_code_override is not None
+                    else _load_bars_by_code(entries, max_window))
     bench_series = None
     if include_benchmark:
         dates = [entry.get("date") for entry in entries if entry.get("date")]
@@ -1013,7 +1040,8 @@ def _run_conditional_entries(entries: list, include_benchmark: bool) -> list[dic
     ]
     if bench_series is not None and not bench_series.empty:
         date_candidates.append(bench_series.index.max())
-    as_of_date = max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None
+    as_of_date = (as_of_date_override or
+                  (max(date_candidates).strftime("%Y-%m-%d") if date_candidates else None))
 
     rows: list[dict] = []
     for entry in entries:
@@ -1032,7 +1060,10 @@ def _run_conditional_entries(entries: list, include_benchmark: bool) -> list[dic
 
 def _shadow_arm_stats(rows: list[dict], analyzed_count: int,
                       gate_passed_count: int) -> dict:
-    official = [row for row in rows if row.get("status") in {"completed", "data_truncated"}]
+    official = sorted(
+        [row for row in rows if row.get("status") in {"completed", "data_truncated"}],
+        key=lambda row: row.get("exit_date") or row.get("fill_date") or row.get("date") or "",
+    )
     filled = [row for row in rows if row.get("fill_price") is not None]
     returns = [float(row["net_return"]) for row in official if row.get("net_return") is not None]
     wins = [value for value in returns if value > 0]
@@ -1042,7 +1073,30 @@ def _shadow_arm_stats(rows: list[dict], analyzed_count: int,
     completed_hits = [bool(row.get("hit")) for row in official if row.get("hit") is not None]
     drawdowns = [float(row["max_drawdown"]) for row in official if row.get("max_drawdown") is not None]
     first_30 = completed_hits[:30]
-    last_30 = completed_hits[30:60]
+    last_30 = completed_hits[-30:] if len(completed_hits) >= 60 else []
+    equity = peak = 1.0
+    equity_drawdown = 0.0
+    for value in returns:
+        equity *= 1 + value
+        peak = max(peak, equity)
+        equity_drawdown = min(equity_drawdown, equity / peak - 1)
+    regime_aliases = {
+        "偏热": "risk_on", "亢奋": "risk_on", "强势": "risk_on",
+        "中性": "neutral",
+        "偏冷": "risk_off", "冰点": "risk_off", "弱势": "risk_off",
+    }
+    by_regime: dict[str, dict] = {}
+    for row in official:
+        key = regime_aliases.get(str(row.get("regime") or ""), "unknown")
+        bucket = by_regime.setdefault(key, {"completed_count": 0, "wins": 0, "net_sum": 0.0})
+        bucket["completed_count"] += 1
+        value = float(row.get("net_return") or 0)
+        bucket["wins"] += int(value > 0)
+        bucket["net_sum"] += value
+    for bucket in by_regime.values():
+        count = bucket["completed_count"]
+        bucket["win_rate"] = round(bucket["wins"] / count, 4) if count else None
+        bucket["avg_net_return"] = round(bucket.pop("net_sum") / count, 4) if count else None
     status_counts = pd.Series([row.get("status") for row in rows], dtype="object").value_counts().to_dict()
     return {
         "analyzed_count": analyzed_count,
@@ -1054,6 +1108,8 @@ def _shadow_arm_stats(rows: list[dict], analyzed_count: int,
         "avg_net_return": round(sum(returns) / len(returns), 4) if returns else None,
         "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
         "worst_max_drawdown": round(min(drawdowns), 4) if drawdowns else None,
+        "max_drawdown": round(equity_drawdown, 4) if returns else None,
+        "by_regime": by_regime,
         "pending_count": int(status_counts.get("pending", 0)),
         "pending_entry_count": int(status_counts.get("pending_entry", 0)),
         "expired_unfilled_count": int(status_counts.get("expired_unfilled", 0)),
@@ -1062,6 +1118,22 @@ def _shadow_arm_stats(rows: list[dict], analyzed_count: int,
         "first_30_win_rate": round(sum(first_30) / 30, 4) if len(first_30) == 30 else None,
         "last_30_win_rate": round(sum(last_30) / 30, 4) if len(last_30) == 30 else None,
     }
+
+
+def _shadow_snapshot(entries: list[dict]) -> tuple[dict, Optional[str]]:
+    """Load one immutable market snapshot shared by every shadow arm."""
+    max_window = max([
+        10,
+        *[
+            int(((entry.get("trade_decision") or {}).get("holding_period_days") or 10))
+            + int((((entry.get("trade_decision") or {}).get("entry_plan") or {}).get("valid_for_days") or 3))
+            for entry in entries
+        ],
+    ])
+    bars_by_code = _load_bars_by_code(entries, max_window) if entries else {}
+    latest = [frame.index.max() for frame in bars_by_code.values()
+              if frame is not None and not frame.empty]
+    return bars_by_code, (max(latest).strftime("%Y-%m-%d") if latest else None)
 
 
 def run_shadow(ts_code: Optional[str] = None,
@@ -1085,14 +1157,22 @@ def run_shadow(ts_code: Optional[str] = None,
         sorted({entry.get("ts_code") for entry in versioned if entry.get("ts_code")}),
         versioned, 13,
     )
-    baseline_rows, _ = _run_entries(baseline_entries, 10, include_benchmark)
-    execution_rows = _run_conditional_entries(proposed_entries, include_benchmark)
-    challenger_rows = _run_conditional_entries(challenger_entries, include_benchmark)
+    bars_by_code, as_of_date = _shadow_snapshot(versioned)
+    baseline_rows, _ = _run_entries(
+        baseline_entries, 10, include_benchmark,
+        bars_by_code_override=bars_by_code, as_of_date_override=as_of_date)
+    execution_rows = _run_conditional_entries(
+        proposed_entries, include_benchmark,
+        bars_by_code_override=bars_by_code, as_of_date_override=as_of_date)
+    challenger_rows = _run_conditional_entries(
+        challenger_entries, include_benchmark,
+        bars_by_code_override=bars_by_code, as_of_date_override=as_of_date)
     analyzed_count = len(versioned)
     return {
         "gate_version": "v1",
         "mode": (((config.get().get("backtest") or {}).get("trade_signal_gate") or {}).get("mode") or "shadow"),
         "analyzed_count": analyzed_count,
+        "as_of_date": as_of_date,
         "arms": {
             "baseline": _shadow_arm_stats(baseline_rows, analyzed_count, len(baseline_entries)),
             "execution_only": _shadow_arm_stats(execution_rows, analyzed_count, len(proposed_entries)),

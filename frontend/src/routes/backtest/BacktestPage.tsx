@@ -44,7 +44,7 @@ import {
 } from "@/api/backtest";
 import { ApiError } from "@/api/client";
 import { cn, formatPercent, formatRatio } from "@/lib/utils";
-import { computeStats, getSignalOutcome, hasAggregateSignals } from "./stats";
+import { computeStats, getSignalOutcome, getTradeDecisionText, hasAggregateSignals } from "./stats";
 
 /**
  * /backtest 回测页
@@ -241,6 +241,7 @@ export function BacktestPage() {
             <div className="divide-y divide-border">
               {data.map((s, i) => {
                 const outcome = getSignalOutcome(s);
+                const decision = getTradeDecisionText(s);
                 return (
                 <div
                   key={i}
@@ -250,6 +251,15 @@ export function BacktestPage() {
                     <div className="flex items-center gap-2">
                       <p className="truncate font-medium">{s.name ?? s.ts_code}</p>
                       <VerdictTag verdict={s.verdict} />
+                      {decision && (
+                        <span className={cn(
+                          "rounded px-1.5 py-0.5 text-xs",
+                          s.trade_action === "buy" ? "bg-up/10 text-up" :
+                          s.trade_action === "avoid" ? "bg-down/10 text-down" : "bg-muted text-flat",
+                        )}>
+                          最终{decision.label}
+                        </span>
+                      )}
                       {outcome.label === "盈利" ? (
                         <CheckCircle2 className="h-3.5 w-3.5 text-up" />
                       ) : outcome.label === "亏损" ? (
@@ -264,6 +274,9 @@ export function BacktestPage() {
                     <p className="num mt-0.5 text-xs text-text-secondary">
                       {s.ts_code} · {s.date} · 入场 {s.fill_price?.toFixed(2)}
                     </p>
+                    {decision?.reasons && (
+                      <p className="mt-1 text-xs text-text-secondary">未通过原因：{decision.reasons}</p>
+                    )}
                   </div>
                   <div className="text-right">
                     <p

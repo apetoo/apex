@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeStats, getSignalOutcome, hasAggregateSignals } from "../stats";
+import { computeStats, getSignalOutcome, getTradeDecisionText, hasAggregateSignals } from "../stats";
 
 describe("backtest official statistics", () => {
   it("excludes pending and non-fill signals from win rate and averages", () => {
@@ -47,5 +47,12 @@ describe("backtest official statistics", () => {
 
   it("keeps aggregate status counts visible when no trade is official yet", () => {
     expect(hasAggregateSignals({ total_signals: 3 })).toBe(true);
+  });
+
+  it("shows the executable action separately from the opinion and explains rejection", () => {
+    expect(getTradeDecisionText({
+      trade_action: "watch",
+      gate_reasons: ["reward_risk_too_low", "entry_band_invalid"],
+    })).toEqual({ label: "观察", reasons: "盈亏比不足、入场区间无效" });
   });
 });

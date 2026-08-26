@@ -19,6 +19,9 @@ export interface BacktestSignal {
   date: string;
   analyzed_at?: string;
   verdict: string;
+  opinion_verdict?: string;
+  trade_action?: "buy" | "watch" | "avoid";
+  gate_reasons?: string[];
   confidence?: number;
   strategy?: string;
   fill_price?: number;
@@ -173,6 +176,13 @@ export interface ShadowArm {
   avg_net_return: number | null;
   profit_factor: number | null;
   worst_max_drawdown: number | null;
+  max_drawdown?: number | null;
+  by_regime?: Record<string, {
+    completed_count: number;
+    wins: number;
+    win_rate: number | null;
+    avg_net_return: number | null;
+  }>;
   pending_count: number;
   pending_entry_count: number;
   expired_unfilled_count: number;

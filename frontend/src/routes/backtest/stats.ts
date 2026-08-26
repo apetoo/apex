@@ -73,6 +73,27 @@ export function getSignalOutcome(
     : { label: "亏损", tone: "down" };
 }
 
+const GATE_REASON_LABELS: Record<string, string> = {
+  reward_risk_too_low: "盈亏比不足",
+  entry_band_invalid: "入场区间无效",
+  invalid_price_advice: "价格建议无效",
+  evidence_insufficient: "证据不足",
+  confidence_too_low: "置信度不足",
+};
+
+export function getTradeDecisionText(
+  signal: Pick<BacktestSignal, "trade_action" | "gate_reasons">,
+): { label: string; reasons: string } | null {
+  if (!signal.trade_action) return null;
+  const labels = { buy: "买入", watch: "观察", avoid: "回避" } as const;
+  return {
+    label: labels[signal.trade_action],
+    reasons: (signal.gate_reasons ?? [])
+      .map((reason) => GATE_REASON_LABELS[reason] ?? reason)
+      .join("、"),
+  };
+}
+
 export function hasAggregateSignals(
   aggregate: AggregateResult | null | undefined,
 ): aggregate is AggregateResult;

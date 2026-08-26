@@ -258,10 +258,18 @@ def _triggered_today(candidate: dict, ohlc: dict) -> bool:
     """用今日 OHLC 判定候选是否在日内触发（复用 is_triggered 的带状/单向语义）。"""
     if not ohlc:
         return False
-    low = ohlc["low"]; high = ohlc["high"]
+    op = float(ohlc["open"]); low = float(ohlc["low"]); high = float(ohlc["high"])
     tl = candidate.get("trigger_low"); th = candidate.get("trigger_high")
     if tl is not None and th is not None:
-        return float(low) <= float(th) and float(high) >= float(tl)
+        lower, upper = float(tl), float(th)
+        if lower <= op <= upper:
+            return True
+        style = candidate.get("entry_style")
+        if style == "pullback":
+            return op > upper and low <= upper
+        if style == "breakout":
+            return op < lower and high >= lower
+        return low <= upper and high >= lower
     trigger = candidate.get("trigger_price")
     if trigger is None:
         return False
@@ -373,6 +381,7 @@ def _candidate_context(pick: dict, screener_date: str) -> dict:
     return {
         "source_type": "screener",
         "screener_date": screener_date,
+        "as_of": screener_date,
         "strategy": pick.get("strategy"),
         "signals": [
             signal.get("signal_type") for signal in (pick.get("signals") or [])
@@ -467,6 +476,8 @@ def task_screener_and_promote() -> str:
             continue
         stop = float(pa.get("stop_loss") or float(entry) * 0.93)
         target = float(pa.get("target") or float(entry) * 1.10)
+        decision = res.get("trade_decision") or {}
+        plan = decision.get("entry_plan") or {}
         try:
             watchlist.add_candidate(
                 code, pick.get("name", ""),
@@ -478,6 +489,12 @@ def task_screener_and_promote() -> str:
                 stop_advice=stop,
                 target_advice=target,
                 strategy=pick.get("strategy"),
+                trigger_low=plan.get("low") if gate_mode == "enforced" else None,
+                trigger_high=plan.get("high") if gate_mode == "enforced" else None,
+                entry_style=plan.get("style") if gate_mode == "enforced" else None,
+                gate_version=decision.get("gate_version") if gate_mode == "enforced" else None,
+                valid_for_days=plan.get("valid_for_days") if gate_mode == "enforced" else None,
+                expires_days=plan.get("valid_for_days") if gate_mode == "enforced" else None,
             )
             existing_codes.add(code)
             promoted += 1
