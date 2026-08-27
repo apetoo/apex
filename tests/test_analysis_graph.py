@@ -644,6 +644,12 @@ def test_review_transition_revises_then_abstains_for_material_conflict():
     assert analyze._review_transition("pass", issues, revision_count=1)[0] == "abstain"
 
 
+def test_review_transition_preserves_rework_outcome():
+    assert analyze._review_transition(
+        "rework", ["需要补充独立来源"], revision_count=0,
+    )[0] == "rework"
+
+
 def test_review_transition_keeps_technical_failure_blocking():
     outcome, messages = analyze._review_transition(
         "abstain", ["独立复核失败: invalid JSON"], revision_count=0,
@@ -702,6 +708,74 @@ def test_material_review_issue_routes_back_to_draft_once(monkeypatch):
     assert result["review_revision_count"] == 1
     assert "此前流入构成反证" in result["analysis_text"]
     assert [event["outcome"] for event in events if event["type"] == "review"] == ["revise", "pass"]
+
+
+def test_raw_rework_review_routes_back_to_research_and_reason(monkeypatch):
+    base = {
+        "verdict": "偏空", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,
+        "features": {"ma5_position": "below", "ma20_position": "below", "volume_ratio": 0.8, "rsi_14": 35, "atr_14_pct": 5.8},
+        "stock_type": "均衡型", "valuation_basis": "non_valuation",
+        "evidence": ["主力净流出 → 短线资金偏弱"],
+    }
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={"thesis": "偏空", "gaps": [], "next_actions": [], "ready": True}),
+        _response(tool_name="record_verdict", arguments=base),
+        _response(content=json.dumps({"outcome": "rework", "issues": ["补充独立来源核验资金面"]}, ensure_ascii=False)),
+        _response(tool_name="get_fundamentals", arguments={"ts_code": "000977.SZ"}),
+        _response(tool_name="submit_research_state", arguments={"thesis": "偏空", "gaps": [], "next_actions": [], "ready": True}),
+        _response(tool_name="record_verdict", arguments=base),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="偏空", confidence=5)),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
+        "title": "浪潮信息公告", "snippet": "风险扫描完成", "url": "https://www.cninfo.com.cn/scan",
+        "date": "2026-08-24", "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+        "freshness_status": "current",
+    }]}))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+    events = []
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=events.append,
+    )
+
+    assert [event["outcome"] for event in events if event["type"] == "review"][:1] == ["rework"]
+    assert sum(event.get("stage") == "researching" for event in events if event["type"] == "status") >= 2
+
+
+def test_minor_review_issue_passes_after_one_revision_for_000977(monkeypatch):
+    base = {
+        "verdict": "偏空", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,
+        "features": {"ma5_position": "below", "ma20_position": "below", "volume_ratio": 0.8, "rsi_14": 35, "atr_14_pct": 5.8},
+        "stock_type": "均衡型", "valuation_basis": "non_valuation",
+        "evidence": ["主力净流出 → 短线资金偏弱"],
+    }
+    minor = {"message": "盘中跌破均线但尚未收盘确认", "severity": "minor", "blocking": False}
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={"thesis": "偏空", "gaps": [], "next_actions": [], "ready": True}),
+        _response(tool_name="record_verdict", arguments=base),
+        _response(content=json.dumps({"outcome": "pass", "issues": [minor]}, ensure_ascii=False)),
+        _response(tool_name="record_verdict", arguments=base),
+        _response(content=json.dumps({"outcome": "pass", "issues": [minor]}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="偏空", confidence=5)),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
+        "title": "浪潮信息公告", "snippet": "风险扫描完成", "url": "https://www.cninfo.com.cn/scan",
+        "date": "2026-08-24", "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+        "freshness_status": "current",
+    }]}))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["review_revision_count"] == 1
 
 
 def test_reviewer_business_abstention_is_review_failure(monkeypatch):

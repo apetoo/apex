@@ -1638,7 +1638,11 @@ def _review_transition(outcome, issues, revision_count, *, technical_failure=Fal
     messages = [item["message"] for item in normalized]
     if technical_failure:
         return "abstain", messages
+    if outcome == "rework":
+        return "rework", messages
     material = any(item["blocking"] or item["severity"] == "material" for item in normalized)
+    if outcome == "abstain" and material:
+        return "abstain", messages
     if material:
         return ("revise" if revision_count < 1 else "abstain"), messages
     if messages and revision_count < 1:
@@ -2362,14 +2366,9 @@ def _run_langgraph_loop(
             issues = list(payload.get("issues") or [])
             technical_failure = False
         revision_count = int(state.get("review_revision_count", 0))
-        raw_outcome = outcome
         outcome, issues = _review_transition(
             outcome, issues, revision_count, technical_failure=technical_failure,
         )
-        # An explicit business abstention is already a safety decision; only
-        # normalize pass/reviewable outcomes while retaining its blocking state.
-        if raw_outcome == "abstain" and not technical_failure:
-            outcome = "abstain"
         if outcome not in {"revise", "abstain"}:
             outcome = controller.record_review(outcome, issues)
         emit({"type": "review", "outcome": outcome, "issues": issues})

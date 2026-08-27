@@ -20,3 +20,9 @@ The implementation accepts reviewer string or mapping issues, normalizes message
 - The existing `_review_requires_revision` helper was kept compatible and updated so the bare `结论方向` phrase is not a material marker.
 - No unrelated untracked files were modified or staged.
 
+## Review fix round 1
+
+- RED: added regressions for raw `rework` preservation and the 000977 minor-issue-after-revision path; the raw rework integration initially failed because the transition seam converted it to `revise`, and the existing business-abstention regression exposed the need to retain material abstentions.
+- GREEN: `_review_transition` now preserves `rework` for `controller.record_review`, retains material business abstentions, and allows minor issues to pass after one revision without a caller-side override.
+- Added integration coverage proving raw rework emits a rework review and re-enters the researching/reason path, plus 000977 minor issue recovery.
+- Focused tests: 7 passed. Full `tests/test_analysis_graph.py`: 40 passed. `git diff --check`: passed.
