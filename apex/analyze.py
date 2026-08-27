@@ -1723,14 +1723,17 @@ def _normalize_report_scale_plan(candidate: dict) -> dict:
     plan = []
     for raw_level in normalized.get("scale_plan") or []:
         level = dict(raw_level) if isinstance(raw_level, dict) else raw_level
-        if (
-            isinstance(level, dict)
-            and level.get("action") == "trim"
-            and float(level.get("pct") or 0) == 1.0
-            and level.get("new_stop") is not None
-            and float(level["new_stop"]) <= 0
-        ):
-            level["new_stop"] = None
+        if isinstance(level, dict) and level.get("action") == "trim":
+            try:
+                qualifies_full_exit = (
+                    float(level.get("pct") or 0) == 1.0
+                    and level.get("new_stop") is not None
+                    and float(level["new_stop"]) <= 0
+                )
+            except (TypeError, ValueError):
+                qualifies_full_exit = False
+            if qualifies_full_exit:
+                level["new_stop"] = None
         plan.append(level)
     normalized["scale_plan"] = plan
     return normalized

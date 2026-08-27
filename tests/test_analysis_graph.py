@@ -411,6 +411,14 @@ def test_report_scale_plan_normalization_preserves_partial_trim_and_positive_sto
     assert analyze._normalize_report_scale_plan(candidate) == candidate
 
 
+def test_report_scale_plan_normalization_preserves_malformed_numeric_fields():
+    candidate = {"scale_plan": [
+        {"action": "trim", "trigger_price": 80, "pct": "not-a-number", "new_stop": 0},
+        {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": "unknown"},
+    ]}
+    assert analyze._normalize_report_scale_plan(candidate) == candidate
+
+
 def test_ladder_mismatch_reports_expected_and_parsed_values():
     candidate = {
         "action": "hold", "new_stop": 71.5, "new_target": 90,
