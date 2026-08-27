@@ -697,6 +697,19 @@ def test_review_transition_escalates_direction_changing_unsupported_claim():
     assert normalized[0]["blocking"] is True
 
 
+def test_review_transition_escalates_spec_wording_for_unsupported_directional_claim():
+    issue = {
+        "message": "候选包含无支撑方向性主张，可能误导交易动作。",
+        "severity": "minor",
+        "blocking": False,
+    }
+
+    normalized = analyze._normalize_review_issues([issue])
+
+    assert normalized[0]["severity"] == "material"
+    assert normalized[0]["blocking"] is True
+
+
 def test_bearish_valuation_thesis_cannot_claim_non_valuation_basis():
     candidate = {"verdict": "偏空", "valuation_basis": "non_valuation"}
     assert analyze._valuation_basis_conflict(candidate, "估值仍高，PE_TTM 54.6 压制股价") is True
@@ -874,7 +887,7 @@ def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
     assert "new_stop、new_target、scale_plan 是本次拟议修改" in review_prompt
 
 
-def test_reviewer_business_abstention_is_review_failure(monkeypatch):
+def test_reviewer_first_material_abstention_revises_then_passes(monkeypatch):
     verdict = {
         "verdict": "中性", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,
         "features": {"ma5_position": "above", "ma20_position": "below", "volume_ratio": 1.0, "rsi_14": 50, "atr_14_pct": 2.0},
