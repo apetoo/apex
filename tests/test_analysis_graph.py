@@ -778,6 +778,64 @@ def test_minor_review_issue_passes_after_one_revision_for_000977(monkeypatch):
     assert result["review_revision_count"] == 1
 
 
+def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
+    held = {
+        "ts_code": "000977.SZ", "entry_price": 77.0, "position_size_shares": 200,
+        "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [{
+            "level": 1, "action": "trim", "trigger_price": 82.0,
+            "shares": 100, "new_stop": 71.5, "reason": "历史防守档",
+        }]},
+    }
+    action = {
+        "action": "hold", "new_stop": 73.0, "scale_plan": [],
+        "rationale": "MA60 已上行，止损随趋势抬升至 73.0。",
+    }
+    minor = {
+        "message": "MA60 上行的确认窗口仍偏短，但不改变持仓防守结论。",
+        "severity": "minor", "blocking": False,
+    }
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "持仓防守", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=action),
+        _response(content=json.dumps({"outcome": "pass", "issues": [minor]}, ensure_ascii=False)),
+        _response(tool_name="record_position_action", arguments=action),
+        _response(content=json.dumps({"outcome": "abstain", "issues": [minor]}, ensure_ascii=False)),
+        _response(content=_complete_position_report().replace(
+            "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
+            "**当前动作：hold**\n**新止损：73.0**\nMA60 上行后抬升防守位。",
+        )),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 74.0})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
+        "title": "浪潮信息公告", "snippet": "未见新增重大风险", "url": "https://www.cninfo.com.cn/scan",
+        "date": "2026-08-24", "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+        "freshness_status": "current",
+    }]}))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [held]})
+    monkeypatch.setattr(analyze.journal, "load_position_actions", lambda _code: [])
+    monkeypatch.setattr(analyze, "_finalize_position_action", lambda *_args, **_kwargs: {
+        "analysis_status": "completed", "position_action": action,
+    })
+    events = []
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=events.append,
+        system_context=(
+            "当前 ladder（历史基线）：L1 trim @ 82.0 -> new_stop 71.5；"
+            "当前止损 71.5。"
+        ),
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["review_revision_count"] == 1
+    assert [event["outcome"] for event in events if event["type"] == "review"] == ["revise", "pass"]
+
+
 def test_reviewer_business_abstention_is_review_failure(monkeypatch):
     verdict = {
         "verdict": "中性", "confidence": 5, "entry": 0, "stop_loss": 0, "target": 0,

@@ -2322,9 +2322,12 @@ def _run_langgraph_loop(
             "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
             "system_context 是系统注入的确定性数据（行情/技术/大盘/情绪/持仓计划/历史判断），"
             "视为已验证：候选引用其中数据时不必要求外部证据。"
+            "system_context 中的 ladder/止损是历史基线；candidate 的 new_stop、new_target、scale_plan"
+            "是本次拟议修改。数值不同本身不是冲突；只有缺少调整依据、违反风险约束或候选内部互相矛盾时才记录问题。"
             "rework 仅用于影响结论方向的重大外部事实主张无支撑；"
             "技术指标等次要出入记入 issues 但不应单独导致 rework。"
-            "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, issues: string[]}。"
+            "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, "
+            "issues: [{message: string, severity: minor|material, blocking: boolean}]}。"
         )
         review_user = json.dumps(compact, ensure_ascii=False)
         # 复核输出本应只有几百 token。temp=0 下模型偶发复读循环，一路写到
@@ -2369,7 +2372,7 @@ def _run_langgraph_loop(
         outcome, issues = _review_transition(
             outcome, issues, revision_count, technical_failure=technical_failure,
         )
-        if outcome not in {"revise", "abstain"}:
+        if outcome != "revise":
             outcome = controller.record_review(outcome, issues)
         emit({"type": "review", "outcome": outcome, "issues": issues})
         update = {"review_outcome": outcome, "review_issues": issues}
