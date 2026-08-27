@@ -623,6 +623,44 @@ def test_review_pass_with_material_contradiction_requires_draft_revision():
     assert analyze._review_requires_revision("pass", ["技术指标存在次要出入，不影响结论"]) is False
 
 
+def test_review_transition_downgrades_minor_abstain_after_revision_to_pass():
+    issues = [{
+        "message": "盘中站上均线但尚未收盘确认，作为 hold 支撑仍可接受",
+        "severity": "minor",
+        "blocking": False,
+    }]
+    assert analyze._review_transition("abstain", issues, revision_count=1) == (
+        "pass", [issues[0]["message"]],
+    )
+
+
+def test_review_transition_revises_then_abstains_for_material_conflict():
+    issues = [{
+        "message": "候选方向与已确认财务事实存在重大冲突",
+        "severity": "material",
+        "blocking": True,
+    }]
+    assert analyze._review_transition("pass", issues, revision_count=0)[0] == "revise"
+    assert analyze._review_transition("pass", issues, revision_count=1)[0] == "abstain"
+
+
+def test_review_transition_keeps_technical_failure_blocking():
+    outcome, messages = analyze._review_transition(
+        "abstain", ["独立复核失败: invalid JSON"], revision_count=0,
+        technical_failure=True,
+    )
+    assert outcome == "abstain"
+    assert messages == ["独立复核失败: invalid JSON"]
+
+
+def test_review_transition_does_not_treat_bare_conclusion_direction_as_material():
+    issues = analyze._normalize_review_issues(["仅记录结论方向，暂无额外问题"])
+    assert issues[0]["severity"] == "minor"
+    assert analyze._review_transition(
+        "pass", ["仅记录结论方向，暂无额外问题"], revision_count=1,
+    )[0] == "pass"
+
+
 def test_bearish_valuation_thesis_cannot_claim_non_valuation_basis():
     candidate = {"verdict": "偏空", "valuation_basis": "non_valuation"}
     assert analyze._valuation_basis_conflict(candidate, "估值仍高，PE_TTM 54.6 压制股价") is True

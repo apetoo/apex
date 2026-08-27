@@ -1600,8 +1600,50 @@ def _review_requires_revision(outcome: str, issues: list[str]) -> bool:
     """Model reviewer may call material inconsistencies 'minor'; deterministic policy wins."""
     if outcome != "pass":
         return False
-    material_markers = ("矛盾", "无支撑", "自相矛盾", "口径混用", "事实错误", "持续流出")
+    material_markers = (
+        "重大冲突", "关键未知", "事实错误", "无支撑", "自相矛盾", "矛盾",
+        "口径混用", "影响结论方向", "改变结论方向", "持续流出",
+    )
     return any(any(marker in str(issue) for marker in material_markers) for issue in issues)
+
+
+_MATERIAL_REVIEW_MARKERS = (
+    "重大冲突", "关键未知", "事实错误", "无支撑", "自相矛盾", "矛盾",
+    "口径混用", "影响结论方向", "改变结论方向", "持续流出",
+)
+
+
+def _normalize_review_issues(issues: list) -> list[dict]:
+    normalized = []
+    for issue in issues or []:
+        if isinstance(issue, dict):
+            message = str(issue.get("message") or "").strip()
+            severity = str(issue.get("severity") or "minor").lower()
+            blocking = bool(issue.get("blocking")) or severity == "material"
+        else:
+            message = str(issue).strip()
+            blocking = any(marker in message for marker in _MATERIAL_REVIEW_MARKERS)
+            severity = "material" if blocking else "minor"
+        if message:
+            normalized.append({
+                "message": message,
+                "severity": severity if severity in {"minor", "material"} else "minor",
+                "blocking": blocking,
+            })
+    return normalized
+
+
+def _review_transition(outcome, issues, revision_count, *, technical_failure=False):
+    normalized = _normalize_review_issues(issues)
+    messages = [item["message"] for item in normalized]
+    if technical_failure:
+        return "abstain", messages
+    material = any(item["blocking"] or item["severity"] == "material" for item in normalized)
+    if material:
+        return ("revise" if revision_count < 1 else "abstain"), messages
+    if messages and revision_count < 1:
+        return "revise", messages
+    return "pass", messages
 
 
 def _valuation_basis_conflict(candidate: dict, thesis: str) -> bool:
@@ -2314,13 +2356,21 @@ def _run_langgraph_loop(
         if payload is None:
             emit({"type": "review_retry_failed", "reason": failure})
             outcome, issues = "abstain", [f"独立复核失败: {failure}"]
+            technical_failure = True
         else:
             outcome = str(payload.get("outcome") or "abstain")
             issues = list(payload.get("issues") or [])
+            technical_failure = False
         revision_count = int(state.get("review_revision_count", 0))
-        if _review_requires_revision(outcome, issues):
-            outcome = "revise" if revision_count < 1 else "abstain"
-        elif outcome != "revise":
+        raw_outcome = outcome
+        outcome, issues = _review_transition(
+            outcome, issues, revision_count, technical_failure=technical_failure,
+        )
+        # An explicit business abstention is already a safety decision; only
+        # normalize pass/reviewable outcomes while retaining its blocking state.
+        if raw_outcome == "abstain" and not technical_failure:
+            outcome = "abstain"
+        if outcome not in {"revise", "abstain"}:
             outcome = controller.record_review(outcome, issues)
         emit({"type": "review", "outcome": outcome, "issues": issues})
         update = {"review_outcome": outcome, "review_issues": issues}
