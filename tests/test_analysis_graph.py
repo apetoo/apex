@@ -419,6 +419,59 @@ def test_report_scale_plan_normalization_preserves_malformed_numeric_fields():
     assert analyze._normalize_report_scale_plan(candidate) == candidate
 
 
+def test_report_scale_plan_normalization_rejects_non_finite_and_oversized_stops():
+    for new_stop in ("-1e9999", "9" * 401):
+        candidate = {"scale_plan": [
+            {"action": "trim", "trigger_price": 80, "pct": 1.0, "new_stop": new_stop},
+        ]}
+        assert analyze._normalize_report_scale_plan(candidate) == candidate
+
+
+def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monkeypatch):
+    held = {"ts_code": "000977.SZ", "entry_price": 77.0, "position_size_shares": 200,
+            "stop_loss": 71.5, "target": 90.0}
+    action = {
+        "action": "hold", "new_stop": 71.5, "new_target": 90,
+        "scale_plan": [
+            {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 0},
+        ],
+    }
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "持仓防守", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=action),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_position_report_with_plan("- trim @ 71.5，比例 1.0")),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
+        "title": "浪潮信息公告", "snippet": "未见新增重大风险", "url": "https://www.cninfo.com.cn/scan",
+        "date": "2026-08-25", "site": "巨潮资讯", "source_tier": 1,
+        "entity_matched": True, "freshness_status": "current",
+    }]}))
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 74.0})
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [held]})
+    monkeypatch.setattr(analyze, "_validate_position_action", lambda *args, **kwargs: ([], []))
+    seen = []
+    original_validator = analyze._validate_final_report
+    monkeypatch.setattr(analyze, "_validate_final_report", lambda report, kind, candidate: (
+        seen.append(candidate) or original_validator(report, kind, candidate)
+    ))
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12,
+        emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "completed", result
+    assert seen[0]["scale_plan"][0]["new_stop"] is None
+    prompt = client.calls[-1]["messages"][-1]["content"]
+    assert '"new_stop": null' in prompt
+    assert "有新止损的档位必须追加" not in prompt
+
+
 def test_ladder_mismatch_reports_expected_and_parsed_values():
     candidate = {
         "action": "hold", "new_stop": 71.5, "new_target": 90,

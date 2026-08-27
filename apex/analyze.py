@@ -3,6 +3,7 @@ DeepSeek API (OpenAI-compatible) agent for stock analysis.
 The AI autonomously calls data tools, then records verdict via record_verdict tool.
 """
 import json
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1729,8 +1730,10 @@ def _normalize_report_scale_plan(candidate: dict) -> dict:
                     float(level.get("pct") or 0) == 1.0
                     and level.get("new_stop") is not None
                     and float(level["new_stop"]) <= 0
+                    and math.isfinite(float(level.get("pct") or 0))
+                    and math.isfinite(float(level["new_stop"]))
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 qualifies_full_exit = False
             if qualifies_full_exit:
                 level["new_stop"] = None
@@ -1821,19 +1824,29 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             value = candidate.get(field)
             _validate_labeled_number(text, label, value, issues)
         plan_section = text.split("## 条件触发计划", 1)[-1].split("\n## ", 1)[0]
-        parsed_plan = [
-            (
-                item_action, float(trigger), "shares" if shares else "pct",
-                int(shares) if shares else float(pct),
-                float(new_stop) if new_stop else None,
-            )
-            for item_action, trigger, shares, pct, new_stop in re.findall(
-                r"(?m)^\s*-\s*(add|trim)\s*@\s*(\d+(?:\.\d+)?)[，,]\s*"
-                r"(?:(\d+)\s*股|比例\s*(\d+(?:\.\d+)?))"
-                r"(?:[，,]\s*新止损\s*(\d+(?:\.\d+)?))?",
-                plan_section,
-            )
-        ]
+        parsed_plan = []
+        for item_action, trigger, shares, pct, new_stop in re.findall(
+            r"(?m)^\s*-\s*(add|trim)\s*@\s*(\d+(?:\.\d+)?)[，,]\s*"
+            r"(?:(\d+)\s*股|比例\s*(\d+(?:\.\d+)?))"
+            r"(?:[，,]\s*新止损\s*(\d+(?:\.\d+)?))?",
+            plan_section,
+        ):
+            try:
+                parsed_level = (
+                    item_action, float(trigger), "shares" if shares else "pct",
+                    int(shares) if shares else float(pct),
+                    float(new_stop) if new_stop else None,
+                )
+                if (
+                    not math.isfinite(parsed_level[1])
+                    or not math.isfinite(parsed_level[3])
+                    or (parsed_level[4] is not None and not math.isfinite(parsed_level[4]))
+                ):
+                    raise ValueError("条件触发计划数值必须有限")
+            except (TypeError, ValueError, OverflowError):
+                parsed_plan = None
+                break
+            parsed_plan.append(parsed_level)
         expected_plan = []
         for level in candidate.get("scale_plan") or []:
             try:
@@ -1843,13 +1856,20 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                 has_pct = level.get("pct") is not None
                 if has_shares == has_pct:
                     raise ValueError("shares/pct 必须且只能提供一个")
-                expected_plan.append((
+                expected_level = (
                     str(level["action"]), float(level["trigger_price"]),
                     "shares" if has_shares else "pct",
                     int(level["shares"]) if has_shares else float(level["pct"]),
                     float(level["new_stop"]) if level.get("new_stop") is not None else None,
-                ))
-            except (KeyError, TypeError, ValueError):
+                )
+                if (
+                    not math.isfinite(expected_level[1])
+                    or not math.isfinite(expected_level[3])
+                    or (expected_level[4] is not None and not math.isfinite(expected_level[4]))
+                ):
+                    raise ValueError("scale_plan 数值必须有限")
+                expected_plan.append(expected_level)
+            except (KeyError, TypeError, ValueError, OverflowError):
                 issues.append("结构化条件触发计划字段无效")
                 expected_plan = None
                 break
@@ -2998,11 +3018,15 @@ def _simulate_ladder(
             continue
         try:
             _tp = float(_lvl.get("trigger_price"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(_tp):
             continue
         try:
             _nsf = float(_lvl.get("new_stop"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            _nsf = None
+        if _nsf is not None and not math.isfinite(_nsf):
             _nsf = None
         parsed.append((_i, _act, _tp, _nsf))
 
