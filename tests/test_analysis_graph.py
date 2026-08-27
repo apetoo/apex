@@ -616,13 +616,6 @@ def test_formal_report_uses_finalized_candidate_as_single_source_of_truth(monkey
     assert result["analysis_text"] == report
 
 
-def test_review_pass_with_material_contradiction_requires_draft_revision():
-    assert analyze._review_requires_revision("pass", [
-        "资金面数据存在矛盾：candidate 声称持续流出，但近两日为净流入",
-    ]) is True
-    assert analyze._review_requires_revision("pass", ["技术指标存在次要出入，不影响结论"]) is False
-
-
 def test_review_transition_downgrades_minor_abstain_after_revision_to_pass():
     issues = [{
         "message": "盘中站上均线但尚未收盘确认，作为 hold 支撑仍可接受",
@@ -667,6 +660,43 @@ def test_review_transition_does_not_treat_bare_conclusion_direction_as_material(
     )[0] == "pass"
 
 
+def test_review_transition_treats_legacy_timeframe_wording_as_minor_after_revision():
+    issue = "盘中与收盘口径混用，收盘后需补充确认。"
+
+    normalized = analyze._normalize_review_issues([issue])
+
+    assert normalized[0]["severity"] == "minor"
+    assert normalized[0]["blocking"] is False
+    assert analyze._review_transition("abstain", [issue], revision_count=1)[0] == "pass"
+
+
+def test_review_transition_escalates_explicit_material_text_mislabeled_minor():
+    issue = {
+        "message": "候选方向与已确认财务事实存在重大冲突",
+        "severity": "minor",
+        "blocking": False,
+    }
+
+    normalized = analyze._normalize_review_issues([issue])
+
+    assert normalized[0]["severity"] == "material"
+    assert normalized[0]["blocking"] is True
+    assert analyze._review_transition("pass", [issue], revision_count=0)[0] == "revise"
+
+
+def test_review_transition_escalates_direction_changing_unsupported_claim():
+    issue = {
+        "message": "候选方向缺少证据支撑，可能改变结论方向。",
+        "severity": "minor",
+        "blocking": False,
+    }
+
+    normalized = analyze._normalize_review_issues([issue])
+
+    assert normalized[0]["severity"] == "material"
+    assert normalized[0]["blocking"] is True
+
+
 def test_bearish_valuation_thesis_cannot_claim_non_valuation_basis():
     candidate = {"verdict": "偏空", "valuation_basis": "non_valuation"}
     assert analyze._valuation_basis_conflict(candidate, "估值仍高，PE_TTM 54.6 压制股价") is True
@@ -682,7 +712,7 @@ def test_material_review_issue_routes_back_to_draft_once(monkeypatch):
     client = _FakeClient([
         _response(tool_name="submit_research_state", arguments={"thesis": "偏空", "gaps": [], "next_actions": [], "ready": True}),
         _response(tool_name="record_verdict", arguments={**base, "evidence": ["单日流出 → 资金持续撤离"]}),
-        _response(content=json.dumps({"outcome": "pass", "issues": ["资金面数据存在矛盾：单日流出不能表述为持续撤离"]}, ensure_ascii=False)),
+        _response(content=json.dumps({"outcome": "pass", "issues": ["资金面数据存在重大冲突：单日流出不能表述为持续撤离"]}, ensure_ascii=False)),
         _response(tool_name="record_verdict", arguments={**base, "evidence": ["当日主力净流出 → 短线资金偏弱，但此前流入构成反证"]}),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
         _response(content=_complete_verdict_report(verdict="偏空", confidence=5).replace(
@@ -834,6 +864,14 @@ def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
     assert result["analysis_status"] == "completed"
     assert result["review_revision_count"] == 1
     assert [event["outcome"] for event in events if event["type"] == "review"] == ["revise", "pass"]
+    review_prompt = next(
+        call["messages"][0]["content"]
+        for call in client.calls
+        if call["messages"][0]["role"] == "system"
+        and "独立审稿人" in call["messages"][0]["content"]
+    )
+    assert "ladder/止损是历史基线" in review_prompt
+    assert "new_stop、new_target、scale_plan 是本次拟议修改" in review_prompt
 
 
 def test_reviewer_business_abstention_is_review_failure(monkeypatch):
@@ -848,6 +886,9 @@ def test_reviewer_business_abstention_is_review_failure(monkeypatch):
         _response(tool_name="submit_research_state", arguments={"thesis": "中性", "gaps": [], "next_actions": [], "ready": True}),
         _response(tool_name="record_verdict", arguments=verdict),
         _response(content=json.dumps({"outcome": "abstain", "issues": [issue]}, ensure_ascii=False)),
+        _response(tool_name="record_verdict", arguments=verdict),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report(verdict="中性", confidence=5)),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002050.SZ": "三花智控"})
     monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
@@ -858,16 +899,15 @@ def test_reviewer_business_abstention_is_review_failure(monkeypatch):
     monkeypatch.setattr(analyze, "_dispatch_tool", lambda *_args: json.dumps({"valuation": {"pe_ttm": 20}}))
     monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
 
+    events = []
     result = analyze._run_langgraph_loop(
         ts_code="002050.SZ", client=client, model="fake",
-        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=lambda _event: None,
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=events.append,
     )
 
-    assert result["analysis_status"] == "insufficient_evidence"
-    assert result["outcome_reason"] == "review_failure"
-    assert result["unknowns"] == []
-    assert any(issue in failure for failure in result["failures"])
-    assert result["next_actions"] == ["修正候选结论后重新运行独立复核"]
+    assert result["analysis_status"] == "completed"
+    assert result["review_revision_count"] == 1
+    assert [event["outcome"] for event in events if event["type"] == "review"] == ["revise", "pass"]
 
 
 def test_second_material_review_contradiction_is_review_failure(monkeypatch):
@@ -877,8 +917,8 @@ def test_second_material_review_contradiction_is_review_failure(monkeypatch):
         "stock_type": "均衡型", "valuation_basis": "non_valuation",
         "evidence": ["当日主力净流出 → 短线资金偏弱"],
     }
-    first_issue = "资金面数据存在矛盾：单日流出不能表述为持续撤离"
-    second_issue = "修订后仍存在矛盾：结论未处理历史流入反证"
+    first_issue = "资金面数据存在重大冲突：单日流出不能表述为持续撤离"
+    second_issue = "修订后仍存在重大冲突：结论未处理历史流入反证"
     client = _FakeClient([
         _response(tool_name="get_fundamentals", arguments={"ts_code": "002938.SZ"}),
         _response(tool_name="submit_research_state", arguments={"thesis": "偏空", "gaps": [], "next_actions": [], "ready": True}),

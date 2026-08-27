@@ -1596,21 +1596,22 @@ def _safety_scan_outcome(parsed: dict) -> bool:
     return not bool(parsed.get("error"))
 
 
-def _review_requires_revision(outcome: str, issues: list[str]) -> bool:
-    """Model reviewer may call material inconsistencies 'minor'; deterministic policy wins."""
-    if outcome != "pass":
-        return False
-    material_markers = (
-        "重大冲突", "关键未知", "事实错误", "无支撑", "自相矛盾", "矛盾",
-        "口径混用", "影响结论方向", "改变结论方向", "持续流出",
-    )
-    return any(any(marker in str(issue) for marker in material_markers) for issue in issues)
-
-
 _MATERIAL_REVIEW_MARKERS = (
-    "重大冲突", "关键未知", "事实错误", "无支撑", "自相矛盾", "矛盾",
-    "口径混用", "影响结论方向", "改变结论方向", "持续流出",
+    "重大冲突", "关键未知", "事实错误",
+    "方向性主张无支撑", "影响结论方向且无支撑", "改变结论方向且无支撑",
 )
+_REVIEW_DIRECTION_MARKERS = ("候选方向", "结论方向", "影响结论方向", "改变结论方向")
+_REVIEW_UNSUPPORTED_MARKERS = ("无支撑", "缺少支撑", "缺乏支撑", "缺少证据", "缺乏证据", "未经证实")
+
+
+def _is_explicit_material_review_issue(message: str) -> bool:
+    return (
+        any(marker in message for marker in _MATERIAL_REVIEW_MARKERS)
+        or (
+            any(marker in message for marker in _REVIEW_DIRECTION_MARKERS)
+            and any(marker in message for marker in _REVIEW_UNSUPPORTED_MARKERS)
+        )
+    )
 
 
 def _normalize_review_issues(issues: list) -> list[dict]:
@@ -1619,15 +1620,18 @@ def _normalize_review_issues(issues: list) -> list[dict]:
         if isinstance(issue, dict):
             message = str(issue.get("message") or "").strip()
             severity = str(issue.get("severity") or "minor").lower()
-            blocking = bool(issue.get("blocking")) or severity == "material"
         else:
             message = str(issue).strip()
-            blocking = any(marker in message for marker in _MATERIAL_REVIEW_MARKERS)
-            severity = "material" if blocking else "minor"
         if message:
+            explicit_material = _is_explicit_material_review_issue(message)
+            declared_material = (
+                bool(issue.get("blocking")) or severity == "material"
+                if isinstance(issue, dict) else False
+            )
+            blocking = explicit_material or declared_material
             normalized.append({
                 "message": message,
-                "severity": severity if severity in {"minor", "material"} else "minor",
+                "severity": "material" if blocking else "minor",
                 "blocking": blocking,
             })
     return normalized
@@ -1641,8 +1645,6 @@ def _review_transition(outcome, issues, revision_count, *, technical_failure=Fal
     if outcome == "rework":
         return "rework", messages
     material = any(item["blocking"] or item["severity"] == "material" for item in normalized)
-    if outcome == "abstain" and material:
-        return "abstain", messages
     if material:
         return ("revise" if revision_count < 1 else "abstain"), messages
     if messages and revision_count < 1:
@@ -2322,7 +2324,7 @@ def _run_langgraph_loop(
             "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
             "system_context 是系统注入的确定性数据（行情/技术/大盘/情绪/持仓计划/历史判断），"
             "视为已验证：候选引用其中数据时不必要求外部证据。"
-            "system_context 中的 ladder/止损是历史基线；candidate 的 new_stop、new_target、scale_plan"
+            "system_context 中的 ladder/止损是历史基线；candidate 的 new_stop、new_target、scale_plan "
             "是本次拟议修改。数值不同本身不是冲突；只有缺少调整依据、违反风险约束或候选内部互相矛盾时才记录问题。"
             "rework 仅用于影响结论方向的重大外部事实主张无支撑；"
             "技术指标等次要出入记入 issues 但不应单独导致 rework。"
