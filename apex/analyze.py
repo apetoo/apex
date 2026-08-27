@@ -1718,6 +1718,24 @@ def _validate_labeled_number(
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
+def _normalize_report_scale_plan(candidate: dict) -> dict:
+    normalized = dict(candidate or {})
+    plan = []
+    for raw_level in normalized.get("scale_plan") or []:
+        level = dict(raw_level) if isinstance(raw_level, dict) else raw_level
+        if (
+            isinstance(level, dict)
+            and level.get("action") == "trim"
+            and float(level.get("pct") or 0) == 1.0
+            and level.get("new_stop") is not None
+            and float(level["new_stop"]) <= 0
+        ):
+            level["new_stop"] = None
+        plan.append(level)
+    normalized["scale_plan"] = plan
+    return normalized
+
+
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
@@ -1833,7 +1851,10 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                 expected_plan = None
                 break
         if parsed_plan != expected_plan:
-            issues.append("条件触发计划与结构化结果不一致")
+            issues.append(
+                "条件触发计划与结构化结果不一致："
+                f"expected={expected_plan!r}; parsed={parsed_plan!r}"
+            )
     return issues
 
 
@@ -2423,7 +2444,17 @@ def _run_langgraph_loop(
             candidate = dict(candidate or {})
             finalization_metadata = dict(finalization_metadata or {})
         if kind == "position_action":
+            candidate = _normalize_report_scale_plan(candidate)
             heading_contract = "\n".join(_POSITION_REPORT_SECTIONS)
+            ladder_contract = (
+                "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股`；"
+                "若 trim 档按比例执行，则写成 `- trim @ <trigger_price>，比例 <pct>`。"
+            )
+            if any(
+                isinstance(level, dict) and level.get("new_stop") is not None
+                for level in candidate.get("scale_plan") or []
+            ):
+                ladder_contract += "有新止损的档位必须追加 `，新止损 <new_stop>`。"
             format_contract = (
                 "持仓动作报告必须依次包含这些标题：\n"
                 + heading_contract + "\n\n"
@@ -2431,9 +2462,8 @@ def _run_langgraph_loop(
                 "candidate 中非空的动作字段必须使用这些标签逐字写出："
                 "`**加仓股数：<add_shares>**`、`**减仓股数：<trim_shares>**`、"
                 "`**减仓比例：<trim_pct>**`、`**新止损：<new_stop>**`、`**新目标：<new_target>**`。"
-                "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股，新止损 <new_stop>`；"
-                "若 trim 档按比例执行，则写成 `- trim @ <trigger_price>，比例 <pct>，新止损 <new_stop>`。"
-                "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
+                + ladder_contract
+                + "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
             )
         else:
             heading_contract = "\n".join(_VERDICT_REPORT_SECTIONS)

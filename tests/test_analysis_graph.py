@@ -190,6 +190,16 @@ def _complete_position_report(*, action="hold"):
 趋势进一步转弱或基本面恶化可能触发止损。"""
 
 
+def _position_report_with_plan(plan_text: str) -> str:
+    return _complete_position_report().replace(
+        "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：hold**\n**新止损：71.5**\n**新目标：90**\n保持现有仓位。",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        plan_text,
+    )
+
+
 def test_final_report_validator_rejects_missing_sections_and_process_text():
     issues = analyze._validate_final_report(
         "让我查询。\n## 核心判断\n**判断：观望偏空**\n**置信度：4/10**",
@@ -375,6 +385,40 @@ def test_final_report_validator_supports_pct_ladder_without_throwing():
     malformed = {"action": "hold", "scale_plan": [None]}
     issues = analyze._validate_final_report(report, "position_action", malformed)
     assert any("结构化条件触发计划字段无效" in issue for issue in issues)
+
+
+def test_final_report_validator_allows_full_exit_to_omit_zero_new_stop():
+    candidate = {
+        "action": "hold", "new_stop": 71.5, "new_target": 90,
+        "scale_plan": [
+            {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 0},
+            {"action": "add", "trigger_price": 79.0, "shares": 100, "new_stop": 73.0},
+        ],
+    }
+    report = _position_report_with_plan(
+        "- trim @ 71.5，比例 1.0\n- add @ 79.0，100 股，新止损 73.0"
+    )
+    assert analyze._validate_final_report(
+        report, "position_action", analyze._normalize_report_scale_plan(candidate),
+    ) == []
+
+
+def test_report_scale_plan_normalization_preserves_partial_trim_and_positive_stop():
+    candidate = {"scale_plan": [
+        {"action": "trim", "trigger_price": 80, "pct": 0.5, "new_stop": 0},
+        {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 70},
+    ]}
+    assert analyze._normalize_report_scale_plan(candidate) == candidate
+
+
+def test_ladder_mismatch_reports_expected_and_parsed_values():
+    candidate = {
+        "action": "hold", "new_stop": 71.5, "new_target": 90,
+        "scale_plan": [{"action": "add", "trigger_price": 79.0, "shares": 100}],
+    }
+    report = _position_report_with_plan("- add @ 80.0，100 股")
+    issues = analyze._validate_final_report(report, "position_action", candidate)
+    assert any("expected=" in issue and "parsed=" in issue for issue in issues)
 
 
 def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatch):
