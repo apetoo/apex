@@ -475,6 +475,25 @@ def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     assert any("当前有效目标与结构化结果不一致" in issue for issue in issues)
 
 
+def test_final_report_validator_requires_explicit_clear_ladder_statement():
+    """A clear effective state must report the removal, not silently omit its ladder."""
+    candidate = analyze._effective_position_report_candidate({
+        "action": "hold", "ladder_intent": "clear",
+        "effective_stop": 71.5, "effective_target": 90.0,
+        "effective_scale_plan": [],
+    })
+    report = _position_report_with_plan("条件触发计划已清空")
+
+    assert analyze._validate_final_report(report, "position_action", candidate) == []
+    assert any(
+        "ladder_intent=clear" in issue
+        for issue in analyze._validate_final_report(
+            _position_report_with_plan("本次不设置条件触发计划。"),
+            "position_action", candidate,
+        )
+    )
+
+
 def test_final_report_validator_compares_each_ladder_level_in_order():
     candidate = {
         "action": "hold", "scale_plan": [

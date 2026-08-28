@@ -2956,14 +2956,16 @@ def run(ts_code: str, save: bool = True, on_progress=None,
 
     draft_kind = graph_result.get("draft_kind")
     draft_data = dict(graph_result.get("draft_data") or {})
+    draft_proposal = dict(graph_result.get("draft_proposal") or {})
     verdict_data = draft_data if draft_kind == "verdict" else {}
-    position_action_data = draft_data if draft_kind == "position_action" else {}
+    position_action_proposal = draft_proposal if draft_kind == "position_action" else {}
+    position_action_effective = draft_data if draft_kind == "position_action" else {}
     searches_performed: list[str] = []
 
     # ── v1.1.0 双路径分支：持仓路径直接收尾，不走 calibration/24h 限幅 ──
-    if position_action_data:
+    if draft_kind == "position_action" and position_action_proposal and position_action_effective:
         return _finalize_position_action(
-            ts_code, position_action_data, analysis_text, events,
+            ts_code, position_action_proposal, position_action_effective, analysis_text, events,
             playstyle_feats, market_ctx, save, evidence_items=evidence_items,
             token_usage=token_usage,
         )
@@ -3351,14 +3353,16 @@ def _validate_position_action(
 
 def _finalize_position_action(
     ts_code: str,
-    position_action_data: dict,
+    proposal: dict,
+    effective: dict,
     analysis_text: str,
     events: list,
     playstyle_feats: dict,
     market_ctx: dict,
-    save: bool,
-    evidence_items: Optional[list[dict]] = None,
-    token_usage: Optional[dict] = None,
+    save: bool = True,
+    *,
+    evidence_items: list | None = None,
+    token_usage: dict | None = None,
 ) -> dict:
     """v1.1.0 持仓路径收尾：写 position_action journal entry + 刷新 active_positions.plan。
 
@@ -3392,14 +3396,19 @@ def _finalize_position_action(
         "analysis_status": "completed",
         "source": POSITION_ACTION_SOURCE,
         "position_action": {
-            "action": position_action_data.get("action"),
-            "add_shares": position_action_data.get("add_shares"),
-            "trim_shares": position_action_data.get("trim_shares"),
-            "trim_pct": position_action_data.get("trim_pct"),
-            "new_stop": position_action_data.get("new_stop"),
-            "new_target": position_action_data.get("new_target"),
-            "scale_plan": position_action_data.get("scale_plan") or [],
-            "rationale": position_action_data.get("rationale"),
+            "action": proposal.get("action"),
+            "add_shares": proposal.get("add_shares"),
+            "trim_shares": proposal.get("trim_shares"),
+            "trim_pct": proposal.get("trim_pct"),
+            # Keep legacy change fields as the proposal, while explicit effective
+            # metadata describes the state reviewed and reported this run.
+            "new_stop": proposal.get("new_stop"),
+            "new_target": proposal.get("new_target"),
+            "ladder_intent": proposal.get("ladder_intent"),
+            "effective_stop": effective.get("effective_stop"),
+            "effective_target": effective.get("effective_target"),
+            "scale_plan": effective.get("effective_scale_plan") or [],
+            "rationale": proposal.get("rationale"),
         },
         "analysis_text": analysis_text.strip(),
         "prompt_version": "3.0.0-langgraph",
@@ -3444,10 +3453,11 @@ def _finalize_position_action(
             else:
                 _n = len(_new_plan["scale_plan"])
                 print(f"✓ 已保存加减仓建议: {ts_code} -> {entry['position_action']['action']} (ladder {_n} 档)")
-                # B1: new_stop 直接覆盖持仓 stop_loss（AI 建议即生效，不等 B3 sim 执行）。
+                # Apply only an explicit proposal change. An inherited effective
+                # value is state for reporting/audit, not a fresh recommendation.
                 # update_plan 已把旧 stop 锁进 plan.last_stop_before，此处改 stop_loss 不影响 delta 展示。
-                _new_stop = entry["position_action"].get("new_stop")
-                if _new_stop is not None:
+                _new_stop = proposal.get("new_stop")
+                if "new_stop" in proposal and _new_stop is not None:
                     try:
                         _wl_fin.update_advice(ts_code, stop_loss=_new_stop, emit_notify=False)
                         print(f"✓ 已应用新止损: {ts_code} stop_loss -> {_new_stop}")
@@ -3455,9 +3465,9 @@ def _finalize_position_action(
                         print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止损未应用")
                     except Exception as e:
                         print(f"⚠ 新止损应用失败（不影响 journal/plan）: {e}")
-                # 同 new_stop：new_target 直接覆盖持仓 target（防化石止盈推送与 ladder 打架）。
-                _new_target = entry["position_action"].get("new_target")
-                if _new_target is not None:
+                # Same for target: apply the proposal, never an inherited value.
+                _new_target = proposal.get("new_target")
+                if "new_target" in proposal and _new_target is not None:
                     try:
                         _wl_fin.update_advice(ts_code, target=_new_target, emit_notify=False)
                         print(f"✓ 已应用新止盈: {ts_code} target -> {_new_target}")
