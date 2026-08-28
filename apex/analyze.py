@@ -1764,6 +1764,17 @@ def _normalize_report_scale_plan(candidate: dict) -> dict:
     return normalized
 
 
+def _effective_position_report_candidate(effective: dict) -> dict:
+    """Build the sole position-action state consumed by report generation."""
+    report_candidate = {
+        **dict(effective or {}),
+        "current_stop": (effective or {}).get("effective_stop"),
+        "current_target": (effective or {}).get("effective_target"),
+        "scale_plan": (effective or {}).get("effective_scale_plan") or [],
+    }
+    return _normalize_report_scale_plan(report_candidate)
+
+
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
@@ -1840,8 +1851,8 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                 break
         for field, label in (
             ("add_shares", "加仓股数"), ("trim_shares", "减仓股数"),
-            ("trim_pct", "减仓比例"), ("new_stop", "新止损"),
-            ("new_target", "新目标"),
+            ("trim_pct", "减仓比例"), ("current_stop", "当前有效止损"),
+            ("current_target", "当前有效目标"),
         ):
             value = candidate.get(field)
             _validate_labeled_number(text, label, value, issues)
@@ -1900,6 +1911,11 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                 "条件触发计划与结构化结果不一致："
                 f"expected={expected_plan!r}; parsed={parsed_plan!r}"
             )
+        if candidate.get("ladder_intent") == "clear":
+            if "条件触发计划已清空" not in plan_section:
+                issues.append("ladder_intent=clear 时必须明确说明条件触发计划已清空")
+            if parsed_plan:
+                issues.append("ladder_intent=clear 时条件触发计划不得包含档位")
     return issues
 
 
@@ -2392,7 +2408,9 @@ def _run_langgraph_loop(
         emit({"type": "status", "stage": "reviewing", "message": "正在进行独立复核"})
         compact = {
             "candidate_kind": state.get("draft_kind"),
-            "candidate": state.get("draft_data"),
+            "baseline": state.get("position_baseline") or {},
+            "proposal": state.get("draft_proposal") or {},
+            "effective": state.get("draft_data") or {},
             "evidence": state.get("evidence") or [],
             "gaps": state.get("gaps") or [],
             "safety_scan_status": state.get("safety_scan_status"),
@@ -2402,11 +2420,12 @@ def _run_langgraph_loop(
             "system_context": system_context,
         }
         review_system = (
-            "你是独立审稿人。只检查候选结论是否被给定证据支持、是否存在重大未知。"
+            "你是独立审稿人。只检查 effective 结论是否被给定证据支持、是否存在重大未知。"
             "system_context 是系统注入的确定性数据（行情/技术/大盘/情绪/持仓计划/历史判断），"
-            "视为已验证：候选引用其中数据时不必要求外部证据。"
-            "system_context 中的 ladder/止损是历史基线；candidate 的 new_stop、new_target、scale_plan "
-            "是本次拟议修改。数值不同本身不是冲突；只有缺少调整依据、违反风险约束或候选内部互相矛盾时才记录问题。"
+            "视为已验证：effective 引用其中数据时不必要求外部证据。"
+            "baseline 是冻结的历史持仓基线，proposal 是本次提交的拟议修改，effective 是唯一需判断的完整结果。"
+            "proposal 只能用来解释 effective 相对 baseline 的变化；数值不同本身不是冲突。"
+            "只有缺少调整依据、违反风险约束或 effective 内部互相矛盾时才记录问题。"
             "rework 仅用于影响结论方向的重大外部事实主张无支撑；"
             "技术指标等次要出入记入 issues 但不应单独导致 rework。"
             "不得补造事实。只输出 JSON: {outcome: pass|rework|abstain, "
@@ -2461,7 +2480,7 @@ def _run_langgraph_loop(
         update = {"review_outcome": outcome, "review_issues": issues}
         if outcome == "revise":
             update.update({
-                "draft_kind": "", "draft_data": {},
+                "draft_kind": "", "draft_data": {}, "draft_proposal": {},
                 "review_revision_count": revision_count + 1,
                 "messages": [*(state.get("messages") or []), {
                     "role": "user",
@@ -2485,7 +2504,7 @@ def _run_langgraph_loop(
             })
         if outcome == "rework":
             update.update({
-                "draft_kind": "", "draft_data": {},
+                "draft_kind": "", "draft_data": {}, "draft_proposal": {},
                 "messages": [*(state.get("messages") or []), {
                     "role": "user", "content": "独立复核要求定向补证：" + "；".join(issues),
                 }],
@@ -2502,7 +2521,7 @@ def _run_langgraph_loop(
             candidate = dict(candidate or {})
             finalization_metadata = dict(finalization_metadata or {})
         if kind == "position_action":
-            candidate = _normalize_report_scale_plan(candidate)
+            candidate = _effective_position_report_candidate(candidate)
             heading_contract = "\n".join(_POSITION_REPORT_SECTIONS)
             ladder_contract = (
                 "每个 scale_plan 档必须写成 `- <action> @ <trigger_price>，<shares> 股`；"
@@ -2517,11 +2536,16 @@ def _run_langgraph_loop(
                 "持仓动作报告必须依次包含这些标题：\n"
                 + heading_contract + "\n\n"
                 "核心判断和当前持仓动作章节都必须逐字写出 `**当前动作：<action>**`。"
-                "candidate 中非空的动作字段必须使用这些标签逐字写出："
+                "effective 中非空的当前动作字段必须使用这些标签逐字写出："
                 "`**加仓股数：<add_shares>**`、`**减仓股数：<trim_shares>**`、"
-                "`**减仓比例：<trim_pct>**`、`**新止损：<new_stop>**`、`**新目标：<new_target>**`。"
+                "`**减仓比例：<trim_pct>**`、`**当前有效止损：<current_stop>**`、"
+                "`**当前有效目标：<current_target>**`。"
                 + ladder_contract
                 + "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
+                + (
+                    "ladder_intent=clear：必须写出“条件触发计划已清空”，且不得列出任何档位。"
+                    if candidate.get("ladder_intent") == "clear" else ""
+                )
             )
         else:
             heading_contract = "\n".join(_VERDICT_REPORT_SECTIONS)
@@ -2545,15 +2569,21 @@ def _run_langgraph_loop(
         ]
         authoritative_context = {
             "kind": kind,
-            "candidate": candidate,
             "confirmed_evidence": confirmed_evidence,
             "research_thesis": controller.thesis,
             "gaps": list(state.get("gaps") or []),
             "unknowns": list(state.get("unknowns") or []),
             "review_outcome": state.get("review_outcome"),
             "review_issues": list(state.get("review_issues") or []),
-            "system_context": system_context,
         }
+        if kind == "position_action":
+            authoritative_context.update({
+                "effective": candidate,
+                "baseline_for_change_explanation": state.get("position_baseline") or {},
+            })
+        else:
+            authoritative_context["candidate"] = candidate
+            authoritative_context["system_context"] = system_context
         report_contract = (
             "你是 Apex 的正式投资分析报告编辑。候选结论已经完成证据门控和独立复核，"
             "你只能解释它，不得改变其中任何机器字段。基于给定对话、工具结果、证据和候选结论，"
@@ -2562,8 +2592,14 @@ def _run_langgraph_loop(
             + "基本面分析必须引用具体营收、利润、现金流、ROE、负债或估值数据；数据未知就明确写未知，禁止编造。"
             "多头和空头各至少三条，格式为数据点 → 推论；裁判必须比较双方最硬证据。"
             "评分和置信度调整必须列出计算过程。操作建议必须与最终方向及价格建议一致。\n\n"
-            "以下是正式报告的权威上下文。confirmed_evidence 与 system_context 视为已验证；"
-            "原始对话中的未收录材料不得覆盖它。candidate 是不可修改的最终机器结果：\n"
+            "以下是正式报告的权威上下文。confirmed_evidence"
+            + (" 与 system_context" if kind != "position_action" else "")
+            + " 视为已验证；"
+            "原始对话中的未收录材料不得覆盖它。"
+            + (
+                "effective 是不可修改的最终机器结果；baseline_for_change_explanation 只可解释变化，绝不可作为另一份结果。\n"
+                if kind == "position_action" else "candidate 是不可修改的最终机器结果：\n"
+            )
             + json.dumps(authoritative_context, ensure_ascii=False, sort_keys=True)
         )
         issues: list[str] = []

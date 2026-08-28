@@ -156,6 +156,85 @@ def test_accepted_position_action_stores_adapted_proposal_and_effective_draft(mo
     assert len(result["draft_data"]["effective_scale_plan"]) == 2
 
 
+def _held_000977_with_two_level_plan():
+    return {
+        "ts_code": "000977.SZ", "entry_price": 77.095,
+        "position_size_shares": 200, "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [
+            {"level": 1, "action": "trim", "trigger_price": 71.5,
+             "pct": 1.0, "reason": "防守退出"},
+            {"level": 2, "action": "add", "trigger_price": 79.0,
+             "shares": 100, "new_stop": 73.0, "reason": "突破确认"},
+        ]},
+    }
+
+
+def _effective_position_report():
+    return _complete_position_report().replace(
+        "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：hold**\n**当前有效止损：71.5**\n**当前有效目标：90.0**",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "- trim @ 71.5，比例 1.0\n- add @ 79.0，100 股，新止损 73.0",
+    )
+
+
+def test_000977_revision_preserves_effective_plan_for_report(monkeypatch):
+    baseline = _held_000977_with_two_level_plan()
+    first = {
+        "action": "hold", "new_stop": 73.0, "new_target": 90.0,
+        "ladder_intent": "replace", "scale_plan": [
+            {"level": 1, "action": "trim", "trigger_price": 73.0, "pct": 1.0},
+            {"level": 2, "action": "add", "trigger_price": 79.0,
+             "shares": 100, "new_stop": 74.0},
+        ],
+        "rationale": "上移止损",
+    }
+    second_legacy = {"action": "hold", "scale_plan": [], "rationale": "维持原计划"}
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "维持持仓", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=first),
+        _response(content=json.dumps({
+            "outcome": "pass", "issues": [
+                {"message": "技术描述需修订", "severity": "minor", "blocking": False},
+            ],
+        }, ensure_ascii=False)),
+        _response(tool_name="record_position_action", arguments=second_legacy),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_effective_position_report()),
+    ])
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [baseline]})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({"results": [{
+        "title": "浪潮信息公告", "snippet": "未见新增重大风险", "url": "https://www.cninfo.com.cn/scan",
+        "date": "2026-08-25", "site": "巨潮资讯", "source_tier": 1,
+        "entity_matched": True, "freshness_status": "current",
+    }]}))
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 78.27})
+    monkeypatch.setattr(analyze.journal, "load_position_actions", lambda _code: [])
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake", messages=[],
+        max_iter=12, emit=lambda _event: None, position_baseline=baseline,
+    )
+    assert result["analysis_status"] == "completed"
+    assert result["draft_data"]["effective_stop"] == 71.5
+    assert result["draft_data"]["effective_target"] == 90.0
+    assert len(result["draft_data"]["effective_scale_plan"]) == 2
+    review_prompt = next(
+        call["messages"][-1]["content"]
+        for call in client.calls
+        if call["messages"] and isinstance(call["messages"][0], dict)
+        and call["messages"][0]["role"] == "system"
+        and "独立审稿人" in call["messages"][0]["content"]
+    )
+    assert '"baseline"' in review_prompt
+    assert '"proposal"' in review_prompt
+    assert '"effective"' in review_prompt
+    report_prompt = client.calls[-1]["messages"][-1]["content"]
+    assert "effective 是不可修改的最终机器结果" in report_prompt
+
+
 def test_held_position_prompt_requires_explicit_preserve_replace_or_clear_intent():
     prompt = analyze._format_held_ladder_block({
         "ts_code": "000977.SZ", "entry_price": 77.095,
@@ -265,7 +344,7 @@ def _complete_position_report(*, action="hold"):
 def _position_report_with_plan(plan_text: str) -> str:
     return _complete_position_report().replace(
         "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
-        "**当前动作：hold**\n**新止损：71.5**\n**新目标：90**\n保持现有仓位。",
+        "**当前动作：hold**\n**当前有效止损：71.5**\n**当前有效目标：90**\n保持现有仓位。",
     ).replace(
         "价格满足计划条件后才执行未来动作，当前不提前交易。",
         plan_text,
@@ -357,27 +436,28 @@ def test_final_report_validator_enforces_position_action_contract():
 def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     report = _complete_position_report().replace(
         "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
-        "**当前动作：hold**\n**新止损：4.8**\n**新目标：7.5**\n保持现有仓位。",
+        "**当前动作：hold**\n**当前有效止损：4.8**\n**当前有效目标：7.5**\n保持现有仓位。",
     ).replace(
         "价格满足计划条件后才执行未来动作，当前不提前交易。",
         "- add @ 5.2，100 股，新止损 4.9；价格触发后才执行。",
     )
     candidate = {
-        "action": "hold", "new_stop": 4.8, "new_target": 7.5,
-        "scale_plan": [{
+        "action": "hold", "effective_stop": 4.8, "effective_target": 7.5,
+        "effective_scale_plan": [{
             "action": "add", "trigger_price": 5.2, "shares": 100,
             "new_stop": 4.9, "reason": "突破确认",
         }],
         "rationale": "保持仓位",
     }
+    candidate = analyze._effective_position_report_candidate(candidate)
 
     assert analyze._validate_final_report(report, "position_action", candidate) == []
 
     issues = analyze._validate_final_report(
-        report.replace("**新止损：4.8**", "**新止损：4.2**"),
+        report.replace("**当前有效止损：4.8**", "**当前有效止损：4.2**"),
         "position_action", candidate,
     )
-    assert any("新止损与结构化结果不一致" in issue for issue in issues)
+    assert any("当前有效止损与结构化结果不一致" in issue for issue in issues)
 
     issues = analyze._validate_final_report(
         report + "\n**当前动作：add**", "position_action", candidate,
@@ -390,9 +470,9 @@ def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     assert any("当前指令与结构化动作不一致" in issue for issue in issues)
 
     issues = analyze._validate_final_report(
-        report + "\n**新目标：7.2**", "position_action", candidate,
+        report + "\n**当前有效目标：7.2**", "position_action", candidate,
     )
-    assert any("新目标与结构化结果不一致" in issue for issue in issues)
+    assert any("当前有效目标与结构化结果不一致" in issue for issue in issues)
 
 
 def test_final_report_validator_compares_each_ladder_level_in_order():
@@ -461,8 +541,8 @@ def test_final_report_validator_supports_pct_ladder_without_throwing():
 
 def test_final_report_validator_allows_full_exit_to_omit_zero_new_stop():
     candidate = {
-        "action": "hold", "new_stop": 71.5, "new_target": 90,
-        "scale_plan": [
+        "action": "hold", "effective_stop": 71.5, "effective_target": 90,
+        "effective_scale_plan": [
             {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 0},
             {"action": "add", "trigger_price": 79.0, "shares": 100, "new_stop": 73.0},
         ],
@@ -471,7 +551,7 @@ def test_final_report_validator_allows_full_exit_to_omit_zero_new_stop():
         "- trim @ 71.5，比例 1.0\n- add @ 79.0，100 股，新止损 73.0"
     )
     assert analyze._validate_final_report(
-        report, "position_action", analyze._normalize_report_scale_plan(candidate),
+        report, "position_action", analyze._effective_position_report_candidate(candidate),
     ) == []
 
 
@@ -1025,7 +1105,11 @@ def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
         _response(content=json.dumps({"outcome": "abstain", "issues": [minor]}, ensure_ascii=False)),
         _response(content=_complete_position_report().replace(
             "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
-            "**当前动作：hold**\n**新止损：73.0**\nMA60 上行后抬升防守位。",
+            "**当前动作：hold**\n**当前有效止损：73.0**\n"
+            "**当前有效目标：90.0**\nMA60 上行后抬升防守位。",
+        ).replace(
+            "价格满足计划条件后才执行未来动作，当前不提前交易。",
+            "- trim @ 82.0，100 股，新止损 71.5",
         )),
     ])
     monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
@@ -1049,6 +1133,7 @@ def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
             "当前 ladder（历史基线）：L1 trim @ 82.0 -> new_stop 71.5；"
             "当前止损 71.5。"
         ),
+        position_baseline=held,
     )
 
     assert result["analysis_status"] == "completed"
@@ -1060,8 +1145,9 @@ def test_minor_reviewer_abstention_after_revision_for_000977(monkeypatch):
         if call["messages"][0]["role"] == "system"
         and "独立审稿人" in call["messages"][0]["content"]
     )
-    assert "ladder/止损是历史基线" in review_prompt
-    assert "new_stop、new_target、scale_plan 是本次拟议修改" in review_prompt
+    assert "baseline 是冻结的历史持仓基线" in review_prompt
+    assert "proposal 是本次提交的拟议修改" in review_prompt
+    assert "effective 是唯一需判断的完整结果" in review_prompt
 
 
 def test_reviewer_first_material_abstention_revises_then_passes(monkeypatch):
