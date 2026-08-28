@@ -1097,7 +1097,7 @@ def _resolve_industries_batch(ts_codes: list[str]) -> dict[str, str]:
 def _format_held_ladder_block(held: dict, ts_code: str) -> str:
     """v1.1.0 OV#6: 候选已被持有 -> 注入当前 ladder 快照 + 指示调 record_position_action（非 record_verdict）。
 
-    AI 拿到当前 ladder 才能「演进而非替换」；未触发 level 保留，可新增/调整。
+    当前 ladder 是冻结基线；模型必须显式选择 preserve、replace 或 clear。
     """
     shares = held.get("position_size_shares")
     avg = held.get("avg_cost") or held.get("entry_price")
@@ -1109,21 +1109,28 @@ def _format_held_ladder_block(held: dict, ts_code: str) -> str:
         f"## ⚠ 你已持有 {ts_code}（{held.get('name', '')}）",
         f"当前持仓：{shares}股 @ {avg}，止损 {stop}，目标 {target}。",
         "**本次是重新分析已持仓票，必须调 `record_position_action` 给加减仓建议**"
-        "（action=hold/add/trim/exit + 对应股数/比例 + new_stop + 完整 scale_plan ladder），"
+        "（action=hold/add/trim/exit + 对应股数/比例 + new_stop + ladder_intent），"
         "调 `record_verdict` 会被系统拒绝。",
     ]
     if scale_plan:
-        parts.append("当前 ladder（演进，非替换；未触发 level 保留，可新增/调整）：")
+        parts.append("当前 ladder（冻结基线，供本次显式选择）：")
         for item in scale_plan:
             tag = "✓已触发" if item.get("executed") else "待触发"
             parts.append(
                 f"- L{item.get('level', '?')} {item.get('action', '?')} @ {item.get('trigger_price')} "
                 f"-> new_stop {item.get('new_stop')}（{tag}）{item.get('reason', '')}"
             )
+        parts.append(
+            "ladder_intent 必填：preserve：不提交 scale_plan，保留上述完整 ladder；"
+            "replace：提交完整的期望 ladder（会整体替换当前计划，不得只提交新增或调整档）；"
+            "clear：明确清空 ladder，不提交 scale_plan。"
+        )
     else:
         parts.append(
-            "当前 ladder 为空（首次重新分析）：请在 scale_plan 给出完整加减仓计划"
-            "（首加/首减触发价 + 止损上移节奏 + 减仓比例，锚定当前 stop/target）。"
+            "当前 ladder 为空（首次重新分析）。ladder_intent 必填："
+            "replace：提交完整的非空 scale_plan（首加/首减触发价 + 止损上移节奏 + 减仓比例，锚定当前 stop/target）；"
+            "preserve：保持空 ladder，不提交 scale_plan；"
+            "clear：明确清空 ladder，不提交 scale_plan。"
         )
     return "\n".join(parts)
 

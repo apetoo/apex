@@ -156,6 +156,36 @@ def test_accepted_position_action_stores_adapted_proposal_and_effective_draft(mo
     assert len(result["draft_data"]["effective_scale_plan"]) == 2
 
 
+def test_held_position_prompt_requires_explicit_preserve_replace_or_clear_intent():
+    prompt = analyze._format_held_ladder_block({
+        "ts_code": "000977.SZ", "entry_price": 77.095,
+        "position_size_shares": 200, "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [{"level": 1, "action": "trim", "trigger_price": 71.5, "pct": 1.0}]},
+    }, "000977.SZ")
+
+    assert "ladder_intent 必填" in prompt
+    assert "preserve：不提交 scale_plan" in prompt
+    assert "replace：提交完整的期望 ladder" in prompt
+    assert "clear：明确清空 ladder，不提交 scale_plan" in prompt
+    assert "演进，非替换" not in prompt
+
+
+def test_empty_position_ladder_prompt_and_schema_require_explicit_intent():
+    prompt = analyze._format_held_ladder_block({
+        "ts_code": "000977.SZ", "entry_price": 77.095,
+        "position_size_shares": 200, "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": []},
+    }, "000977.SZ")
+    schema = next(tool["function"] for tool in analyze.TOOLS
+                  if tool["function"]["name"] == "record_position_action")["parameters"]
+
+    assert "ladder_intent 必填" in prompt
+    assert "replace：提交完整的非空 scale_plan" in prompt
+    assert "preserve：保持空 ladder，不提交 scale_plan" in prompt
+    assert schema["properties"]["ladder_intent"]["enum"] == ["preserve", "replace", "clear"]
+    assert "ladder_intent" in schema["required"]
+
+
 def _multi_tool_response(calls):
     tool_calls = [SimpleNamespace(
         id=f"call-{index}-{name}",
