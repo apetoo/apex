@@ -5,7 +5,7 @@
 """
 from datetime import datetime, timedelta, timezone
 
-from apex import journal, watchlist
+from apex import analyze, journal, watchlist
 from apex.analyze import _validate_position_action
 from apex.schemas import POSITION_ACTION_SOURCE
 
@@ -15,6 +15,60 @@ _TZ = timezone(timedelta(hours=8))
 def _add(ts_code="002050.SZ", shares=1000):
     return watchlist.add_position(ts_code, "test", 12.0, 11.0, 14.0,
                                  position_size_shares=shares)
+
+
+def _held_position_with_plan():
+    return {
+        "ts_code": "000977.SZ", "entry_price": 77.095,
+        "position_size_shares": 200, "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [
+            {"level": 1, "action": "trim", "trigger_price": 71.5,
+             "pct": 1.0, "reason": "防守退出"},
+            {"level": 2, "action": "add", "trigger_price": 79.0,
+             "shares": 100, "new_stop": 73.0, "reason": "突破确认"},
+        ]},
+    }
+
+
+def _add_held_position_with_plan():
+    baseline = _held_position_with_plan()
+    watchlist.add_position(
+        baseline["ts_code"], "test", baseline["entry_price"], baseline["stop_loss"],
+        baseline["target"], position_size_shares=baseline["position_size_shares"],
+    )
+    watchlist.update_plan(baseline["ts_code"], baseline["plan"])
+    return baseline
+
+
+def test_legacy_empty_ladder_preserves_baseline_in_effective_candidate(isolated_paths):
+    baseline = _add_held_position_with_plan()
+
+    proposal, effective, blockers = analyze._prepare_position_action_candidate(
+        {"action": "hold", "scale_plan": [], "rationale": "维持原计划"},
+        baseline, "000977.SZ", 78.27,
+    )
+
+    assert blockers == []
+    assert proposal["ladder_intent"] == "preserve"
+    assert effective["effective_stop"] == 71.5
+    assert effective["effective_target"] == 90.0
+    assert len(effective["effective_scale_plan"]) == 2
+
+
+def test_explicit_clear_and_replace_are_validated_before_review(isolated_paths):
+    _add_held_position_with_plan()
+
+    _, _, clear_blockers = analyze._prepare_position_action_candidate(
+        {"action": "hold", "ladder_intent": "clear", "rationale": "取消条件单"},
+        _held_position_with_plan(), "000977.SZ", 78.27,
+    )
+    _, _, invalid_blockers = analyze._prepare_position_action_candidate(
+        {"action": "hold", "ladder_intent": "replace", "scale_plan": []},
+        _held_position_with_plan(), "000977.SZ", 78.27,
+    )
+
+    assert clear_blockers == []
+    assert any("清空请使用 clear" in item for item in invalid_blockers)
 
 
 def _write_prior_pa(ts_code, hours_ago):

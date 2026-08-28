@@ -27,6 +27,8 @@ class AnalysisGraphState(TypedDict, total=False):
     analysis_text: str
     draft_kind: str
     draft_data: dict[str, Any]
+    position_baseline: dict[str, Any]
+    draft_proposal: dict[str, Any]
     model_iterations: int
     unknowns: list[str]
     attempted_tools: list[str]

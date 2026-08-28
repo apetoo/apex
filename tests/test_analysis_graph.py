@@ -114,6 +114,48 @@ class _FakeClient:
         return response
 
 
+def test_accepted_position_action_stores_adapted_proposal_and_effective_draft(monkeypatch):
+    baseline = {
+        "ts_code": "000977.SZ", "entry_price": 77.095,
+        "position_size_shares": 200, "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [
+            {"level": 1, "action": "trim", "trigger_price": 71.5, "pct": 1.0},
+            {"level": 2, "action": "add", "trigger_price": 79.0, "shares": 100,
+             "new_stop": 73.0},
+        ]},
+    }
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "维持持仓", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments={
+            "action": "hold", "scale_plan": [], "rationale": "维持原计划",
+        }),
+        _response(content=json.dumps({"outcome": "abstain", "issues": []}, ensure_ascii=False)),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
+        "results": [{
+            "title": "浪潮信息公告", "snippet": "未见新增重大风险", "url": "https://www.cninfo.com.cn/scan",
+            "date": "2026-08-25", "site": "巨潮资讯", "source_tier": 1,
+            "entity_matched": True, "freshness_status": "current",
+        }],
+    }))
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 78.27})
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [baseline]})
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12,
+        emit=lambda _event: None, position_baseline=baseline,
+    )
+
+    assert result["draft_proposal"]["ladder_intent"] == "preserve"
+    assert result["draft_data"]["effective_stop"] == 71.5
+    assert result["draft_data"]["effective_target"] == 90.0
+    assert len(result["draft_data"]["effective_scale_plan"]) == 2
+
+
 def _multi_tool_response(calls):
     tool_calls = [SimpleNamespace(
         id=f"call-{index}-{name}",

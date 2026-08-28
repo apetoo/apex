@@ -5,6 +5,7 @@ The AI autonomously calls data tools, then records verdict via record_verdict to
 import json
 import math
 import re
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -23,6 +24,11 @@ from apex.schemas import (
 from apex.analysis_graph import GraphHandlers, build_analysis_graph
 from apex.evidence import classify_evidence_type, entity_matches, make_evidence_item, source_tier
 from apex.evidence_control import EvidenceController
+from apex.position_action_state import (
+    adapt_legacy_proposal,
+    materialize_effective_position_plan,
+    validate_proposal_shape,
+)
 
 
 class AnalysisError(Exception):
@@ -437,7 +443,8 @@ TOOLS = [
             "description": (
                 "记录已持仓票的加减仓建议。重新分析一只**你已持有**的票时调此工具；未持仓的票调 record_verdict（调错会被系统拒绝）。"
                 "action=add 必填 add_shares(>0)；action=trim 二选一 trim_shares 或 trim_pct(0-1]；action=exit/hold 可只给 new_stop。"
-                "scale_plan 给完整 ladder（演进当前 ladder，非替换：未触发 level 保留，可新增/调整 level/trigger/new_stop）。"
+                "ladder_intent 必填且只能是 preserve、replace 或 clear：preserve 保留现有 ladder 且不得提交 scale_plan；"
+                "replace 必须提交完整非空 scale_plan；clear 明确清空现有 ladder 且不得提交 scale_plan。"
                 "系统会按价格顺序模拟执行 ladder 并拒绝不自洽路径：下行路径（现价往下）必须单一意图——纯回踩加仓或纯防守减仓，先卖后买/先买后卖是 churn（两档若互斥请合并为单一防守档或拉开到不同情景）；上行路径先加后减（金字塔），trim 之后不得再有 add；trim 低于有效止损（含路径内止损上移后的新止损）是死档；add ≥ 有效止盈价是自相矛盾（用 new_target 上移止盈修复）。"
                 "target 是建仓时的一次性字段，价格观上移时必须用 new_target 同步止盈，否则化石止盈（monitor 推送）会与 ladder 打架。"
                 "rationale 是机器可读摘要，完整推理写进分析文本。"
@@ -453,9 +460,13 @@ TOOLS = [
                     "trim_pct": {"type": "number", "description": "action=trim 二选一，减仓比例 0-1（如 0.33=减1/3）"},
                     "new_stop": {"type": "number", "description": "止损上移建议（add/hold 常带，advisory）"},
                     "new_target": {"type": "number", "description": "止盈价上移建议（hold/add 常带；价格观演进时同步 target，防化石止盈推送与 ladder 冲突）"},
+                    "ladder_intent": {
+                        "type": "string", "enum": ["preserve", "replace", "clear"],
+                        "description": "preserve=保留现有 ladder；replace=用完整 scale_plan 替换；clear=明确清空 ladder",
+                    },
                     "scale_plan": {
                         "type": "array",
-                        "description": "完整 ladder 计划（演进当前 ladder，非替换）",
+                        "description": "仅 ladder_intent=replace 时提交的完整非空 ladder 计划",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -476,7 +487,7 @@ TOOLS = [
                         "description": "本次相比上次 position_action 的新增信息（4h 内重复时据此豁免反 churn 速率限制）",
                     },
                 },
-                "required": ["action", "rationale"],
+                "required": ["action", "rationale", "ladder_intent"],
             },
         },
     },
@@ -1117,7 +1128,9 @@ def _format_held_ladder_block(held: dict, ts_code: str) -> str:
     return "\n".join(parts)
 
 
-def _format_portfolio_context(candidate_ts_code: str) -> str:
+def _format_portfolio_context(
+    candidate_ts_code: str, position_baseline: dict | None = None,
+) -> str:
     """B7：当前持仓上下文，注入用户 prompt 让 AI 知道行业集中度 / 总风险。"""
     try:
         from apex import watchlist as _wl
@@ -1161,7 +1174,9 @@ def _format_portfolio_context(candidate_ts_code: str) -> str:
             and candidate_industry and candidate_industry != "未知"
         ]
 
-        held = next((p for p in positions if p.get("ts_code") == candidate_ts_code), None)
+        held = position_baseline if position_baseline and position_baseline.get("ts_code") == candidate_ts_code else next(
+            (p for p in positions if p.get("ts_code") == candidate_ts_code), None
+        )
         lines = [
             f"## 你的当前持仓上下文（{len(positions)} 只）",
             f"- 行业分布：{ind_dist}",
@@ -1988,6 +2003,7 @@ def _run_langgraph_loop(
     *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
     system_context: str = "",
     finalize_candidate: Callable[[str, dict], tuple[dict, dict]] | None = None,
+    position_baseline: dict | None = None,
 ) -> dict:
     """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
     controller = EvidenceController()
@@ -2005,6 +2021,7 @@ def _run_langgraph_loop(
         return {
             "messages": list(messages), "analysis_text": "", "model_iterations": 0,
             "research_rounds": 0, "evidence": [], "gaps": [],
+            "position_baseline": deepcopy(position_baseline or {}), "draft_proposal": {},
         }
 
     def safety_scan(state):
@@ -2158,27 +2175,13 @@ def _run_langgraph_loop(
             held = False
         if name == "record_verdict" and held:
             blockers.append("已持仓票必须提交 position_action")
-        if name == "record_position_action":
-            scale_plan = tool_input.get("scale_plan", [])
-            if not isinstance(scale_plan, list):
-                blockers.append("scale_plan 必须是数组。")
-            elif any(not isinstance(level, dict) for level in scale_plan):
-                blockers.append("scale_plan 每一档必须是对象。")
-            current_price = None
-            try:
-                current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
-            except Exception:
-                pass
-            pa_reasons, _ = _validate_position_action(
-                tool_input, ts_code, [], current_price=current_price,
-            )
-            blockers.extend(pa_reasons)
         return blockers
 
     def execute_tools(state):
         appended = list(state.get("messages") or [])
         draft_kind = state.get("draft_kind") or ""
         draft_data = dict(state.get("draft_data") or {})
+        draft_proposal = dict(state.get("draft_proposal") or {})
         for tool_call in state.get("pending_tools") or []:
             name = tool_call.function.name
             try:
@@ -2216,11 +2219,23 @@ def _run_langgraph_loop(
                 }, ensure_ascii=False)
             elif name in {"record_verdict", "record_position_action"}:
                 blockers = _candidate_blockers(name, tool_input)
+                proposal, effective = {}, {}
+                if name == "record_position_action":
+                    current_price = None
+                    try:
+                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                    except Exception:
+                        pass
+                    proposal, effective, position_blockers = _prepare_position_action_candidate(
+                        tool_input, dict(state.get("position_baseline") or {}), ts_code, current_price,
+                    )
+                    blockers.extend(position_blockers)
                 if blockers:
                     result = json.dumps({"error": "；".join(blockers)}, ensure_ascii=False)
                 else:
                     draft_kind = "verdict" if name == "record_verdict" else "position_action"
-                    draft_data = tool_input
+                    draft_data = effective if name == "record_position_action" else tool_input
+                    draft_proposal = proposal if name == "record_position_action" else {}
                     result = "candidate recorded; pending independent review"
             else:
                 stop = controller.should_stop()
@@ -2247,7 +2262,7 @@ def _run_langgraph_loop(
             appended.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
         return {
             "messages": appended, "pending_tools": [],
-            "draft_kind": draft_kind, "draft_data": draft_data,
+            "draft_kind": draft_kind, "draft_data": draft_data, "draft_proposal": draft_proposal,
             "evidence": list(controller.evidence.values()),
             "gaps": list(controller.gaps), "research_rounds": controller.research_rounds,
         }
@@ -2332,12 +2347,25 @@ def _run_langgraph_loop(
                     continue
                 candidate = json.loads(calls[0].function.arguments or "{}")
                 blockers = _candidate_blockers(tool_name, candidate)
+                proposal, effective = {}, {}
+                if tool_name == "record_position_action":
+                    current_price = None
+                    try:
+                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                    except Exception:
+                        pass
+                    proposal, effective, position_blockers = _prepare_position_action_candidate(
+                        candidate, dict(state.get("position_baseline") or {}), ts_code, current_price,
+                    )
+                    blockers.extend(position_blockers)
                 if blockers:
                     failure = "；".join(blockers)
                     continue
                 return {
                     "draft_kind": "position_action" if held else "verdict",
-                    "draft_data": candidate, "draft_route": "review",
+                    "draft_data": effective if tool_name == "record_position_action" else candidate,
+                    "draft_proposal": proposal if tool_name == "record_position_action" else {},
+                    "draft_route": "review",
                 }
             except Exception as exc:
                 failure = str(exc)
@@ -2670,7 +2698,16 @@ def run(ts_code: str, save: bool = True, on_progress=None,
     history_block = _format_history(
         history_entries, ts_code=ts_code, limit=history_limit,
     )
-    portfolio_block = _format_portfolio_context(ts_code)
+    try:
+        from apex import watchlist as _wl_run
+        position_baseline = deepcopy(next(
+            (position for position in _wl_run.load().get("active_positions", [])
+             if position.get("ts_code") == ts_code),
+            {},
+        ))
+    except Exception:
+        position_baseline = {}
+    portfolio_block = _format_portfolio_context(ts_code, position_baseline)
     intraday_block, intraday_ctx = _format_intraday_block(ts_code)
     market_block, market_ctx = _format_market_context(ts_code)
     # 把盘中走势快照并入 market_context，事后复盘一处看全
@@ -2831,6 +2868,7 @@ def run(ts_code: str, save: bool = True, on_progress=None,
             _finalize_verdict_candidate(candidate, history_entries)
             if kind == "verdict" else (dict(candidate), {})
         ),
+        position_baseline=position_baseline,
     )
     analysis_text = str(graph_result.get("analysis_text") or "")
     evidence_items = list(graph_result.get("evidence") or [])
@@ -3132,6 +3170,27 @@ def _simulate_ladder(
             )
 
     return rejects, advisories
+
+
+def _prepare_position_action_candidate(
+    tool_input: dict, baseline: dict, ts_code: str, current_price,
+) -> tuple[dict, dict, list[str]]:
+    """Adapt, materialize, and business-validate one position-action proposal."""
+    proposal = adapt_legacy_proposal(tool_input)
+    shape_issues = validate_proposal_shape(proposal)
+    if shape_issues:
+        return proposal, {}, shape_issues
+    effective = materialize_effective_position_plan(baseline, proposal)
+    validation_input = {
+        **proposal,
+        "new_stop": effective["effective_stop"],
+        "new_target": effective["effective_target"],
+        "scale_plan": effective["effective_scale_plan"],
+    }
+    reasons, _ = _validate_position_action(
+        validation_input, ts_code, [], current_price=current_price,
+    )
+    return proposal, effective, reasons
 
 
 def _validate_position_action(
