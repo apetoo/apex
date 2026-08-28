@@ -1,5 +1,6 @@
 """Manage ~/.stock-watchlist/watchlist.json: positions, candidates, archive."""
 import json
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -191,7 +192,7 @@ def migrate_and_backfill() -> dict:
 
 
 def _empty_plan() -> dict:
-    """空 ladder 快照（开仓时初始化）。AI 首次重新分析时填充 scale_plan，演进而非替换。
+    """空 ladder 快照（开仓时初始化）。后续分析按 ladder_intent 物化完整有效 scale_plan。
     B1 单一默认 doctrine（不分桶）；B2 playstyle 分桶后 doctrine 值变化。
     last_action/last_new_stop/last_stop_before 开仓时全 None（尚无 position_action）。"""
     return {
@@ -309,6 +310,47 @@ def update_plan(ts_code: str, plan: dict) -> Optional[dict]:
             p["plan"] = plan_to_write
             _save(data)
             return p
+    return None
+
+
+def apply_position_action_if_unchanged(
+    ts_code: str,
+    baseline: dict,
+    *,
+    plan: dict,
+    effective_stop: Optional[float],
+    effective_target: Optional[float],
+) -> Optional[dict]:
+    """Compare a frozen trading baseline and apply one complete position action in one update.
+
+    The comparison and replacement deliberately share a single loaded watchlist
+    document, so a changed ladder cannot pass a separate preflight check and be
+    replaced later.  ``None`` means the position was closed or any trading
+    field changed after analysis; no document is saved in that case.
+    """
+    from apex.position_action_state import position_trading_fingerprint
+
+    expected = position_trading_fingerprint(baseline)
+    if not isinstance(baseline, dict) or baseline.get("ts_code") != ts_code:
+        return None
+    data = _load()
+    for position in data["active_positions"]:
+        if position.get("ts_code") != ts_code:
+            continue
+        if expected is None or position_trading_fingerprint(position) != expected:
+            return None
+
+        prior_stop = position.get("stop_loss")
+        plan_to_write = deepcopy(plan)
+        if plan_to_write.get("last_action") is not None and "last_stop_before" not in plan_to_write:
+            plan_to_write["last_stop_before"] = prior_stop
+        position["plan"] = plan_to_write
+        if effective_stop is not None:
+            position["stop_loss"] = float(effective_stop)
+        if effective_target is not None:
+            position["target"] = float(effective_target)
+        _save(data)
+        return position
     return None
 
 

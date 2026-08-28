@@ -458,26 +458,38 @@ TOOLS = [
                     "add_shares": {"type": "integer", "description": "action=add 必填，加仓股数(>0)"},
                     "trim_shares": {"type": "integer", "description": "action=trim 二选一，减仓股数(>0)"},
                     "trim_pct": {"type": "number", "description": "action=trim 二选一，减仓比例 0-1（如 0.33=减1/3）"},
-                    "new_stop": {"type": "number", "description": "止损上移建议（add/hold 常带，advisory）"},
-                    "new_target": {"type": "number", "description": "止盈价上移建议（hold/add 常带；价格观演进时同步 target，防化石止盈推送与 ladder 冲突）"},
+                    "new_stop": {
+                        "anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}],
+                        "description": "正数止损替换建议；null 表示保持现有止损",
+                    },
+                    "new_target": {
+                        "anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}],
+                        "description": "正数止盈替换建议；null 表示保持现有目标",
+                    },
                     "ladder_intent": {
                         "type": "string", "enum": ["preserve", "replace", "clear"],
                         "description": "preserve=保留现有 ladder；replace=用完整 scale_plan 替换；clear=明确清空 ladder",
                     },
                     "scale_plan": {
                         "type": "array",
+                        "minItems": 1,
                         "description": "仅 ladder_intent=replace 时提交的完整非空 ladder 计划",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "level": {"type": "integer", "description": "1=首加/首减, 2=二加..."},
-                                "trigger_price": {"type": "number", "description": "触发价"},
+                                "trigger_price": {"type": "number", "exclusiveMinimum": 0, "description": "触发价"},
                                 "action": {"type": "string", "enum": ["add", "trim"]},
-                                "shares": {"type": "integer", "description": "加/减仓股数"},
-                                "pct": {"type": "number", "description": "减仓比例 0-1（trim 时 shares/pct 二选一）"},
-                                "new_stop": {"type": "number", "description": "触发后止损上移到"},
+                                "shares": {"type": "integer", "minimum": 1, "description": "加/减仓股数"},
+                                "pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "减仓比例 (0,1]（shares/pct 二选一）"},
+                                "new_stop": {"type": "number", "description": "触发后止损；仅 trim pct=1.0 的完整退出档可用非正数，系统会规范化为 null"},
                                 "reason": {"type": "string", "description": "该档触发理由"},
                             },
+                            "required": ["action", "trigger_price"],
+                            "oneOf": [
+                                {"required": ["shares"], "not": {"required": ["pct"]}},
+                                {"required": ["pct"], "not": {"required": ["shares"]}},
+                            ],
                         },
                     },
                     "rationale": {"type": "string", "description": "机器可读摘要（why this action + ladder），完整推理写进分析文本"},
@@ -488,6 +500,10 @@ TOOLS = [
                     },
                 },
                 "required": ["action", "rationale", "ladder_intent"],
+                "allOf": [{
+                    "if": {"properties": {"ladder_intent": {"const": "replace"}}},
+                    "then": {"required": ["scale_plan"]},
+                }],
             },
         },
     },
@@ -1741,38 +1757,16 @@ def _validate_labeled_number(
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
-def _normalize_report_scale_plan(candidate: dict) -> dict:
-    normalized = dict(candidate or {})
-    plan = []
-    for raw_level in normalized.get("scale_plan") or []:
-        level = dict(raw_level) if isinstance(raw_level, dict) else raw_level
-        if isinstance(level, dict) and level.get("action") == "trim":
-            try:
-                qualifies_full_exit = (
-                    float(level.get("pct") or 0) == 1.0
-                    and level.get("new_stop") is not None
-                    and float(level["new_stop"]) <= 0
-                    and math.isfinite(float(level.get("pct") or 0))
-                    and math.isfinite(float(level["new_stop"]))
-                )
-            except (TypeError, ValueError, OverflowError):
-                qualifies_full_exit = False
-            if qualifies_full_exit:
-                level["new_stop"] = None
-        plan.append(level)
-    normalized["scale_plan"] = plan
-    return normalized
-
-
 def _effective_position_report_candidate(effective: dict) -> dict:
     """Build the sole position-action state consumed by report generation."""
     report_candidate = {
         **dict(effective or {}),
-        "current_stop": (effective or {}).get("effective_stop"),
-        "current_target": (effective or {}).get("effective_target"),
         "scale_plan": (effective or {}).get("effective_scale_plan") or [],
     }
-    return _normalize_report_scale_plan(report_candidate)
+    if report_candidate.get("action") != "exit":
+        report_candidate["current_stop"] = (effective or {}).get("effective_stop")
+        report_candidate["current_target"] = (effective or {}).get("effective_target")
+    return report_candidate
 
 
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
@@ -1849,11 +1843,16 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
             if immediate_actions[word] != action:
                 issues.append("当前指令与结构化动作不一致")
                 break
-        for field, label in (
+        fields = [
             ("add_shares", "加仓股数"), ("trim_shares", "减仓股数"),
-            ("trim_pct", "减仓比例"), ("current_stop", "当前有效止损"),
-            ("current_target", "当前有效目标"),
-        ):
+            ("trim_pct", "减仓比例"),
+        ]
+        if action != "exit":
+            fields.extend((
+                ("current_stop", "当前有效止损"),
+                ("current_target", "当前有效目标"),
+            ))
+        for field, label in fields:
             value = candidate.get(field)
             _validate_labeled_number(text, label, value, issues)
         plan_section = text.split("## 条件触发计划", 1)[-1].split("\n## ", 1)[0]
@@ -2967,7 +2966,7 @@ def run(ts_code: str, save: bool = True, on_progress=None,
         return _finalize_position_action(
             ts_code, position_action_proposal, position_action_effective, analysis_text, events,
             playstyle_feats, market_ctx, save, evidence_items=evidence_items,
-            token_usage=token_usage,
+            token_usage=token_usage, position_baseline=position_baseline,
         )
 
     limited_verdict = verdict_data["verdict"]
@@ -3361,6 +3360,7 @@ def _finalize_position_action(
     market_ctx: dict,
     save: bool = True,
     *,
+    position_baseline: dict | None = None,
     evidence_items: list | None = None,
     token_usage: dict | None = None,
 ) -> dict:
@@ -3409,6 +3409,7 @@ def _finalize_position_action(
             "effective_target": effective.get("effective_target"),
             "scale_plan": effective.get("effective_scale_plan") or [],
             "rationale": proposal.get("rationale"),
+            "compatibility_warnings": list(proposal.get("compatibility_warnings") or []),
         },
         "analysis_text": analysis_text.strip(),
         "prompt_version": "3.0.0-langgraph",
@@ -3430,53 +3431,51 @@ def _finalize_position_action(
     }
 
     if save:
+        from apex import watchlist as _wl_fin
+        _new_plan = {
+            "scale_plan": entry["position_action"]["scale_plan"],
+            "doctrine": "single_v1",
+            "updated_at": entry["analyzed_at"],
+            # Single compare-and-apply below records this before changing effective stop/target.
+            "last_action": entry["position_action"]["action"],
+            "last_new_stop": entry["position_action"]["new_stop"],
+        }
+        baseline_for_save = position_baseline
+        if baseline_for_save is None:
+            # Compatibility for direct callers. run() always provides its frozen baseline.
+            baseline_for_save = next(
+                (item for item in _wl_fin.load().get("active_positions", [])
+                 if item.get("ts_code") == ts_code),
+                {},
+            )
+        _updated = _wl_fin.apply_position_action_if_unchanged(
+            ts_code,
+            baseline_for_save,
+            plan=_new_plan,
+            effective_stop=effective.get("effective_stop"),
+            effective_target=effective.get("effective_target"),
+        )
+        if _updated is None:
+            return {
+                "ts_code": ts_code,
+                "name": stock_name,
+                "analysis_status": "insufficient_evidence",
+                "outcome_reason": "position_changed_during_analysis",
+                "unknowns": ["持仓在分析期间已平仓或交易计划已变更，未保存过期建议。"],
+                "next_actions": ["刷新当前持仓后重新运行分析。"],
+                "analysis_text": analysis_text.strip(),
+                "evidence": list(evidence_items or []),
+                "market_context": market_ctx,
+                "token_usage": dict(token_usage or {}),
+                "_trace_events": events,
+            }
         journal.write_entry(entry)
         try:
             trace_mod.write_trace(ts_code, entry["analyzed_at"], events)
         except Exception as e:
             print(f"⚠ trace 写入失败（不影响 journal）: {e}")
-        # 刷新持仓 ladder（竞态：分析期间平仓 -> plan 无处可写，journal 已落，下次重建）
-        try:
-            from apex import watchlist as _wl_fin
-            _new_plan = {
-                "scale_plan": entry["position_action"]["scale_plan"],
-                "doctrine": "single_v1",
-                "updated_at": entry["analyzed_at"],
-                # B1 增强：最近 position_action 快照，供持仓卡显示"现在 vs 未来"
-                # last_stop_before 由 update_plan 从持仓当前 stop_loss 补（race-free）
-                "last_action": entry["position_action"]["action"],
-                "last_new_stop": entry["position_action"]["new_stop"],
-            }
-            _updated = _wl_fin.update_plan(ts_code, _new_plan)
-            if _updated is None:
-                print(f"⚠ 持仓 {ts_code} 已不持仓，ladder 未写入（position_action journal 已保存）")
-            else:
-                _n = len(_new_plan["scale_plan"])
-                print(f"✓ 已保存加减仓建议: {ts_code} -> {entry['position_action']['action']} (ladder {_n} 档)")
-                # Apply only an explicit proposal change. An inherited effective
-                # value is state for reporting/audit, not a fresh recommendation.
-                # update_plan 已把旧 stop 锁进 plan.last_stop_before，此处改 stop_loss 不影响 delta 展示。
-                _new_stop = proposal.get("new_stop")
-                if "new_stop" in proposal and _new_stop is not None:
-                    try:
-                        _wl_fin.update_advice(ts_code, stop_loss=_new_stop, emit_notify=False)
-                        print(f"✓ 已应用新止损: {ts_code} stop_loss -> {_new_stop}")
-                    except _wl_fin.PositionNotFoundError:
-                        print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止损未应用")
-                    except Exception as e:
-                        print(f"⚠ 新止损应用失败（不影响 journal/plan）: {e}")
-                # Same for target: apply the proposal, never an inherited value.
-                _new_target = proposal.get("new_target")
-                if "new_target" in proposal and _new_target is not None:
-                    try:
-                        _wl_fin.update_advice(ts_code, target=_new_target, emit_notify=False)
-                        print(f"✓ 已应用新止盈: {ts_code} target -> {_new_target}")
-                    except _wl_fin.PositionNotFoundError:
-                        print(f"⚠ 持仓 {ts_code} 竞态已平仓，新止盈未应用")
-                    except Exception as e:
-                        print(f"⚠ 新止盈应用失败（不影响 journal/plan）: {e}")
-        except Exception as e:
-            print(f"⚠ ladder 刷新失败（不影响 journal）: {e}")
+        _n = len(_new_plan["scale_plan"])
+        print(f"✓ 已保存加减仓建议: {ts_code} -> {entry['position_action']['action']} (ladder {_n} 档)")
 
     entry["_trace_events"] = events
     return entry

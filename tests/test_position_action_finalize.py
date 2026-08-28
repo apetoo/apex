@@ -105,26 +105,62 @@ def test_finalize_writes_position_action_entry_and_refreshes_plan(mock_names, is
 
 
 @patch("apex.data.get_name_map")
-def test_finalize_plan_not_written_when_position_closed(mock_names, isolated_paths):
-    """竞态：分析期间平仓 -> plan 无处可写，但 journal position_action 仍落盘。"""
+def test_finalize_closed_position_returns_race_result_without_any_write(mock_names, isolated_paths):
+    """A closed position invalidates the frozen baseline before journal/watchlist mutation."""
     mock_names.return_value = {}
-    _add()
+    baseline = _add()
     watchlist.close_position("002050.SZ", exit_price=13.0, exit_reason="manual",
                              record_trade=False)
-    # 此时已无持仓
     proposal = {"action": "hold", "ladder_intent": "preserve", "rationale": "x"}
-    effective = {
-        "action": "hold", "ladder_intent": "preserve", "effective_stop": 11.0,
-        "effective_target": 14.0, "effective_scale_plan": [],
-    }
-    entry = _finalize_position_action(
+    effective = materialize_effective_position_plan(baseline, proposal)
+    result = _finalize_position_action(
         "002050.SZ", proposal, effective, "text", [], {}, {}, save=True,
+        position_baseline=baseline,
     )
-    assert entry["source"] == POSITION_ACTION_SOURCE
-    # journal 仍写
-    assert len(journal.load_position_actions("002050.SZ")) == 1
-    # active 无持仓，plan 无处可写（不抛、不重建）
+
+    assert result["analysis_status"] == "insufficient_evidence"
+    assert result["outcome_reason"] == "position_changed_during_analysis"
+    assert journal.load_position_actions("002050.SZ") == []
     assert watchlist.load()["active_positions"] == []
+
+
+@patch("apex.data.get_name_map")
+def test_finalize_changed_trading_state_returns_race_result_without_any_write(mock_names, isolated_paths):
+    """Only trading fields participate in the save-time frozen-baseline comparison."""
+    mock_names.return_value = {}
+    baseline = _add_position_with_two_level_plan()
+    proposal = {"action": "hold", "ladder_intent": "clear", "rationale": "取消条件单"}
+    effective = materialize_effective_position_plan(baseline, proposal)
+    watchlist.update_position("002050.SZ", stop_loss=10.8)
+
+    result = _finalize_position_action(
+        "002050.SZ", proposal, effective, "report", [], {}, {}, save=True,
+        position_baseline=baseline,
+    )
+
+    position = watchlist.load()["active_positions"][0]
+    assert result["outcome_reason"] == "position_changed_during_analysis"
+    assert journal.load_position_actions("002050.SZ") == []
+    assert position["stop_loss"] == 10.8
+    assert len(position["plan"]["scale_plan"]) == 2
+
+
+@patch("apex.data.get_name_map")
+def test_finalize_ignores_non_trading_metadata_in_race_comparison(mock_names, isolated_paths):
+    mock_names.return_value = {}
+    baseline = _add_position_with_two_level_plan()
+    proposal = {"action": "hold", "ladder_intent": "clear", "rationale": "取消条件单"}
+    effective = materialize_effective_position_plan(baseline, proposal)
+    watchlist.update_position("002050.SZ", name="改名不影响交易计划")
+
+    entry = _finalize_position_action(
+        "002050.SZ", proposal, effective, "report", [], {}, {}, save=True,
+        position_baseline=baseline,
+    )
+
+    assert entry["analysis_status"] == "completed"
+    assert len(journal.load_position_actions("002050.SZ")) == 1
+    assert watchlist.load()["active_positions"][0]["plan"]["scale_plan"] == []
 
 
 @patch("apex.data.get_name_map")
@@ -199,6 +235,29 @@ def test_finalize_clear_removes_only_ladder(mock_names, isolated_paths):
     assert position["plan"]["scale_plan"] == []
     assert position["stop_loss"] == 11.0
     assert position["target"] == 14.0
+
+
+@patch("apex.data.get_name_map")
+def test_finalize_persists_the_same_canonical_full_exit_ladder_everywhere(mock_names, isolated_paths):
+    mock_names.return_value = {}
+    baseline = _add_position_with_two_level_plan()
+    proposal = {
+        "action": "hold", "ladder_intent": "replace", "rationale": "跌破后全部退出",
+        "scale_plan": [{
+            "action": "trim", "trigger_price": 11.0, "pct": 1.0, "new_stop": 0,
+        }],
+    }
+    effective = materialize_effective_position_plan(baseline, proposal)
+
+    entry = _finalize_position_action(
+        "002050.SZ", proposal, effective, "report", [], {}, {}, save=True,
+        position_baseline=baseline,
+    )
+
+    scale_plan = effective["effective_scale_plan"]
+    assert scale_plan[0]["new_stop"] is None
+    assert entry["position_action"]["scale_plan"] == scale_plan
+    assert watchlist.load()["active_positions"][0]["plan"]["scale_plan"] == scale_plan
 
 
 @patch("apex.data.get_name_map")

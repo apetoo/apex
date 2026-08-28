@@ -263,6 +263,11 @@ def test_empty_position_ladder_prompt_and_schema_require_explicit_intent():
     assert "preserve：保持空 ladder，不提交 scale_plan" in prompt
     assert schema["properties"]["ladder_intent"]["enum"] == ["preserve", "replace", "clear"]
     assert "ladder_intent" in schema["required"]
+    assert set(schema["properties"]["scale_plan"]["items"]["required"]) == {
+        "action", "trigger_price",
+    }
+    assert len(schema["properties"]["scale_plan"]["items"]["oneOf"]) == 2
+    assert schema["allOf"][0]["then"]["required"] == ["scale_plan"]
 
 
 def _multi_tool_response(calls):
@@ -558,11 +563,11 @@ def test_final_report_validator_supports_pct_ladder_without_throwing():
     assert any("结构化条件触发计划字段无效" in issue for issue in issues)
 
 
-def test_final_report_validator_allows_full_exit_to_omit_zero_new_stop():
+def test_final_report_validator_accepts_domain_normalized_full_exit_ladder():
     candidate = {
         "action": "hold", "effective_stop": 71.5, "effective_target": 90,
         "effective_scale_plan": [
-            {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 0},
+            {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": None},
             {"action": "add", "trigger_price": 79.0, "shares": 100, "new_stop": 73.0},
         ],
     }
@@ -574,28 +579,74 @@ def test_final_report_validator_allows_full_exit_to_omit_zero_new_stop():
     ) == []
 
 
-def test_report_scale_plan_normalization_preserves_partial_trim_and_positive_stop():
-    candidate = {"scale_plan": [
-        {"action": "trim", "trigger_price": 80, "pct": 0.5, "new_stop": 0},
-        {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": 70},
-    ]}
-    assert analyze._normalize_report_scale_plan(candidate) == candidate
+def test_exit_report_does_not_require_a_baseline_stop_or_target_label():
+    candidate = analyze._effective_position_report_candidate({
+        "action": "exit", "effective_stop": 71.5, "effective_target": 90.0,
+        "effective_scale_plan": [], "ladder_intent": "preserve",
+    })
+    report = _complete_position_report(action="exit").replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "本次无后续条件触发计划。",
+    )
+
+    assert candidate["effective_stop"] == 71.5
+    assert candidate["effective_target"] == 90.0
+    assert analyze._validate_final_report(report, "position_action", candidate) == []
 
 
-def test_report_scale_plan_normalization_preserves_malformed_numeric_fields():
-    candidate = {"scale_plan": [
-        {"action": "trim", "trigger_price": 80, "pct": "not-a-number", "new_stop": 0},
-        {"action": "trim", "trigger_price": 71.5, "pct": 1.0, "new_stop": "unknown"},
-    ]}
-    assert analyze._normalize_report_scale_plan(candidate) == candidate
+def test_run_passes_distinct_proposal_effective_state_and_frozen_baseline_to_finalization(monkeypatch):
+    baseline = {
+        "ts_code": "000977.SZ", "position_size_shares": 200,
+        "stop_loss": 71.5, "target": 90.0,
+        "plan": {"scale_plan": [{"action": "trim", "trigger_price": 71.5, "pct": 1.0}]},
+    }
+    proposal = {"action": "hold", "ladder_intent": "preserve", "rationale": "维持"}
+    effective = {
+        "action": "hold", "ladder_intent": "preserve",
+        "effective_stop": 71.5, "effective_target": 90.0,
+        "effective_scale_plan": [{"action": "trim", "trigger_price": 71.5, "pct": 1.0}],
+    }
+    captured = {}
+    result_entry = {"analysis_status": "completed", "source": "position_action"}
 
+    monkeypatch.setattr(analyze._cfg_mod, "get", lambda: {
+        "deepseek": {"model": "fake", "max_tool_iterations": 1, "history_limit": 1},
+    })
+    monkeypatch.setattr(analyze, "_make_client", lambda _cfg: object())
+    monkeypatch.setattr(analyze, "_load_system_prompt", lambda: "system")
+    monkeypatch.setattr(analyze.journal, "load_verdicts", lambda **_kwargs: [])
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [baseline]})
+    monkeypatch.setattr(analyze, "_format_history", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(analyze, "_format_intraday_block", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_market_context", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_playstyle_block", lambda _code: ("", {}))
+    def run_loop_spy(**kwargs):
+        captured["loop_baseline"] = kwargs["position_baseline"]
+        return {
+            "analysis_status": "completed", "draft_kind": "position_action",
+            "draft_proposal": proposal, "draft_data": effective,
+            "analysis_text": "report", "evidence": [], "token_usage": {},
+        }
 
-def test_report_scale_plan_normalization_rejects_non_finite_and_oversized_stops():
-    for new_stop in ("-1e9999", "9" * 401):
-        candidate = {"scale_plan": [
-            {"action": "trim", "trigger_price": 80, "pct": 1.0, "new_stop": new_stop},
-        ]}
-        assert analyze._normalize_report_scale_plan(candidate) == candidate
+    monkeypatch.setattr(analyze, "_run_langgraph_loop", run_loop_spy)
+
+    def finalize_spy(*args, **kwargs):
+        captured["finalize_args"] = args
+        captured["finalize_kwargs"] = kwargs
+        return result_entry
+
+    monkeypatch.setattr(analyze, "_finalize_position_action", finalize_spy)
+
+    result = analyze.run("000977.SZ", save=True)
+
+    assert result is result_entry
+    assert captured["loop_baseline"] == baseline
+    assert captured["loop_baseline"] is not baseline
+    assert captured["finalize_args"][1] == proposal
+    assert captured["finalize_args"][2] == effective
+    assert captured["finalize_args"][1] != captured["finalize_args"][2]
+    assert captured["finalize_kwargs"]["position_baseline"] == baseline
+    assert captured["finalize_kwargs"]["position_baseline"] is not baseline
 
 
 def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monkeypatch):

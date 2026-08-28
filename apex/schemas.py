@@ -136,6 +136,7 @@ class RepeatAnalysisSchema(TypedDict, total=False):
 # position_action 是独立 journal record kind（source=POSITION_ACTION_SOURCE）, 不污染 calibration/backtest
 # （calibration 评分入场方向 call、backtest 吃 bullish 入场信号, "加 300 股"既非方向 call 也非入场信号）。
 POSITION_ACTION_SOURCE = "position_action"
+LADDER_INTENT_ENUM = ["preserve", "replace", "clear"]
 
 # ladder 单档：加仓/减仓触发计划的一级。B3 sim 在每日 OHLC 上撮合, executed 标记防同档每 bar 重触发。
 # 一根 bar 最多执行一个动作（优先级 stop_loss exit > trim > add）, 执行价 = trigger_price（对齐 auto-loop fill_price=trigger）。
@@ -145,7 +146,7 @@ class ScalePlanItemSchema(TypedDict, total=False):
     action: Literal["add", "trim"]
     shares: Optional[int]         # 加仓/减仓股数
     pct: Optional[float]          # 减仓比例 0-1（trim 时 shares/pct 二选一）
-    new_stop: Optional[float]     # 触发后止损上移到（advisory, B1 只建议）
+    new_stop: Optional[float]     # 触发后止损；trim pct=1.0 的完整退出档非正数规范化为 None
     reason: str
     executed: Optional[bool]      # B3 触发后标记 True; 缺省视为 False（未触发）
 
@@ -153,23 +154,29 @@ class ScalePlanItemSchema(TypedDict, total=False):
 class PositionActionSchema(TypedDict, total=False):
     """已持仓票的加减仓建议（source=POSITION_ACTION_SOURCE 的 journal record）。
 
-    action=add 必填 add_shares>0; action=trim 二选一 trim_shares/trim_pct;
-    action=exit/hold 可只给 new_stop。scale_plan 给完整 ladder; rationale 是机器可读摘要,
-    AI 推理全文进 analysis_text。B1 不含 rule_guards（无规则引擎, 字段恒空是死 schema, B2 规则引擎落地时加回）。
+    proposal 用 ladder_intent 表达 preserve/replace/clear；journal 仍保留本次的
+    new_stop/new_target 变更意图，同时写入 effective_stop/effective_target 和完整
+    effective scale_plan，供报告、审计和持仓快照共享。B1 不含 rule_guards（无规则引擎,
+    字段恒空是死 schema, B2 规则引擎落地时加回）。
     """
     action: Literal["hold", "add", "trim", "exit"]
     add_shares: Optional[int]     # action=add 必填, >0
     trim_shares: Optional[int]    # action=trim 二选一
     trim_pct: Optional[float]     # action=trim 二选一（0-1）
-    new_stop: Optional[float]     # 止损上移建议（add/hold 常带）
-    new_target: Optional[float]   # 止盈价上移建议（同步 target 字段，防化石止盈与 ladder 冲突）
-    scale_plan: list              # ScalePlanItemSchema[], 完整 ladder 计划
+    new_stop: Optional[float]     # 本次止损替换意图；None/缺失=保持基线
+    new_target: Optional[float]   # 本次止盈替换意图；None/缺失=保持基线
+    ladder_intent: Literal["preserve", "replace", "clear"]
+    scale_plan: list              # ScalePlanItemSchema[]，物化后的完整有效 ladder
+    effective_stop: Optional[float]
+    effective_target: Optional[float]
+    compatibility_warnings: list[str]  # 旧空/缺失 scale_plan 适配为 preserve 时的附加提示
     rationale: str                # 机器可读摘要
 
 
 class PositionPlanSchema(TypedDict, total=False):
-    """持仓 ladder 快照（存于 active_positions.plan）。生于开仓（空 ladder, 锚定当前 stop/target）,
-    每次重新分析 AI 演进（非替换）, 死于平仓（close_position null 掉防同 ts_code 重开读陈旧）。B3 sim 消费执行。"""
+    """持仓有效 ladder 快照（存于 active_positions.plan）。生于开仓（空 ladder, 锚定当前 stop/target），
+    每次重新分析按 ladder_intent 物化 preserve/replace/clear 后整体写入；死于平仓
+    （close_position null 掉防同 ts_code 重开读陈旧）。B3 sim 消费执行。"""
     scale_plan: list              # ScalePlanItemSchema[]
     doctrine: str                 # B1 单一默认 'single_v1'; B2 按 playstyle 分桶
     updated_at: Optional[str]     # 最后一次 position_action 刷新时间
