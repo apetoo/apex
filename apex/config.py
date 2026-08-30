@@ -25,6 +25,22 @@ def load(path: str = "config.yaml") -> dict:
     _resolve("bocha", "api_key", "BOCHA_API_KEY")
     _resolve("mx", "api_key", "MX_APIKEY")
 
+    langsmith = _cfg.setdefault("langsmith", {})
+    configured_enabled = langsmith.get("enabled")
+    if configured_enabled is None:
+        configured_enabled = os.environ.get("LANGSMITH_TRACING", "").strip().lower() == "true"
+    langsmith["enabled"] = bool(configured_enabled)
+    _resolve("langsmith", "api_key", "LANGSMITH_API_KEY")
+    langsmith["project"] = (
+        langsmith.get("project")
+        or os.environ.get("LANGSMITH_PROJECT")
+        or "apex-ai-analysis"
+    )
+    os.environ["LANGSMITH_TRACING"] = "true" if langsmith["enabled"] else "false"
+    if langsmith["api_key"]:
+        os.environ["LANGSMITH_API_KEY"] = str(langsmith["api_key"])
+    os.environ["LANGSMITH_PROJECT"] = str(langsmith["project"])
+
     # Tilde expansion for all path fields
     paths = _cfg.setdefault("paths", {})
     for key, val in paths.items():

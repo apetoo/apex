@@ -3,7 +3,7 @@
 # config.yaml 已被 .gitignore 忽略，不会进版本库。
 #
 # 取值优先级：YAML 里的值 > 环境变量 > 留空。
-# 即：YAML 留空时回退到环境变量 TUSHARE_TOKEN / DEEPSEEK_API_KEY / BOCHA_API_KEY / MX_APIKEY。
+# 即：YAML 留空时回退到对应环境变量。
 
 tushare:
   token: ""                     # tushare.pro 注册获取（或 env TUSHARE_TOKEN）
@@ -20,6 +20,11 @@ bocha:
 
 mx:
   api_key: ""                   # 妙想金融数据 API（或 env MX_APIKEY）
+
+langsmith:
+  enabled: false                # true 时追踪个股 AI 分析（或 env LANGSMITH_TRACING=true）
+  api_key: ""                   # smith.langchain.com 获取（或 env LANGSMITH_API_KEY）
+  project: "apex-ai-analysis"  # LangSmith 项目名（或 env LANGSMITH_PROJECT）
 
 paths:
   journal_dir: "~/.stock-journal"

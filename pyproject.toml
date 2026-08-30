@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.110",
     "langgraph>=1.0,<2",
+    "langsmith>=0.4,<1",
     "pytest>=8.0.0",
     "scrapy>=2.13,<2.14",
     "sse-starlette>=2.0",

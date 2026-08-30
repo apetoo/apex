@@ -14,7 +14,7 @@ from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle, trade_signal
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle, trade_signal, observability
 from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
@@ -600,10 +600,11 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
 
 def _make_client(cfg: dict) -> OpenAI:
     from apex.llm import make_client
-    return make_client(
+    client = make_client(
         api_key=cfg["deepseek"]["api_key"],
         base_url=cfg["deepseek"].get("base_url", "https://api.deepseek.com"),
     )
+    return observability.wrap_analysis_client(client)
 
 
 def _fetch_forward_bars(ts_code: str, start_d: date, end_d: date) -> list[dict]:
@@ -2052,18 +2053,26 @@ def _run_langgraph_loop(
             f"{stock_name} {ts_code.split('.')[0]} {ts_code} "
             "重大公告 监管 立案 处罚 诉讼 停牌 业绩预警"
         )
-        try:
-            raw = data.web_search(
-                ts_code, category="general", name=stock_name, query=query,
-                freshness="oneYear", count=10,
-            )
+        with observability.tool_trace("authoritative_scan", {
+            "ts_code": ts_code,
+            "name": stock_name,
+            "query": query,
+            "freshness": "oneYear",
+            "count": 10,
+        }) as tool_span:
             try:
-                parsed = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                parsed = {"error": "返回不可解析"}
-        except Exception as exc:
-            raw = json.dumps({"error": str(exc)}, ensure_ascii=False)
-            parsed = {"error": str(exc)}
+                raw = data.web_search(
+                    ts_code, category="general", name=stock_name, query=query,
+                    freshness="oneYear", count=10,
+                )
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    parsed = {"error": "返回不可解析"}
+            except Exception as exc:
+                raw = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                parsed = {"error": str(exc)}
+            tool_span.set_outputs({"result": raw})
         evidence = [item for item in _tool_evidence("web_search", raw, ts_code)
                     if int(item.get("source_tier") or 3) <= 2]
         # 扫描执行成功即成功，不要求 Tier 1 命中。旧逻辑把"只搜到 Tier 2"
@@ -2215,72 +2224,74 @@ def _run_langgraph_loop(
                 "tool_call_id": tool_call.id, "name": name, "args": tool_input,
             })
 
-            if name == "submit_research_state":
-                try:
-                    from apex import watchlist as _wl_assessment
-                    held = any(
-                        p.get("ts_code") == ts_code
-                        for p in _wl_assessment.load().get("active_positions", [])
-                    )
-                except Exception:
-                    held = False
-                controller.submit_assessment(
-                    thesis=str(tool_input.get("thesis") or ""),
-                    gaps=_normalize_research_gaps(
-                        list(tool_input.get("gaps") or []), held=held,
-                        safety_scan_status=controller.safety_scan_status,
-                    ),
-                    ready=bool(tool_input.get("ready")),
-                    next_actions=list(tool_input.get("next_actions") or []),
-                    count_research_round=not bool(state.get("final_assessment_done")),
-                )
-                result = json.dumps({
-                    "accepted": True,
-                    "stop": controller.should_stop().stop,
-                    "finalization": controller.finalization_decision().allowed,
-                }, ensure_ascii=False)
-            elif name in {"record_verdict", "record_position_action"}:
-                blockers = _candidate_blockers(name, tool_input)
-                proposal, effective = {}, {}
-                if name == "record_position_action":
-                    current_price = None
+            with observability.tool_trace(name, tool_input) as tool_span:
+                if name == "submit_research_state":
                     try:
-                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
-                    except Exception:
-                        pass
-                    proposal, effective, position_blockers = _prepare_position_action_candidate(
-                        tool_input, dict(state.get("position_baseline") or {}), ts_code, current_price,
-                    )
-                    blockers.extend(position_blockers)
-                if blockers:
-                    result = json.dumps({"error": "；".join(blockers)}, ensure_ascii=False)
-                else:
-                    draft_kind = "verdict" if name == "record_verdict" else "position_action"
-                    draft_data = effective if name == "record_position_action" else tool_input
-                    draft_proposal = proposal if name == "record_position_action" else {}
-                    result = "candidate recorded; pending independent review"
-            else:
-                stop = controller.should_stop()
-                if stop.stop:
-                    result = json.dumps({"error": f"动态预算已停止: {stop.reason}"}, ensure_ascii=False)
-                else:
-                    try:
-                        result = _dispatch_tool(name, tool_input)
-                        parsed = json.loads(result) if isinstance(result, str) else result
-                        success = not (isinstance(parsed, dict) and parsed.get("error"))
-                        controller.record_external_call(
-                            name, success=success,
-                            error=str(parsed.get("error") or "") if isinstance(parsed, dict) else "",
+                        from apex import watchlist as _wl_assessment
+                        held = any(
+                            p.get("ts_code") == ts_code
+                            for p in _wl_assessment.load().get("active_positions", [])
                         )
-                        controller.add_evidence(_tool_evidence(name, result, ts_code))
-                    except Exception as exc:
-                        controller.record_external_call(name, success=False, error=str(exc))
-                        result = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                emit({
-                    "type": "tool_result", "iteration": state.get("model_iterations", 1) - 1,
-                    "tool_call_id": tool_call.id, "name": name,
-                    "summary": trace_mod.summarize_tool_result(name, result), "raw": result,
-                })
+                    except Exception:
+                        held = False
+                    controller.submit_assessment(
+                        thesis=str(tool_input.get("thesis") or ""),
+                        gaps=_normalize_research_gaps(
+                            list(tool_input.get("gaps") or []), held=held,
+                            safety_scan_status=controller.safety_scan_status,
+                        ),
+                        ready=bool(tool_input.get("ready")),
+                        next_actions=list(tool_input.get("next_actions") or []),
+                        count_research_round=not bool(state.get("final_assessment_done")),
+                    )
+                    result = json.dumps({
+                        "accepted": True,
+                        "stop": controller.should_stop().stop,
+                        "finalization": controller.finalization_decision().allowed,
+                    }, ensure_ascii=False)
+                elif name in {"record_verdict", "record_position_action"}:
+                    blockers = _candidate_blockers(name, tool_input)
+                    proposal, effective = {}, {}
+                    if name == "record_position_action":
+                        current_price = None
+                        try:
+                            current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                        except Exception:
+                            pass
+                        proposal, effective, position_blockers = _prepare_position_action_candidate(
+                            tool_input, dict(state.get("position_baseline") or {}), ts_code, current_price,
+                        )
+                        blockers.extend(position_blockers)
+                    if blockers:
+                        result = json.dumps({"error": "；".join(blockers)}, ensure_ascii=False)
+                    else:
+                        draft_kind = "verdict" if name == "record_verdict" else "position_action"
+                        draft_data = effective if name == "record_position_action" else tool_input
+                        draft_proposal = proposal if name == "record_position_action" else {}
+                        result = "candidate recorded; pending independent review"
+                else:
+                    stop = controller.should_stop()
+                    if stop.stop:
+                        result = json.dumps({"error": f"动态预算已停止: {stop.reason}"}, ensure_ascii=False)
+                    else:
+                        try:
+                            result = _dispatch_tool(name, tool_input)
+                            parsed = json.loads(result) if isinstance(result, str) else result
+                            success = not (isinstance(parsed, dict) and parsed.get("error"))
+                            controller.record_external_call(
+                                name, success=success,
+                                error=str(parsed.get("error") or "") if isinstance(parsed, dict) else "",
+                            )
+                            controller.add_evidence(_tool_evidence(name, result, ts_code))
+                        except Exception as exc:
+                            controller.record_external_call(name, success=False, error=str(exc))
+                            result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                    emit({
+                        "type": "tool_result", "iteration": state.get("model_iterations", 1) - 1,
+                        "tool_call_id": tool_call.id, "name": name,
+                        "summary": trace_mod.summarize_tool_result(name, result), "raw": result,
+                    })
+                tool_span.set_outputs({"result": result})
             appended.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
         return {
             "messages": appended, "pending_tools": [],
@@ -2368,27 +2379,31 @@ def _run_langgraph_loop(
                     failure = f"草稿未调用要求的 {tool_name}"
                     continue
                 candidate = json.loads(calls[0].function.arguments or "{}")
-                blockers = _candidate_blockers(tool_name, candidate)
-                proposal, effective = {}, {}
-                if tool_name == "record_position_action":
-                    current_price = None
-                    try:
-                        current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
-                    except Exception:
-                        pass
-                    proposal, effective, position_blockers = _prepare_position_action_candidate(
-                        candidate, dict(state.get("position_baseline") or {}), ts_code, current_price,
-                    )
-                    blockers.extend(position_blockers)
-                if blockers:
-                    failure = "；".join(blockers)
-                    continue
-                return {
-                    "draft_kind": "position_action" if held else "verdict",
-                    "draft_data": effective if tool_name == "record_position_action" else candidate,
-                    "draft_proposal": proposal if tool_name == "record_position_action" else {},
-                    "draft_route": "review",
-                }
+                with observability.tool_trace(tool_name, candidate) as tool_span:
+                    blockers = _candidate_blockers(tool_name, candidate)
+                    proposal, effective = {}, {}
+                    if tool_name == "record_position_action":
+                        current_price = None
+                        try:
+                            current_price = (data.get_realtime_price([ts_code]) or {}).get(ts_code)
+                        except Exception:
+                            pass
+                        proposal, effective, position_blockers = _prepare_position_action_candidate(
+                            candidate, dict(state.get("position_baseline") or {}), ts_code, current_price,
+                        )
+                        blockers.extend(position_blockers)
+                    if blockers:
+                        failure = "；".join(blockers)
+                        tool_span.set_outputs({"result": {"error": failure}})
+                        continue
+                    result = {
+                        "draft_kind": "position_action" if held else "verdict",
+                        "draft_data": effective if tool_name == "record_position_action" else candidate,
+                        "draft_proposal": proposal if tool_name == "record_position_action" else {},
+                        "draft_route": "review",
+                    }
+                    tool_span.set_outputs({"result": result})
+                    return result
             except Exception as exc:
                 failure = str(exc)
                 if isinstance(exc, (ConnectionError, TimeoutError)):
@@ -2702,11 +2717,16 @@ def _run_langgraph_loop(
         execute_tools=execute_tools, assess=assess, draft=draft,
         review=review, report=report, finalize=finalize, abstain=abstain,
     ))
-    return graph.invoke({}, {"recursion_limit": max(30, max_iter * 5)})
+    return graph.invoke({}, {
+        "recursion_limit": max(30, max_iter * 5),
+        "run_name": "apex-analysis-graph",
+        "tags": ["apex", "stock-analysis", ts_code],
+        "metadata": {"ts_code": ts_code, "model": model},
+    })
 
 
-def run(ts_code: str, save: bool = True, on_progress=None,
-        candidate_context: Optional[dict] = None) -> dict:
+def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
+                  candidate_context: Optional[dict] = None) -> dict:
     """
     Run full agent analysis for ts_code via DeepSeek API.
     on_progress(event: dict) is called for each milestone (context injection /
@@ -3075,6 +3095,46 @@ def run(ts_code: str, save: bool = True, on_progress=None,
 
     entry["_trace_events"] = events  # 当前会话直接用，不序列化到 journal
     return entry
+
+
+def run(ts_code: str, save: bool = True, on_progress=None,
+        candidate_context: Optional[dict] = None) -> dict:
+    """Run one stock analysis with optional, observer-safe LangSmith tracing."""
+    cfg = _cfg_mod.get()
+    normalized_context = dict(candidate_context or {"source_type": "manual", "red_flag": False})
+    normalized_context.setdefault("source_type", "manual")
+    normalized_context.setdefault("red_flag", False)
+    try:
+        from apex import watchlist as _wl_trace
+        held = any(
+            position.get("ts_code") == ts_code
+            for position in _wl_trace.load().get("active_positions", [])
+        )
+    except Exception:
+        held = False
+
+    with observability.analysis_trace(
+        ts_code=ts_code,
+        save=save,
+        candidate_context=normalized_context,
+        model=cfg["deepseek"]["model"],
+        prompt_version="3.0.0-langgraph",
+        held=held,
+    ) as span:
+        result = _run_analysis(
+            ts_code,
+            save=save,
+            on_progress=on_progress,
+            candidate_context=normalized_context,
+        )
+        span.set_outputs({
+            "analysis_status": result.get("analysis_status"),
+            "outcome_reason": result.get("outcome_reason"),
+            "verdict": result.get("verdict"),
+            "action": (result.get("position_action") or {}).get("action"),
+            "token_usage": result.get("token_usage") or {},
+        })
+        return result
 
 
 def _simulate_ladder(

@@ -1,7 +1,8 @@
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
-from apex import analyze
+from apex import analyze, observability
 from apex.analysis_graph import GraphHandlers, build_analysis_graph
 
 
@@ -742,6 +743,22 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
         "valuation": {"pe_ttm": 20}, "quarters": [{"roe": 12}], "summary": {"flags": []},
     }))
     monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+    traced_tools = []
+
+    class _ToolSpan:
+        def __init__(self, item):
+            self.item = item
+
+        def set_outputs(self, outputs):
+            self.item["outputs"] = outputs
+
+    @contextmanager
+    def fake_tool_trace(name, inputs):
+        item = {"name": name, "inputs": inputs}
+        traced_tools.append(item)
+        yield _ToolSpan(item)
+
+    monkeypatch.setattr(observability, "tool_trace", fake_tool_trace)
     events = []
 
     result = analyze._run_langgraph_loop(
@@ -758,6 +775,11 @@ def test_apex_graph_loop_uses_tools_assessment_and_independent_review(monkeypatc
     assert [tool["function"]["name"] for tool in draft_call["tools"]] == ["record_verdict"]
     assert draft_call["tool_choice"] == {"type": "function", "function": {"name": "record_verdict"}}
     assert any(event["type"] == "review" and event["outcome"] == "pass" for event in events)
+    assert [item["name"] for item in traced_tools] == [
+        "authoritative_scan", "get_fundamentals", "submit_research_state", "record_verdict",
+    ]
+    assert traced_tools[0]["inputs"]["ts_code"] == "002050.SZ"
+    assert traced_tools[1]["outputs"]["result"]
 
 
 def _patch_report_graph_environment(monkeypatch):

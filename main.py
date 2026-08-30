@@ -31,6 +31,7 @@ def _clean_proxy():
 def analyze(ts_code, no_save):
     """运行 DeepSeek AI 分析单只股票"""
     _clean_proxy()
+    from apex import observability
     from apex.analyze import run
 
     def _progress(event):
@@ -41,7 +42,10 @@ def analyze(ts_code, no_save):
         suffix = f" ({current}/{total})" if current is not None and total is not None else ""
         click.echo(f"→ {message}{suffix}")
 
-    result = run(ts_code, save=not no_save, on_progress=_progress)
+    try:
+        result = run(ts_code, save=not no_save, on_progress=_progress)
+    finally:
+        observability.flush_analysis_traces()
     if result.get("analysis_status") == "insufficient_evidence":
         reason_labels = {
             "evidence_gap": "关键证据尚未核实",

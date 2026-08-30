@@ -145,6 +145,27 @@ mx:
   api_key: ""                    # 妙想金融数据 API（或 env MX_APIKEY）
 ```
 
+### LangSmith AI 分析观测（可选）
+
+可直接在 `config.yaml` 中启用：
+
+```yaml
+langsmith:
+  enabled: true
+  api_key: "<your-langsmith-api-key>"
+  project: "apex-ai-analysis"
+```
+
+也可使用官方环境变量；未启用时功能完全关闭：
+
+```bash
+export LANGSMITH_API_KEY="<your-langsmith-api-key>"
+export LANGSMITH_TRACING="true"
+export LANGSMITH_PROJECT="apex-ai-analysis"
+```
+
+LangSmith 控制台会显示整次分析、LangGraph 节点、每次 DeepSeek 请求以及具体工具调用的树状 trace。当前版本为完整调试模式，会上传系统提示词、历史判断、持仓上下文、模型回复、工具参数和工具原始结果；请勿在包含不希望离开本机的数据时开启。该观测链路为旁路能力，上报失败不会中断分析。CLI 会在分析结束时等待 trace 刷新，FastAPI 长进程则由 SDK 后台批量上报。
+
 ### 路径（默认不用改，均 tilde 展开到 `$HOME`）
 
 ```yaml
