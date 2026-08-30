@@ -6,6 +6,12 @@ patch 掉 _sector_for（tushare 行业查询，离线返回 None），fake_cfg �
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def disable_langsmith_test_telemetry(monkeypatch):
+    """Tests must never upload prompts, fixtures, or tool results to LangSmith."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+
+
 @pytest.fixture
 def isolated_paths(tmp_path, monkeypatch):
     """所有存储路径指向 tmp_path，隔离 ~ 下真实数据。"""
