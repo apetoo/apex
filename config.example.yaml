@@ -24,6 +24,7 @@ mx:
 langsmith:
   enabled: false                # true 时追踪个股 AI 分析（或 env LANGSMITH_TRACING=true）
   api_key: ""                   # smith.langchain.com 获取（或 env LANGSMITH_API_KEY）
+  workspace_id: ""              # key 可访问多个 workspace 时必填（或 env LANGSMITH_WORKSPACE_ID）
   project: "apex-ai-analysis"  # LangSmith 项目名（或 env LANGSMITH_PROJECT）
 
 paths:

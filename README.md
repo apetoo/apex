@@ -153,6 +153,7 @@ mx:
 langsmith:
   enabled: true
   api_key: "<your-langsmith-api-key>"
+  workspace_id: "<your-workspace-id>" # API key 可访问多个 workspace 时必填
   project: "apex-ai-analysis"
 ```
 
@@ -161,6 +162,7 @@ langsmith:
 ```bash
 export LANGSMITH_API_KEY="<your-langsmith-api-key>"
 export LANGSMITH_TRACING="true"
+export LANGSMITH_WORKSPACE_ID="<your-workspace-id>"
 export LANGSMITH_PROJECT="apex-ai-analysis"
 ```
 

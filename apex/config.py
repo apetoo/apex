@@ -31,6 +31,7 @@ def load(path: str = "config.yaml") -> dict:
         configured_enabled = os.environ.get("LANGSMITH_TRACING", "").strip().lower() == "true"
     langsmith["enabled"] = bool(configured_enabled)
     _resolve("langsmith", "api_key", "LANGSMITH_API_KEY")
+    _resolve("langsmith", "workspace_id", "LANGSMITH_WORKSPACE_ID")
     langsmith["project"] = (
         langsmith.get("project")
         or os.environ.get("LANGSMITH_PROJECT")
@@ -39,6 +40,8 @@ def load(path: str = "config.yaml") -> dict:
     os.environ["LANGSMITH_TRACING"] = "true" if langsmith["enabled"] else "false"
     if langsmith["api_key"]:
         os.environ["LANGSMITH_API_KEY"] = str(langsmith["api_key"])
+    if langsmith["workspace_id"]:
+        os.environ["LANGSMITH_WORKSPACE_ID"] = str(langsmith["workspace_id"])
     os.environ["LANGSMITH_PROJECT"] = str(langsmith["project"])
 
     # Tilde expansion for all path fields
