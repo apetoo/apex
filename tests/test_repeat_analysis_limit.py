@@ -10,6 +10,7 @@ from apex.analyze import (
     _clamp_verdict_delta,
     _compute_repeat_analysis,
     _finalize_verdict_candidate,
+    _audit_repeat_candidate,
 )
 from apex.schemas import VERDICT_ENUM
 
@@ -131,6 +132,21 @@ def test_finalize_candidate_applies_repeat_limit_before_report_generation():
     assert raw["verdict"] == "看空"
     assert metadata["repeat_analysis"]["raw_verdict"] == "看空"
     assert metadata["repeat_analysis"]["raw_confidence"] == 3
+
+
+def test_policy_repeat_audit_never_mutates_authoritative_trade_state():
+    history = [_entry(verdict="看多", confidence=3, hours_ago=2, features=_feat())]
+    raw = {
+        "verdict": "偏空", "confidence": 8, "new_info": [], "features": _feat(),
+        "proposed_trade_action": "avoid", "position_size_pct": 0,
+        "entry": 0, "stop_loss": 0, "target": 0,
+    }
+
+    final, metadata = _audit_repeat_candidate(raw, history)
+
+    assert final == raw
+    assert metadata["repeat_analysis"]["legacy_suggested_verdict"] != raw["verdict"]
+    assert metadata["repeat_analysis"]["limited"] is False
 
 
 def test_no_limit_when_new_info_verified():

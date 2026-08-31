@@ -13,10 +13,15 @@ class EvidenceItem(TypedDict):
     source_tier: int
     entity_matched: bool
     freshness_status: str
+    as_of: Optional[str]
+    frequency: Optional[str]
+    is_complete: bool
+    independence_group: Optional[str]
 
 VERDICT_ENUM = ["看多", "偏多", "观望偏多", "中性", "观望偏空", "偏空", "看空"]
-BULLISH_VERDICTS = {"看多", "偏多", "观望偏多"}
-BEARISH_VERDICTS = {"看空", "偏空", "观望偏空"}
+BULLISH_VERDICTS = {"看多", "偏多"}
+BEARISH_VERDICTS = {"看空", "偏空"}
+OBSERVATION_VERDICTS = {"观望偏多", "中性", "观望偏空"}
 
 # 步骤 0 AI 声明的标的类型（与 analyze.py 类型表对齐）。成长股触发静态 PE 偏空硬门控。
 STOCK_TYPE_ENUM = ["蓝筹白马", "题材游资", "周期股", "成长股", "均衡型"]

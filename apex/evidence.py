@@ -208,4 +208,8 @@ def make_evidence_item(
         "source_tier": int(source.get("source_tier") or 1),
         "entity_matched": bool(source.get("entity_matched", True)),
         "freshness_status": source.get("freshness_status") or "current",
+        "as_of": source.get("as_of") or source.get("date") or None,
+        "frequency": source.get("frequency") or None,
+        "is_complete": bool(source.get("is_complete", True)),
+        "independence_group": source.get("independence_group") or None,
     }

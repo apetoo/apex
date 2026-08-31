@@ -14,7 +14,9 @@ from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
 
-from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle, trade_signal, observability
+from apex import config as _cfg_mod, data, journal, calibration, evidence_attribution, trace as trace_mod, skills, playstyle, trade_signal, observability, forecast_calibration
+from apex.decision_policy import EvidenceClaimError, apply_accuracy_policy
+from apex.stock_profile import StockProfile, classify_stock_profile
 from apex.journal_views import history_digest
 from apex.schemas import (
     VERDICT_ENUM, BULLISH_VERDICTS, BEARISH_VERDICTS,
@@ -289,10 +291,9 @@ TOOLS = [
             "name": "record_verdict",
             "description": (
                 "记录最终分析结论。分析完成后必须调用此工具，不得省略。\n"
-                "**evidence 字段为必填**：每条格式「数据点 → 推论」，至少 3 条，"
-                "必须引用工具返回的真实数字（如 close=12.34、RSI=67.2、减持公告日期），"
-                "不得写泛泛的定性描述。\n"
-                "**entry / stop_loss / target 为必填**：看多/偏多/观望偏多必须填具体价位，"
+                "**evidence_claims 为必填**：每边 0-3 条，必须引用 evidence_id；不得凑数。"
+                "evidence 是兼容展示字段，不参与后端裁决。\n"
+                "**entry / stop_loss / target**：仅看多/偏多且当前可执行时填具体价位，"
                 "非看多方向（中性及以下）统一填 0。entry 同时给一个成交区间 entry_low/entry_high "
                 "（回踩入场：entry_low=区间下沿地板 / entry_high=entry 主锚点；突破入场：entry_low=entry 主锚点 / "
                 "entry_high=区间上沿天花板），价格进入此带才触发，避免接飞刀或追高。区间宽度参考 ATR(14)%，"
@@ -308,7 +309,11 @@ TOOLS = [
                     },
                     "confidence": {
                         "type": "integer",
-                        "description": "置信度 1-10",
+                        "description": "兼容字段；后端会将其视为模型原始置信度并执行一次确定性校准",
+                    },
+                    "model_confidence": {
+                        "type": "integer", "minimum": 1, "maximum": 10,
+                        "description": "模型基于证据给出的原始置信度；不得手工应用历史加减分",
                     },
                     "proposed_trade_action": {
                         "type": "string",
@@ -324,11 +329,11 @@ TOOLS = [
                         "type": "integer", "minimum": 1, "maximum": 10,
                         "description": "买入区间从下一交易日起有效的交易日数，默认建议 3。",
                     },
-                    "entry": {"type": "number", "description": "建议买入价（主锚点）。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "entry": {"type": "number", "description": "建议买入价（主锚点）。看多/偏多且可执行时填具体数字，其他方向填 0。"},
                     "entry_low": {"type": "number", "description": "买入区间下沿（地板价）。回踩入场=下方支撑，突破入场=entry 主锚点。看多类必填，非看多方向不填。"},
                     "entry_high": {"type": "number", "description": "买入区间上沿（天花板）。回踩入场=entry 主锚点，突破入场=上方阻力。看多类必填，非看多方向不填。"},
-                    "stop_loss": {"type": "number", "description": "止损价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
-                    "target": {"type": "number", "description": "目标价。看多/偏多/观望偏多必须填具体数字，其他方向填 0。"},
+                    "stop_loss": {"type": "number", "description": "止损价。看多/偏多且可执行时填具体数字，其他方向填 0。"},
+                    "target": {"type": "number", "description": "目标价。看多/偏多且可执行时填具体数字，其他方向填 0。"},
                     "features": {
                         "type": "object",
                         "description": "技术特征快照",
@@ -352,14 +357,34 @@ TOOLS = [
                     "evidence": {
                         "type": "array",
                         "description": (
-                            "支撑结论的关键证据列表，格式：「数据点 → 推论」。"
-                            "必须引用工具返回的真实数字，不得只写定性描述。最少 3 条。"
-                            "示例：[\"close=12.34 上穿 MA20=11.80 → 均线支撑有效\","
-                            "\"RSI(14)=67.2 接近超买区 → 短期追高风险\","
-                            "\"2024-04-10 公告减持 500 万股 → 大股东信心不足，利空\"]"
+                            "兼容展示用证据文本；后端只使用 evidence_claims 裁决。"
                         ),
                         "items": {"type": "string"},
-                        "minItems": 3,
+                        "minItems": 0,
+                    },
+                    "evidence_claims": {
+                        "type": "array",
+                        "description": "引用证据账本的结构化多空证据；每边最多 3 条，允许某一边为 0 条。",
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "evidence_id": {"type": "string"},
+                                "stance": {"type": "string", "enum": ["bull", "bear"]},
+                                "dimension": {"type": "string", "enum": ["technical", "fundamental", "capital", "sentiment"]},
+                                "nature": {"type": "string", "enum": ["fact", "current", "forecast"]},
+                                "hardness": {"type": "integer", "minimum": 1, "maximum": 5},
+                                "as_of": {"type": "string", "description": "证据时点 YYYY-MM-DD"},
+                                "frequency": {"type": "string", "enum": ["intraday", "daily", "weekly", "monthly", "quarterly", "event"]},
+                                "is_complete": {"type": "boolean"},
+                                "independence_group": {"type": "string"},
+                                "inference": {"type": "string"},
+                            },
+                            "required": [
+                                "evidence_id", "stance", "dimension", "nature", "hardness",
+                                "as_of", "frequency", "is_complete", "independence_group", "inference",
+                            ],
+                        },
                     },
                     "position_size_pct": {
                         "type": "integer",
@@ -367,8 +392,7 @@ TOOLS = [
                             "建议仓位占账户总资金的百分比（0-50）。"
                             "映射：confidence 1-2→0%, 3→≤5%, 4→≤10%, 5→≤15%, "
                             "6→≤20%, 7→≤30%, 8→≤35%, 9→≤40%, 10→≤50%。"
-                            "「偏多」及更弱的方向且 position_size_pct=0 表示只观察不买入。"
-                            "「观望」及更弱的方向应填 0。"
+                            "观望偏多/中性/观望偏空必须为 0，且不得授权交易。"
                         ),
                     },
                     "new_info": {
@@ -392,8 +416,7 @@ TOOLS = [
                         "type": "string",
                         "enum": STOCK_TYPE_ENUM,
                         "description": (
-                            "步骤 0 声明的标的类型（蓝筹白马/题材游资/周期股/成长股/均衡型）。必填。"
-                            "成长股 + 偏空 + valuation_basis=static_pe_only（或缺填）会被系统拒绝，逼你补前瞻估值后重调。"
+                            "兼容审计字段；最终股票类型由后端软分类覆盖，模型无需据此裁决。"
                         ),
                     },
                     "valuation_basis": {
@@ -432,7 +455,10 @@ TOOLS = [
                         "required": ["ratings", "primary", "reasons"],
                     },
                 },
-                "required": ["verdict", "confidence", "proposed_trade_action", "entry_style", "valid_for_days", "entry", "stop_loss", "target", "features", "evidence", "stock_type"],
+                "required": [
+                    "verdict", "model_confidence", "proposed_trade_action", "entry_style",
+                    "valid_for_days", "entry", "stop_loss", "target", "features", "evidence_claims",
+                ],
             },
         },
     },
@@ -545,17 +571,19 @@ TOOLS.insert(-2, {
 })
 
 
-def _load_system_prompt() -> str:
+def _load_system_prompt(*, skill_names: list[str] | None = None) -> str:
     cfg = _cfg_mod.get()
     prompt_path = Path(cfg["paths"]["prompt_file"]).expanduser()
     if prompt_path.exists():
         base = prompt_path.read_text(encoding="utf-8")
     else:
         base = (
-            "你是一位资深A股投资顾问。对给定股票做技术面+基本面综合分析，"
-            "给出明确的判断方向和具体价位建议。分析完成后必须调用 record_verdict 工具记录结论。"
+            "你是一位资深A股研究员。对给定股票提交可引用的结构化证据和解释；"
+            "最终方向、置信度和交易授权由后端策略确定。分析完成后必须调用 record_verdict。"
         )
-    base = evidence_attribution.inject_into(calibration.inject_into(base))
+    # 方向预测校准由 decision-policy-v1 在后端执行一次。旧实盘 calibration
+    # 仍供绩效页面使用，但不再注入模型，避免选择偏差和双重扣分。
+    base = evidence_attribution.inject_into(base)
     # 回测复盘→分析闭环：注入最近一次全局复盘的 prompt_injection。
     # 时效(max_inject_age_days) + 样本量(min_review_samples) 门槛已由 load 端把关，
     # 不满足则返回 None 不注入，避免旧/小样本结论误导本次分析。
@@ -566,9 +594,8 @@ def _load_system_prompt() -> str:
             base += "\n\n## 回测复盘提醒（基于历史模拟回测派生，注意样本局限，非定论）\n" + inj
     except Exception:
         pass
-    # 领域 skill（成长股/...方法论）。applies_to 含 analyze 的全量拼接。
-    # phase 1 只加不删，与现有 expert-persona.md / 注入条款暂存冗余，验证后再去重。
-    base += skills.load_skills_for("analyze")
+    # 只注入软分类实际启用的领域 skill。
+    base += skills.load_skills_for("analyze", names=skill_names or [])
     return base
 
 
@@ -943,6 +970,28 @@ def _finalize_verdict_candidate(
     final["verdict"], final["confidence"] = _apply_repeat_limit(
         repeat_info, raw_verdict, raw_confidence,
     )
+    return final, {"repeat_analysis": repeat_info}
+
+
+def _audit_repeat_candidate(
+    candidate: dict, history_entries: list[dict],
+) -> tuple[dict, dict]:
+    """Record 24h repeat drift without mutating a decision-policy-v1 result."""
+    final = dict(candidate or {})
+    repeat_info = _compute_repeat_analysis(
+        history_entries,
+        str(final.get("verdict") or ""),
+        final.get("confidence"),
+        final.get("new_info", []),
+        final.get("features", {}),
+    )
+    suggested_verdict, suggested_confidence = _apply_repeat_limit(
+        repeat_info, str(final.get("verdict") or ""), final.get("confidence"),
+    )
+    repeat_info["legacy_suggested_verdict"] = suggested_verdict
+    repeat_info["legacy_suggested_confidence"] = suggested_confidence
+    repeat_info["limited"] = False
+    repeat_info["limit_rule"] = None
     return final, {"repeat_analysis": repeat_info}
 
 
@@ -1631,6 +1680,136 @@ def _format_playstyle_block(ts_code: str) -> tuple[str, dict]:
     return "\n".join(lines), feats
 
 
+def _stock_profile_from_context(
+    ts_code: str, playstyle_feats: dict, candidate_context: dict,
+) -> StockProfile:
+    """Build the deterministic profile from already-fetched FE plus company metadata."""
+    features = (playstyle_feats.get("features") or {}) if isinstance(playstyle_feats, dict) else {}
+    industry = str(candidate_context.get("industry") or "")
+    if not industry:
+        try:
+            info = json.loads(data.get_stock_info(ts_code))
+            if isinstance(info, list) and info:
+                industry = str(info[0].get("industry") or "")
+        except Exception:
+            pass
+    circ_mv = features.get("circ_mv") or {}
+    valuation = features.get("valuation") or {}
+    turnover = features.get("turnover") or {}
+    revenue = features.get("or_yoy") or {}
+    profile_features = {
+        "circ_mv_yi": circ_mv.get("yi"),
+        "pe_ttm": valuation.get("pe_ttm"),
+        "turnover_rate": turnover.get("avg_20d_pct") or turnover.get("latest_pct"),
+        "revenue_yoy": revenue.get("latest"),
+        "industry": industry,
+        "dragon_tiger_count_20d": candidate_context.get("dragon_tiger_count_20d", 0),
+    }
+    return classify_stock_profile(profile_features)
+
+
+def _system_evidence_items(
+    *, ts_code: str, profile: StockProfile, playstyle_feats: dict,
+    market_ctx: dict, intraday_ctx: dict,
+) -> list[dict]:
+    """Expose deterministic injected context through stable ledger IDs."""
+    as_of = str(playstyle_feats.get("as_of") or date.today().isoformat()).replace("-", "")
+    as_of_iso = f"{as_of[:4]}-{as_of[4:6]}-{as_of[6:8]}" if len(as_of) >= 8 else date.today().isoformat()
+    raw = playstyle_feats.get("features") or {}
+    definitions = [
+        ("technical", {
+            key: raw.get(key) for key in ("volatility", "turnover", "ma_alignment") if raw.get(key)
+        }),
+        ("fundamental", {
+            key: raw.get(key) for key in ("or_yoy", "valuation", "roe") if raw.get(key)
+        }),
+        ("capital", {
+            key: raw.get(key) for key in ("moneyflow", "northbound") if raw.get(key)
+        }),
+    ]
+    items: list[dict] = []
+    for dimension, facts in definitions:
+        if not facts:
+            continue
+        items.append({
+            "id": f"sys_{dimension}_{as_of}",
+            "fact": json.dumps(facts, ensure_ascii=False, sort_keys=True),
+            "inference": "系统预计算上下文，等待模型判断方向",
+            "evidence_type": "structured_data", "tool_name": "system_context",
+            "source_name": "Apex Python precompute", "source_url": None,
+            "published_at": as_of_iso, "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current", "as_of": as_of_iso,
+            "frequency": "daily" if dimension != "fundamental" else "quarterly",
+            "nature": "current",
+            "is_complete": True, "independence_group": f"system_{dimension}:{as_of_iso}",
+            "dimension": dimension,
+        })
+    sentiment = market_ctx.get("market_sentiment") or {}
+    if sentiment:
+        sentiment_day = str(sentiment.get("as_of") or date.today().isoformat()).replace("-", "")
+        sentiment_iso = (
+            f"{sentiment_day[:4]}-{sentiment_day[4:6]}-{sentiment_day[6:8]}"
+            if len(sentiment_day) >= 8 else date.today().isoformat()
+        )
+        items.append({
+            "id": f"sys_sentiment_{sentiment_day}",
+            "fact": json.dumps(sentiment, ensure_ascii=False, sort_keys=True, default=str)[:1600],
+            "inference": "市场情绪聚合证据；regime/style/三维度不得拆分重复计分",
+            "evidence_type": "market_sentiment", "tool_name": "system_context",
+            "source_name": "Apex market sentiment", "source_url": None,
+            "published_at": sentiment_iso, "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current", "as_of": sentiment_iso,
+            "frequency": "daily", "is_complete": True,
+            "nature": "current",
+            "independence_group": f"market_sentiment:{sentiment_iso}", "dimension": "sentiment",
+        })
+    if intraday_ctx:
+        items.append({
+            "id": f"sys_intraday_{date.today().isoformat()}",
+            "fact": json.dumps(intraday_ctx, ensure_ascii=False, sort_keys=True, default=str)[:1200],
+            "inference": "盘中未完成数据，只能作为风险提示，不能确认日线突破或反转",
+            "evidence_type": "structured_data", "tool_name": "system_context",
+            "source_name": "Apex intraday", "source_url": None,
+            "published_at": date.today().isoformat(), "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current", "as_of": date.today().isoformat(),
+            "frequency": "intraday", "is_complete": False,
+            "nature": "current",
+            "independence_group": f"intraday:{ts_code}:{date.today().isoformat()}", "dimension": "technical",
+        })
+    items.append({
+        "id": "sys_stock_profile",
+        "fact": json.dumps(profile.to_dict(), ensure_ascii=False, sort_keys=True),
+        "inference": "确定性软分类与混合权重，不作为方向证据",
+        "evidence_type": "classification", "tool_name": "stock_profile",
+        "source_name": "Apex stock profile", "source_url": None,
+        "published_at": as_of_iso, "source_tier": 1, "entity_matched": True,
+        "freshness_status": "current", "as_of": as_of_iso, "frequency": "daily",
+        "is_complete": True, "independence_group": "stock_profile", "dimension": "fundamental",
+        "nature": "fact",
+    })
+    return items
+
+
+def _format_policy_context(profile: StockProfile, evidence_items: list[dict]) -> str:
+    ledger = [
+        {
+            "evidence_id": item["id"], "dimension": item.get("dimension"),
+            "as_of": item.get("as_of"), "frequency": item.get("frequency"),
+            "nature": item.get("nature"),
+            "is_complete": item.get("is_complete"), "independence_group": item.get("independence_group"),
+            "fact": item.get("fact"),
+        }
+        for item in evidence_items if item.get("id") != "sys_stock_profile"
+    ]
+    return (
+        "## 后端确定性决策上下文\n"
+        f"- 股票软分类：`{json.dumps(profile.to_dict(), ensure_ascii=False)}`\n"
+        "- 最终方向由 Python 根据 evidence_claims 计算；模型 verdict 仅供审计。\n"
+        "- 每边可提交 0-3 条 claim；市场情绪派生指标只能引用同一 independence_group 一次。\n"
+        f"- 可引用的系统证据账本：`{json.dumps(ledger, ensure_ascii=False)}`"
+    )
+
+
 def _safety_scan_outcome(parsed: dict) -> bool:
     """权威扫描是否执行成功（与是否命中 Tier 1 无关）。"""
     return not bool(parsed.get("error"))
@@ -1810,6 +1989,29 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
         if confidence is not None and any(value != float(confidence) for value in all_confidence_claims):
             if "存在冲突的置信度" not in issues:
                 issues.append("存在冲突的置信度")
+        if candidate.get("evidence_coverage") is not None:
+            expected_coverage = round(float(candidate["evidence_coverage"]) * 100, 1)
+            _validate_labeled_number(text, "证据覆盖率", expected_coverage, issues)
+        if candidate.get("net_hardness") is not None:
+            _validate_labeled_number(text, "净硬度", candidate["net_hardness"], issues)
+        allowed_evidence_ids = set(candidate.get("counted_evidence_ids") or [])
+        if candidate.get("evidence_coverage") is not None:
+            headings = ("## 一、多头论点", "## 二、空头论点", "## 三、裁判结论")
+            for index, heading in enumerate(headings[:2]):
+                start = text.find(heading)
+                end = text.find(headings[index + 1], start + len(heading)) if start >= 0 else -1
+                section = text[start + len(heading):end] if start >= 0 and end >= 0 else ""
+                content_lines = [line.strip() for line in section.splitlines() if line.strip()]
+                bullets = [line for line in content_lines if line.startswith("-")]
+                if len(bullets) != len(content_lines):
+                    issues.append(f"{heading}存在未按 evidence_id 列表呈现的论点")
+                if len(bullets) > 3:
+                    issues.append(f"{heading}超过 3 条证据")
+                for bullet in bullets:
+                    ids = re.findall(r"\[((?:ev_|sys_)[^\]]+)\]", bullet)
+                    if len(ids) != 1 or ids[0] not in allowed_evidence_ids:
+                        issues.append(f"{heading}包含未计分或未标注 evidence_id 的证据")
+                        break
         all_verdict_claims = re.findall(
             r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", text,
         )
@@ -1973,7 +2175,7 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
                 tool_name=name,
                 source=row,
             ))
-        return items
+        return [_with_policy_metadata(item, name) for item in items]
     if name == "mx_news_search" and isinstance(parsed, dict):
         items, seen = [], set()
         stock_name = data.get_name_map().get(ts_code) or ""
@@ -2003,12 +2205,12 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
             ))
             if len(items) >= 8:
                 break
-        return items
+        return [_with_policy_metadata(item, name) for item in items]
     summary = trace_mod.summarize_tool_result(name, raw)
     if not isinstance(summary, dict) or summary.get("error") or summary.get("note"):
         return []
     fact = json.dumps(summary, ensure_ascii=False, sort_keys=True)[:800]
-    return [make_evidence_item(
+    return [_with_policy_metadata(make_evidence_item(
         fact=fact,
         inference="结构化数据，供多空论证使用",
         # 妙想等返回的公告/业绩内容按内容归入对应 material 桶（tier 1），
@@ -2019,17 +2221,47 @@ def _tool_evidence(name: str, raw: str, ts_code: str) -> list[dict]:
             "title": name, "site": name, "url": "", "date": date.today().isoformat(),
             "source_tier": 1, "entity_matched": True, "freshness_status": "current",
         },
-    )]
+    ), name)]
+
+
+def _with_policy_metadata(item: dict, tool_name: str) -> dict:
+    """Attach backend-owned claim metadata before evidence reaches the model."""
+    evidence_type = str(item.get("evidence_type") or "")
+    lower_tool = tool_name.lower()
+    if any(marker in lower_tool for marker in ("moneyflow", "money_flow", "northbound", "dragon_tiger")):
+        dimension = "capital"
+    elif any(marker in lower_tool for marker in ("daily_price", "realtime", "technical")):
+        dimension = "technical"
+    elif evidence_type == "money_flow":
+        dimension = "capital"
+    elif evidence_type in {"industry", "market_sentiment"}:
+        dimension = "sentiment"
+    else:
+        dimension = "fundamental"
+    is_event = evidence_type not in {"structured_data", "money_flow", "market_sentiment"}
+    as_of = item.get("as_of") or item.get("published_at") or date.today().isoformat()
+    return {
+        **item,
+        "dimension": dimension,
+        "nature": "fact" if is_event else "current",
+        "as_of": as_of,
+        "frequency": item.get("frequency") or ("event" if is_event else "daily"),
+        "is_complete": bool(item.get("is_complete", True)),
+        "independence_group": item.get("independence_group") or item["id"],
+    }
 
 
 def _run_langgraph_loop(
     *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
     system_context: str = "",
     finalize_candidate: Callable[[str, dict], tuple[dict, dict]] | None = None,
+    prepare_candidate: Callable[[str, dict, list[dict]], tuple[dict, dict]] | None = None,
+    initial_evidence: list[dict] | None = None,
     position_baseline: dict | None = None,
 ) -> dict:
     """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
     controller = EvidenceController()
+    controller.add_evidence(list(initial_evidence or []))
     stock_name = data.get_name_map().get(ts_code) or ""
 
     def parse_review_json(content: str) -> dict:
@@ -2043,7 +2275,7 @@ def _run_langgraph_loop(
         emit({"type": "status", "stage": "preparing", "message": "正在准备分析上下文"})
         return {
             "messages": list(messages), "analysis_text": "", "model_iterations": 0,
-            "research_rounds": 0, "evidence": [], "gaps": [],
+            "research_rounds": 0, "evidence": list(controller.evidence.values()), "gaps": [],
             "position_baseline": deepcopy(position_baseline or {}), "draft_proposal": {},
         }
 
@@ -2193,10 +2425,11 @@ def _run_langgraph_loop(
                 for field in ("entry", "stop_loss", "target")
                 if not isinstance(tool_input.get(field), (int, float)) or tool_input.get(field) <= 0
             )
-        if (name == "record_verdict" and tool_input.get("stock_type") == "成长股"
+        if (name == "record_verdict"
+                and tool_input.get("growth_valuation_mode") in {"required", "mixed"}
                 and tool_input.get("verdict") in BEARISH_VERDICTS
                 and tool_input.get("valuation_basis") in (None, "static_pe_only")):
-            blockers.append("成长股偏空不得仅使用静态 PE")
+            blockers.append("成长成员分已启用估值约束，偏空不得仅使用静态 PE")
         if name == "record_verdict" and _valuation_basis_conflict(tool_input, controller.thesis):
             blockers.append("空头论点明确使用估值依据，valuation_basis 不得填 non_valuation")
         try:
@@ -2213,12 +2446,14 @@ def _run_langgraph_loop(
         draft_kind = state.get("draft_kind") or ""
         draft_data = dict(state.get("draft_data") or {})
         draft_proposal = dict(state.get("draft_proposal") or {})
+        finalization_metadata = dict(state.get("finalization_metadata") or {})
         for tool_call in state.get("pending_tools") or []:
             name = tool_call.function.name
             try:
                 tool_input = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
                 tool_input = {}
+            tool_message_content = ""
             emit({
                 "type": "tool_call", "iteration": state.get("model_iterations", 1) - 1,
                 "tool_call_id": tool_call.id, "name": name, "args": tool_input,
@@ -2250,6 +2485,17 @@ def _run_langgraph_loop(
                         "finalization": controller.finalization_decision().allowed,
                     }, ensure_ascii=False)
                 elif name in {"record_verdict", "record_position_action"}:
+                    if name == "record_verdict" and prepare_candidate is not None:
+                        try:
+                            tool_input, policy_metadata = prepare_candidate(
+                                "verdict", tool_input, list(controller.evidence.values()),
+                            )
+                            finalization_metadata.update(policy_metadata)
+                        except (EvidenceClaimError, ValueError) as exc:
+                            result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                            tool_span.set_outputs({"result": result})
+                            appended.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+                            continue
                     blockers = _candidate_blockers(name, tool_input)
                     proposal, effective = {}, {}
                     if name == "record_position_action":
@@ -2282,7 +2528,27 @@ def _run_langgraph_loop(
                                 name, success=success,
                                 error=str(parsed.get("error") or "") if isinstance(parsed, dict) else "",
                             )
-                            controller.add_evidence(_tool_evidence(name, result, ts_code))
+                            new_evidence = _tool_evidence(name, result, ts_code)
+                            controller.add_evidence(new_evidence)
+                            if new_evidence:
+                                tool_message_content = (
+                                    str(result)
+                                    + "\n\nEVIDENCE_LEDGER_IDS="
+                                    + json.dumps([
+                                        {
+                                            "evidence_id": item.get("id"),
+                                            "fact": item.get("fact"),
+                                            "source_tier": item.get("source_tier"),
+                                            "dimension": item.get("dimension"),
+                                            "nature": item.get("nature"),
+                                            "as_of": item.get("as_of"),
+                                            "frequency": item.get("frequency"),
+                                            "is_complete": item.get("is_complete"),
+                                            "independence_group": item.get("independence_group"),
+                                        }
+                                        for item in new_evidence
+                                    ], ensure_ascii=False)
+                                )
                         except Exception as exc:
                             controller.record_external_call(name, success=False, error=str(exc))
                             result = json.dumps({"error": str(exc)}, ensure_ascii=False)
@@ -2292,10 +2558,14 @@ def _run_langgraph_loop(
                         "summary": trace_mod.summarize_tool_result(name, result), "raw": result,
                     })
                 tool_span.set_outputs({"result": result})
-            appended.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+            appended.append({
+                "role": "tool", "tool_call_id": tool_call.id,
+                "content": tool_message_content or result,
+            })
         return {
             "messages": appended, "pending_tools": [],
             "draft_kind": draft_kind, "draft_data": draft_data, "draft_proposal": draft_proposal,
+            "finalization_metadata": finalization_metadata,
             "evidence": list(controller.evidence.values()),
             "gaps": list(controller.gaps), "research_rounds": controller.research_rounds,
         }
@@ -2380,6 +2650,17 @@ def _run_langgraph_loop(
                     continue
                 candidate = json.loads(calls[0].function.arguments or "{}")
                 with observability.tool_trace(tool_name, candidate) as tool_span:
+                    policy_metadata = dict(state.get("finalization_metadata") or {})
+                    if tool_name == "record_verdict" and prepare_candidate is not None:
+                        try:
+                            candidate, prepared_metadata = prepare_candidate(
+                                "verdict", candidate, list(controller.evidence.values()),
+                            )
+                            policy_metadata.update(prepared_metadata)
+                        except (EvidenceClaimError, ValueError) as exc:
+                            failure = str(exc)
+                            tool_span.set_outputs({"result": {"error": failure}})
+                            continue
                     blockers = _candidate_blockers(tool_name, candidate)
                     proposal, effective = {}, {}
                     if tool_name == "record_position_action":
@@ -2400,6 +2681,7 @@ def _run_langgraph_loop(
                         "draft_kind": "position_action" if held else "verdict",
                         "draft_data": effective if tool_name == "record_position_action" else candidate,
                         "draft_proposal": proposal if tool_name == "record_position_action" else {},
+                        "finalization_metadata": policy_metadata,
                         "draft_route": "review",
                     }
                     tool_span.set_outputs({"result": result})
@@ -2529,11 +2811,11 @@ def _run_langgraph_loop(
         emit({"type": "status", "stage": "reporting", "message": "正在生成正式分析报告"})
         kind = str(state.get("draft_kind") or "")
         candidate = dict(state.get("draft_data") or {})
-        finalization_metadata: dict = {}
+        finalization_metadata: dict = dict(state.get("finalization_metadata") or {})
         if finalize_candidate is not None:
-            candidate, finalization_metadata = finalize_candidate(kind, candidate)
+            candidate, late_metadata = finalize_candidate(kind, candidate)
             candidate = dict(candidate or {})
-            finalization_metadata = dict(finalization_metadata or {})
+            finalization_metadata.update(dict(late_metadata or {}))
         if kind == "position_action":
             candidate = _effective_position_report_candidate(candidate)
             heading_contract = "\n".join(_POSITION_REPORT_SECTIONS)
@@ -2567,20 +2849,33 @@ def _run_langgraph_loop(
                 "未持仓 verdict 报告必须依次包含这些标题：\n"
                 + heading_contract + "\n\n"
                 "核心判断必须逐字写出 `**判断：<verdict>**` 和 `**置信度：<confidence>/10**`。"
+                "裁判结论必须逐字写出 `**证据覆盖率：<coverage_pct>%**` 和 `**净硬度：<net_hardness>**`。"
+                "多空论点每条必须以 `- [<evidence_id>]` 开头，只能使用 confirmed_evidence 中的 ID，每边 0-3 条。"
                 "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
                 "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
             )
+        decision_policy_context = finalization_metadata.get("decision_policy") or {}
+        counted_ids = {
+            item.get("evidence_id")
+            for item in decision_policy_context.get("counted_claims") or []
+        }
         confirmed_evidence = [
             {
                 key: item.get(key)
                 for key in (
                     "id", "fact", "inference", "evidence_type", "source_name",
                     "source_url", "published_at", "source_tier", "freshness_status",
+                    "as_of", "frequency", "is_complete", "independence_group",
                 )
                 if item.get(key) is not None
             }
             for item in (state.get("evidence") or [])
+            if kind != "verdict" or not decision_policy_context or item.get("id") in counted_ids
         ]
+        report_decision_policy = {
+            key: value for key, value in decision_policy_context.items()
+            if key != "excluded_claims"
+        }
         authoritative_context = {
             "kind": kind,
             "confirmed_evidence": confirmed_evidence,
@@ -2589,6 +2884,9 @@ def _run_langgraph_loop(
             "unknowns": list(state.get("unknowns") or []),
             "review_outcome": state.get("review_outcome"),
             "review_issues": list(state.get("review_issues") or []),
+            "decision_policy": report_decision_policy,
+            "stock_profile": finalization_metadata.get("stock_profile") or {},
+            "calibration": finalization_metadata.get("calibration") or {},
         }
         if kind == "position_action":
             authoritative_context.update({
@@ -2597,18 +2895,19 @@ def _run_langgraph_loop(
             })
         else:
             authoritative_context["candidate"] = candidate
-            authoritative_context["system_context"] = system_context
+            if not decision_policy_context:
+                authoritative_context["system_context"] = system_context
         report_contract = (
             "你是 Apex 的正式投资分析报告编辑。候选结论已经完成证据门控和独立复核，"
             "你只能解释它，不得改变其中任何机器字段。基于给定对话、工具结果、证据和候选结论，"
             "输出唯一一份干净的 Markdown 正式报告；不要调用工具，不要描述查询过程或自我修正。\n\n"
             + format_contract
             + "基本面分析必须引用具体营收、利润、现金流、ROE、负债或估值数据；数据未知就明确写未知，禁止编造。"
-            "多头和空头各至少三条，格式为数据点 → 推论；裁判必须比较双方最硬证据。"
-            "评分和置信度调整必须列出计算过程。操作建议必须与最终方向及价格建议一致。\n\n"
-            "以下是正式报告的权威上下文。confirmed_evidence"
-            + (" 与 system_context" if kind != "position_action" else "")
-            + " 视为已验证；"
+            "多头和空头各写 0-3 条经后端计入的证据，不得为了凑数添加论据；"
+            "裁判必须引用权威上下文 decision_policy 中的覆盖率、净硬度和去重结果。"
+            "置信度只解释后端的一次性校准结果，不得再次手工加减。"
+            "操作建议必须与最终方向及价格建议一致。\n\n"
+            "以下是正式报告的权威上下文。confirmed_evidence 视为已验证；"
             "原始对话中的未收录材料不得覆盖它。"
             + (
                 "effective 是不可修改的最终机器结果；baseline_for_change_explanation 只可解释变化，绝不可作为另一份结果。\n"
@@ -2627,10 +2926,11 @@ def _run_langgraph_loop(
                 )
                 emit({"type": "report_retry", "attempt": attempt + 1, "issues": issues})
             try:
+                prior_messages = [] if decision_policy_context else list(state.get("messages") or [])
                 response = client.chat.completions.create(
                     model=model,
                     messages=[
-                        *(state.get("messages") or []),
+                        *prior_messages,
                         {"role": "user", "content": report_contract + retry},
                     ],
                     max_tokens=16384, temperature=0.2 if attempt == 0 else 0,
@@ -2738,7 +3038,6 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
     max_iter = cfg["deepseek"]["max_tool_iterations"]
     history_limit = cfg["deepseek"].get("history_limit", 8)
     client = _make_client(cfg)
-    system = _load_system_prompt()
     candidate_context = dict(candidate_context or {"source_type": "manual", "red_flag": False})
     candidate_context.setdefault("source_type", "manual")
     candidate_context.setdefault("red_flag", False)
@@ -2757,6 +3056,7 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
                 pass
 
     history_entries = journal.load_verdicts(ts_code=ts_code)
+    forecast_rows = forecast_calibration.refresh_forecast_rows(journal.load_verdicts())
     history_block = _format_history(
         history_entries, ts_code=ts_code, limit=history_limit,
     )
@@ -2788,11 +3088,23 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         playstyle_block = f"## 玩法特征\n（加载失败: {type(e).__name__}: {e}）"
         playstyle_feats = {"completeness": 0.0, "risk_level": None, "features": {}, "notes": [f"FE 异常: {e}"]}
 
+    stock_profile = _stock_profile_from_context(ts_code, playstyle_feats, candidate_context)
+    initial_evidence = _system_evidence_items(
+        ts_code=ts_code, profile=stock_profile, playstyle_feats=playstyle_feats,
+        market_ctx=market_ctx, intraday_ctx=intraday_ctx,
+    )
+    policy_block = _format_policy_context(stock_profile, initial_evidence)
+    selected_skills = ["playstyle"]
+    if stock_profile.growth_valuation_mode != "disabled":
+        selected_skills.append("growth-stock")
+    system = _load_system_prompt(skill_names=selected_skills)
+
     _emit({"type": "context", "name": "history", "content": history_block})
     _emit({"type": "context", "name": "portfolio", "content": portfolio_block})
     _emit({"type": "context", "name": "intraday", "content": intraday_block})
     _emit({"type": "context", "name": "market", "content": market_block})
     _emit({"type": "context", "name": "playstyle", "content": playstyle_block})
+    _emit({"type": "context", "name": "decision_policy", "content": policy_block})
     _emit({"type": "context", "name": "candidate", "content": candidate_block})
 
     messages = [
@@ -2806,130 +3118,54 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
                 f"{intraday_block}\n\n"
                 f"{market_block}\n\n"
                 f"{playstyle_block}\n\n"
+                f"{policy_block}\n\n"
                 f"{candidate_block}\n\n"
-                "步骤：\n"
-                "0) **股票类型分类（必须最先做，在深入分析任何数据前完成）**：\n"
-                "   优先利用已注入数据；若 circ_mv / PE_TTM / turnover_rate / industry / 龙虎榜频次存在关键缺口，\n"
-                "   再按缺口调用 get_fundamentals / get_stock_info / get_dragon_tiger_list，\n"
-                "   以及 quarters（最近4季财务）和 summary.flags（Python预计算的风险标记）后，\n"
-                "   对照下表自行判断标的类型并**显式声明**：\n"
-                "\n"
-                "   | 类型 | 识别特征 | 财务特征 | 技术 | 基本 | 资金 | 情绪 |\n"
-                "   |------|---------|---------|------|------|------|------|\n"
-                "   | 蓝筹/白马 | circ_mv > 500亿, PE适中, 消费/金融/公用 | ROE>10%稳定, 负债率<60%, OCF为正 | 30% | 50% | 10% | 10% |\n"
-                "   | 题材/游资 | circ_mv < 100亿, turnover >5%, 龙虎榜常客 | 仅排雷: 负债率, 连续亏损 | 35% | 15% | 30% | 20% |\n"
-                "   | 周期股 | 钢铁/煤炭/有色/化工/建材/航运/养殖 | ROE周期性波动, 高杠杆需警惕 | 25% | 35% | 20% | 20% |\n"
-                "   | 成长股 | circ_mv 100-500亿, PE偏高, 科技/医药/新能源 | 营收增速>20%, 毛利率扩张/稳定 | 30% | 40% | 15% | 15% |\n"
-                "   | 均衡型 | 无法明确归类 | 多特征混合 | 25% | 25% | 25% | 25% |\n"
-                "\n"
-                "   声明格式：「**标的类型：XX**，四维权重：技术 X%/基本 X%/资金 X%/情绪 X%」\n"
-                "   如果 circ_mv / PE / turnover_rate 数据缺失（新股或数据源故障），\n"
-                "   根据 industry + 龙虎榜频次 + 上市时间做最佳推断，并在声明中注明「数据缺失，推断分类」。\n"
-                "   **必须引用 summary.flags 中的 Python 预计算风险标记**，不要自己重新判断 ROE 趋势或负债率阈值。\n"
-                "   分类完成后，后续所有步骤的分析深度和证据选择必须按上表权重分配精力。\n"
-                "   **成长股特别提示**：成长股估值看「未来增长能否消化当前估值」，禁止仅凭静态 PE_TTM 偏高就偏空（详见步骤 3 成长股估值约束）。\n"
-                "\n"
-                "1) 数据：检查行情、技术、财务和资金证据是否足够；仅在缺口影响结论时调用相应结构化工具。\n"
-                "\n"
-                "   **结构化补充工具（推荐使用，但非强制）**：\n"
-                "   · get_unlock_schedule — 限售解禁日程；多头判断前建议查，短期大额解禁是关键利空\n"
-                "   · mx_data_query — 妙想金融数据查询（东方财富）。当蓝筹/白马或成长股缺少营收、净利润、\n"
-                "     ROE、毛利率、经营现金流或前瞻估值等关键证据时优先调用。\n"
-                "   · mx_news_search — 妙想财经资讯搜索（东方财富），比博查更垂直精准，\n"
-                "     适合搜研报/新闻/公告\n"
-                "   · mx_stock_screen — 妙想智能选股，自然语言批量筛选候选标的，\n"
-                "     如\"市盈率低于20且ROE大于15%的A股\"\n"
-                "   以上 MX 工具是东财官方数据源，返回结构化数据，与博查 web_search 互补：\n"
-                "   查财经数据/新闻用 MX，查监管/政策用 web_search。\n"
-                "\n"
-                "2) 联网搜索只用于查漏补缺。系统已自动执行权威黑天鹅扫描；你应先分析结构化数据，\n"
-                "   再按证据缺口自主选择 web_search / mx_news_search / mx_data_query。不要为了覆盖类别而搜索。\n"
-                "   搜索报错、空结果、串票和 Tier 3 线索都不能当成决策证据；重大事实需 Tier 1 或交叉验证。\n"
-                "   **股票类型提示**：蓝筹/白马和成长股在 earnings 类别中应额外关注营收/利润趋势的持续性；\n"
-                "   题材/游资股在 money_flow 类别中应重点关注游资动向和席位分析。\n"
-                "   每轮分析或补证后调用 submit_research_state，明确关键缺口与是否收敛。\n"
-                "\n"
-                "3) 三段式辩论（写在 message content 里）：\n"
-                "   ### 一、多头论点（≥3 条，格式：数据点 → 推论）\n"
-                "   引用 K 线/基本面/消息面的具体数字，禁空话。\n"
-                "   **股票类型约束**：蓝筹/白马的多头论点中，至少 2 条必须来自合格的结构化或权威基本面证据；\n"
-                "   题材/游资的多头论点中，资金面（龙虎榜/北向/主力流向）必须占至少 1 条。\n"
-                "   ### 二、空头论点（≥3 条，禁「虽然 X 但是 Y」）\n"
-                "   独立反方证据；至少 1 条直接反驳多头第 N 条；必须考虑估值/解禁减持/行业景气/技术背离/历史回撤。\n"
-                "   **股票类型约束**：蓝筹/白马的空头论点必须包含估值分析（PE 历史分位 / 与行业均值对比）；\n"
-                "   周期股的空头论点必须考虑周期位置（产品价格趋势 / 产能周期 / 库存水平）。\n"
-                "   **成长股估值约束（禁止静态 PE 偏空）**：成长股估值的核心是「未来增长能否消化当前估值」，\n"
-                "   静态 PE_TTM 不得单独作为偏空结论的主要依据。估值分析必须优先采用：Future EPS / Forward PE / PEG / 利润增速 / 行业增速\n"
-                "   （前瞻数据用 mx_data_query 查一致预期/业绩预告；get_fundamentals 已给 trailing PEG = pe_ttm/净利润同比增速 供参考）。\n"
-                "   判定树：\n"
-                "     成长股 -> 利润未来三年是否高速增长？\n"
-                "       是 -> Forward PE 是否快速下降？ 是 -> PE 高不是问题（高 PE 合理）\n"
-                "       否 -> PEG 是否 > 2？ 是 -> 估值开始危险\n"
-                "   即：不是「PE=190 -> 危险」，而是「PE=190 -> 利润未来还能翻倍吗？-> 能 -> PE 不是核心问题」。\n"
-                "   **只有当三者同时成立--利润增长明显放缓、且 Forward PE 仍极高、且 PEG 明显失衡--才能把估值作为主要空头证据；\n"
-                "   否则高 PE 只能作为风险提示写入 evidence，不得据此偏空。**\n"
-                "   ### 三、裁判结论\n"
-                "   多空各自最硬的 1 条；互斥矛盾点 → 倾向哪边？为什么？\n"
-                "   **必须包含加权四维评分**（按步骤 0 声明的权重）：\n"
-                "   - 技术面 X 分 × Wt% = Y\n"
-                "   - 基本面 X 分 × Wf% = Y\n"
-                "   - 资金面 X 分 × Wm% = Y\n"
-                "   - 情绪面 X 分 × Ws% = Y\n"
-                "   - 加权总分 = Z → 档位\n"
-                "   最终 verdict + initial_confidence (1-10)\n"
-                "\n"
-                "4) **置信度调整（一次性结算）**：以 initial_confidence 为基准，遍历下表逐条结算。\n"
-                "   最终 final_confidence = clamp(initial − 扣减总和 + 加分总和, 1, 10)。\n"
-                "   在裁判结论里逐条列出命中的规则与具体数额。\n"
-                "\n"
-                "   | 条件 | 调整 |\n"
-                "   |---|---|\n"
-                "   | 历史命中率 < 50% 或中位收益为负（历史 ≥ 3 次才触发；< 3 次改为 **−1**） | **−2**（≥3次）/ **−1**（<3次） |\n"
-                "   | 每条「空头论点未被第三段有效反驳」 | **−1/条** |\n"
-                "   | 加仓突破行业集中度（≥3 同行业）或总风险逼近上限 | **−1** |\n"
-                "   | 多头判断 + 大盘弱势（沪深300 5日 < −2%） | **−1** |\n"
-                "   | 多头判断 + 板块跑输大盘（5日 差 < −1%） | **−1** |\n"
-                "   | 多头判断 + 个股跑输板块（5日 差 < −1.5%） | **−1** |\n"
-                "   | 多头判断 + 板块强于大盘（5日 差 ≥ +1.5%） | **+1** |\n"
-                "   | 多头判断 + 业绩超预期（最近季度净利润 yoy ≥ +30%）且 PE_TTM ≤ 30 | **+1** |\n"
-"   | 成长股 + 偏空 + 估值作为主要依据但未引用 Forward PE / PEG / 一致预期数字 | **−2**（静态 PE 偏空误杀高成长标的） |\n"
-                "   | 空头判断 + ST/退市风险 或 监管立案/处罚 | **+1** |\n"
-                "   | 空头判断 + regime 弱势（任一 regime 利空命中） | 顺势，不扣不加 |\n"
-                "   | **24h 内重复分析** | 系统自动限幅：方向 ±1 档 / conf ±2（防 LLM 随机漂移）。AI 如实给判断、不要自行压分；在 record_verdict 的 new_info 列出本次新增信息，系统据此判断是否豁免限幅 |\n"
-                "   | **蓝筹/白马 + 基本面证据 < 2 条** | **−2**（基本面权重 50% 但没有实质证据，置信度必须打折扣） |\n"
-                "   | **题材/游资 + 资金面证据缺失** | **−1**（资金面权重 30%，没有龙虎榜/主力流向数据则信号不完整） |\n"
-                "\n"
-                "5) 调 record_verdict：先把公司/方向观点与当前交易时点分开。只有现在具备有效买点才 proposed_trade_action=buy；长期看好但需等确认必须 watch；应回避填 avoid。填写 entry_style 和 valid_for_days。confidence 填 final_confidence；evidence ≥3 条，格式「数据点 → 推论」，引用真实数字。setup_tag 从种子词表（打板/首板/龙回头/板块轮动/超跌反弹/趋势突破/业绩驱动/题材炒作/低位反转）选最贴切本次驱动逻辑的一个，都不贴切填「其他:<自定义>」。\n"
-                "   **stock_type 必填**：填步骤 0 声明的标的类型（蓝筹白马/题材游资/周期股/成长股/均衡型）。\n"
-                "   **valuation_basis**（仅偏空类必填）：本次空头结论中「估值」是不是主要依据--\n"
-                "   forward_valuation=基于 Forward PE/PEG/一致预期等前瞻估值（成长股偏空唯一允许的估值依据）/ static_pe_only=仅静态 PE_TTM / non_valuation=估值非主要依据。\n"
-                "   **成长股 + 偏空 + valuation_basis=static_pe_only（或缺填）会被系统拒绝**，逼你补前瞻估值后重调。\n"
-                "\n"
-                "6) **自我检查（在调用 record_verdict 前完成，写在 message content 末尾）**：\n"
-                "   - [ ] 我的四维权重与声明的股票类型是否一致？\n"
-                "   - [ ] 蓝筹/成长股：基本面证据是否 ≥ 2 条且来自合格的结构化数据或 Tier 1/2 来源？\n"
-                "   - [ ] 题材/游资股：我是否错误地把\"基本面\"当成了主要判断依据？\n"
-                "   - [ ] 周期股：我是否在 PE 很低时说\"估值便宜\"（这是周期股陷阱）？\n"
-                "   - [ ] 成长股：我是否仅凭静态 PE_TTM 偏高就偏空？是否用 mx_data_query 查了一致预期/Forward PE/PEG？只有「增长放缓 + Forward PE 极高 + PEG 失衡」三者同时成立，估值才能作为主要空头依据，否则高 PE 只能是风险提示。\n"
-"   - [ ] 我的 K 线分析深度是否与股票类型匹配（蓝筹股不需要逐根 K 线数浪）？\n"
-                "   - [ ] setup_tag 是否反映了本次最核心的驱动逻辑（而非随便选一个）？\n"
-                "   如果任一条不通过，回到对应步骤修正后再调 record_verdict。"
+                "工作流：先分析已注入的结构化上下文，再按关键缺口调用工具；每轮补证后调用 "
+                "submit_research_state。证据收敛后提交 record_verdict。\n"
+                "record_verdict 中每边提交 0-3 条 evidence_claims，必须引用系统或工具返回的 "
+                "evidence_id；不得凑数，不得把同源市场情绪拆成多条。\n"
+                "只填写 model_confidence，不要应用历史胜率、市场环境或未反驳论点等人工加减分；"
+                "股票类型、四维权重、最终方向和最终置信度由后端确定。\n"
+                "盘中数据 is_complete=false，只能作风险提示，不能确认日线突破或反转。"
             ),
         },
     ]
+
+    def _prepare_policy_candidate(kind: str, candidate: dict, ledger: list[dict]) -> tuple[dict, dict]:
+        if kind != "verdict":
+            return dict(candidate), {}
+        policy_candidate, metadata = apply_accuracy_policy(
+            {
+                **candidate,
+                "stock_type": stock_profile.primary_type,
+                "growth_valuation_mode": stock_profile.growth_valuation_mode,
+            },
+            stock_profile,
+            {
+                "analysis_date": datetime.now(_TZ_CN).date().isoformat(),
+                "evidence_ledger": {item["id"]: item for item in ledger},
+                "sector_available": bool(market_ctx.get("sector")),
+            },
+            forecast_rows=forecast_rows,
+        )
+        limited, repeat_metadata = _audit_repeat_candidate(
+            policy_candidate, history_entries,
+        )
+        metadata.update(repeat_metadata)
+        metadata["stock_profile"] = stock_profile.to_dict()
+        return limited, metadata
 
     graph_result = _run_langgraph_loop(
         ts_code=ts_code, client=client, model=model, messages=messages,
         max_iter=max_iter, emit=_emit,
         system_context="\n\n".join(
             block for block in (
-                history_block, portfolio_block, intraday_block, market_block, playstyle_block, candidate_block,
+                history_block, portfolio_block, intraday_block, market_block, playstyle_block,
+                policy_block, candidate_block,
             ) if block
         ),
-        finalize_candidate=lambda kind, candidate: (
-            _finalize_verdict_candidate(candidate, history_entries)
-            if kind == "verdict" else (dict(candidate), {})
-        ),
+        prepare_candidate=_prepare_policy_candidate,
+        initial_evidence=initial_evidence,
         position_baseline=position_baseline,
     )
     analysis_text = str(graph_result.get("analysis_text") or "")
@@ -2963,7 +3199,18 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         )
         entry["market_context"] = market_ctx
         entry["candidate_context"] = candidate_context
-        entry["prompt_version"] = "3.0.0-langgraph"
+        entry["prompt_version"] = "3.1.0-decision-policy"
+        entry["policy_version"] = "decision-policy-v1"
+        entry["stock_profile"] = stock_profile.to_dict()
+        entry["decision_policy"] = None
+        entry["model_verdict"] = None
+        entry["model_confidence"] = None
+        entry["forecast_outcome"] = None
+        entry["data_quality"] = {
+            "sector_available": bool(market_ctx.get("sector")),
+            "excluded_claims": [],
+            "counted_evidence_ids": [],
+        }
         entry["token_usage"] = token_usage
         if save:
             journal.write_entry(entry)
@@ -2995,17 +3242,8 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         (graph_result.get("finalization_metadata") or {}).get("repeat_analysis") or {}
     )
 
-    cal_score: Optional[float] = None
-    cal_explanation = ""
-    if limited_confidence is not None:
-        try:
-            cal_score, cal_explanation = calibration.calibrate_confidence(
-                int(limited_confidence), limited_verdict,
-            )
-            if cal_score is not None:
-                cal_score = max(1.0, min(10.0, float(cal_score)))
-        except Exception as e:
-            cal_explanation = f"校准失败: {e}"
+    cal_score = verdict_data.get("calibrated_confidence", limited_confidence)
+    cal_explanation = str(verdict_data.get("calibration_explanation") or "")
 
     now_cn = datetime.now(_TZ_CN)
     # 中文名: 优先 name map(一次拉全量), 兜底 None。写入 journal 供历史列表直接展示。
@@ -3050,13 +3288,33 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         "market_context": market_ctx,
         "analysis_text": analysis_text.strip(),
         "repeat_analysis": repeat_info,
-        "prompt_version": "3.0.0-langgraph",
+        "prompt_version": "3.1.0-decision-policy",
         "source": candidate_context.get("strategy") or candidate_context.get("source_type") or "manual",
         "candidate_context": candidate_context,
         "decision_schema_version": "1.0",
         "token_usage": token_usage,
         "setup_tag": verdict_data.get("setup_tag"),
         "stock_type": verdict_data.get("stock_type"),
+        "stock_profile": stock_profile.to_dict(),
+        "decision_policy": dict(
+            (graph_result.get("finalization_metadata") or {}).get("decision_policy") or {}
+        ),
+        "model_verdict": verdict_data.get("model_verdict"),
+        "model_confidence": verdict_data.get("model_confidence"),
+        "forecast_outcome": None,
+        "policy_version": "decision-policy-v1",
+        "data_quality": {
+            "sector_available": bool(market_ctx.get("sector")),
+            "excluded_claims": list((
+                (graph_result.get("finalization_metadata") or {}).get("decision_policy") or {}
+            ).get("excluded_claims") or []),
+            "counted_evidence_ids": [
+                item.get("evidence_id") for item in (
+                    ((graph_result.get("finalization_metadata") or {}).get("decision_policy") or {})
+                    .get("counted_claims") or []
+                )
+            ],
+        },
         "valuation_basis": verdict_data.get("valuation_basis"),
         # ── Playstyle Engine v1（A2 持久化 FE 特征 / D13 risk_level / skill 分支 AI 填 playstyle / T6 契合度脚手架）──
         "playstyle": playstyle_value,                       # {ratings,primary,secondary,reasons,method,low_confidence} 或 null(FE<0.5)
@@ -3118,7 +3376,7 @@ def run(ts_code: str, save: bool = True, on_progress=None,
         save=save,
         candidate_context=normalized_context,
         model=cfg["deepseek"]["model"],
-        prompt_version="3.0.0-langgraph",
+        prompt_version="3.1.0-decision-policy",
         held=held,
     ) as span:
         result = _run_analysis(
@@ -3131,6 +3389,12 @@ def run(ts_code: str, save: bool = True, on_progress=None,
             "analysis_status": result.get("analysis_status"),
             "outcome_reason": result.get("outcome_reason"),
             "verdict": result.get("verdict"),
+            "model_verdict": result.get("model_verdict"),
+            "model_confidence": result.get("model_confidence"),
+            "calibrated_confidence": result.get("calibrated_confidence"),
+            "stock_profile": result.get("stock_profile"),
+            "decision_policy": result.get("decision_policy"),
+            "policy_version": result.get("policy_version"),
             "action": (result.get("position_action") or {}).get("action"),
             "token_usage": result.get("token_usage") or {},
         })

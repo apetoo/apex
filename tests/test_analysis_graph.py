@@ -614,7 +614,7 @@ def test_run_passes_distinct_proposal_effective_state_and_frozen_baseline_to_fin
         "deepseek": {"model": "fake", "max_tool_iterations": 1, "history_limit": 1},
     })
     monkeypatch.setattr(analyze, "_make_client", lambda _cfg: object())
-    monkeypatch.setattr(analyze, "_load_system_prompt", lambda: "system")
+    monkeypatch.setattr(analyze, "_load_system_prompt", lambda **_kwargs: "system")
     monkeypatch.setattr(analyze.journal, "load_verdicts", lambda **_kwargs: [])
     monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [baseline]})
     monkeypatch.setattr(analyze, "_format_history", lambda *_args, **_kwargs: "")

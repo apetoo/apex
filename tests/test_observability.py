@@ -193,13 +193,19 @@ def test_run_creates_parent_trace_and_records_terminal_summary(monkeypatch):
         "save": False,
         "candidate_context": {"source_type": "manual", "red_flag": False},
         "model": "deepseek-chat",
-        "prompt_version": "3.0.0-langgraph",
+        "prompt_version": "3.1.0-decision-policy",
         "held": True,
     }
     assert captured["outputs"] == {
         "analysis_status": "completed",
         "outcome_reason": None,
         "verdict": "偏多",
+        "model_verdict": None,
+        "model_confidence": None,
+        "calibrated_confidence": None,
+        "stock_profile": None,
+        "decision_policy": None,
+        "policy_version": None,
         "action": None,
         "token_usage": {"calls": 3},
     }

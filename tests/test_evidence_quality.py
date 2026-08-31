@@ -162,6 +162,9 @@ def test_builds_structured_evidence_item():
             "source_tier": 1,
             "entity_matched": True,
             "freshness_status": "current",
+            "frequency": "event",
+            "is_complete": True,
+            "independence_group": "regulatory-letter-20260818",
         },
     )
 
@@ -169,6 +172,10 @@ def test_builds_structured_evidence_item():
     assert item["source_url"] == "https://www.cninfo.com.cn/a"
     assert item["source_tier"] == 1
     assert item["entity_matched"] is True
+    assert item["as_of"] == "2026-08-18"
+    assert item["frequency"] == "event"
+    assert item["is_complete"] is True
+    assert item["independence_group"] == "regulatory-letter-20260818"
 
 
 def test_quote_page_with_earnings_chrome_is_not_evidence():
