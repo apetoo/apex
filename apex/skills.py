@@ -47,7 +47,7 @@ def _parse_applies_to(val: str) -> list[str]:
     return [x.strip() for x in cleaned.split(",") if x.strip()]
 
 
-def load_skills_for(agent: str) -> str:
+def load_skills_for(agent: str, *, names: list[str] | None = None) -> str:
     """拼接所有 ``applies_to`` 含 ``agent`` 的 skill 正文。
 
     无 skill / 目录不存在 / 全部不匹配 -> 返回空串（调用方拼 prompt 时自然无影响）。
@@ -55,6 +55,7 @@ def load_skills_for(agent: str) -> str:
     if not _SKILLS_DIR.is_dir():
         return ""
 
+    selected = set(names) if names is not None else None
     chunks: list[str] = []
     for path in sorted(_SKILLS_DIR.glob("*.md")):
         try:
@@ -66,6 +67,8 @@ def load_skills_for(agent: str) -> str:
         if agent not in applies_to:
             continue
         name = fields.get("name", path.stem)
+        if selected is not None and name not in selected:
+            continue
         chunks.append(f"\n\n## Skill: {name}\n{body.rstrip()}")
 
     return "".join(chunks)

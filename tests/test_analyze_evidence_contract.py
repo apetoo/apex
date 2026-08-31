@@ -15,6 +15,19 @@ def test_record_verdict_requires_explicit_trade_intent_and_entry_semantics():
     assert {"proposed_trade_action", "entry_style", "valid_for_days"} <= set(params["required"])
 
 
+def test_record_verdict_exposes_structured_evidence_claims_and_model_confidence():
+    tool = next(t for t in analyze.TOOLS if t["function"]["name"] == "record_verdict")
+    params = tool["function"]["parameters"]
+    claims = params["properties"]["evidence_claims"]
+
+    assert claims["maxItems"] == 6
+    assert {
+        "evidence_id", "stance", "dimension", "nature", "hardness", "as_of",
+        "frequency", "is_complete", "independence_group", "inference",
+    } <= set(claims["items"]["required"])
+    assert "model_confidence" in params["properties"]
+
+
 def test_analyze_run_accepts_candidate_context():
     assert "candidate_context" in inspect.signature(analyze.run).parameters
 
