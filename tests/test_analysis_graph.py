@@ -2,6 +2,8 @@ import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from apex import analyze, observability
 from apex.analysis_graph import GraphHandlers, build_analysis_graph
 
@@ -300,6 +302,7 @@ def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
 
 ## 三、裁判结论
 领先指标弱于滞后的利润数据，因此倾向谨慎。
+**证据覆盖率：60.0%**
 
 ### 加权四维评分
 技术面 4 分，基本面 7 分，资金面 3 分，情绪面 5 分；加权总分 4.9。
@@ -355,6 +358,35 @@ def _position_report_with_plan(plan_text: str) -> str:
         "价格满足计划条件后才执行未来动作，当前不提前交易。",
         plan_text,
     )
+
+
+@pytest.mark.parametrize(
+    "model_fields",
+    [
+        "",
+        "**证据覆盖率：10.0%**",
+        "**证据覆盖率：10.0%**\n**证据覆盖率：90.0%**",
+    ],
+)
+def test_normalize_report_evidence_coverage_writes_one_authoritative_field(model_fields):
+    report = _complete_verdict_report().replace(
+        "**证据覆盖率：60.0%**", model_fields,
+    )
+
+    normalized = analyze._normalize_report_evidence_coverage(
+        report, {"evidence_coverage": 0.625},
+    )
+
+    assert normalized.count("**证据覆盖率：62.5%**") == 1
+    assert len(analyze._report_labeled_values(normalized, "证据覆盖率")) == 1
+
+
+def test_normalize_report_evidence_coverage_does_not_hide_missing_heading():
+    report = _complete_verdict_report().replace("## 三、裁判结论", "## 裁判")
+
+    assert analyze._normalize_report_evidence_coverage(
+        report, {"evidence_coverage": 0.625},
+    ) == report
 
 
 def test_final_report_validator_rejects_missing_sections_and_process_text():

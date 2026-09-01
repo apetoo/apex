@@ -1937,6 +1937,26 @@ def _validate_labeled_number(
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
+def _normalize_report_evidence_coverage(text: str, candidate: dict) -> str:
+    coverage = candidate.get("evidence_coverage")
+    heading = "## 三、裁判结论"
+    if coverage is None or heading not in text:
+        return text
+    authoritative = f"**证据覆盖率：{round(float(coverage) * 100, 1)}%**"
+    without_model_fields = re.sub(
+        r"(?m)^\s*\*\*证据覆盖率：[^*\n]+\*\*\s*\n?",
+        "",
+        text,
+    )
+    section_start = without_model_fields.index(heading) + len(heading)
+    return (
+        without_model_fields[:section_start]
+        + "\n"
+        + authoritative
+        + without_model_fields[section_start:]
+    )
+
+
 def _effective_position_report_candidate(effective: dict) -> dict:
     """Build the sole position-action state consumed by report generation."""
     report_candidate = {
