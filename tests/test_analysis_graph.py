@@ -656,14 +656,31 @@ def test_run_passes_distinct_proposal_effective_state_and_frozen_baseline_to_fin
     })
     monkeypatch.setattr(analyze, "_make_client", lambda _cfg: object())
     monkeypatch.setattr(analyze, "_load_system_prompt", lambda **_kwargs: "system")
-    monkeypatch.setattr(analyze.journal, "load_verdicts", lambda **_kwargs: [])
+    history_entry = {
+        "analyzed_at": "2026-08-30T10:00:00+08:00",
+        "verdict": "偏空",
+        "analysis_text": "DRAFT_ONLY_HISTORY_PEG_0_43",
+    }
+
+    def load_verdicts(**kwargs):
+        return [history_entry] if kwargs.get("ts_code") else []
+
+    monkeypatch.setattr(analyze.journal, "load_verdicts", load_verdicts)
+    monkeypatch.setattr(analyze.forecast_calibration, "refresh_forecast_rows", lambda _rows: [])
     monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [baseline]})
     monkeypatch.setattr(analyze, "_format_history", lambda *_args, **_kwargs: "")
     monkeypatch.setattr(analyze, "_format_intraday_block", lambda _code: ("", {}))
-    monkeypatch.setattr(analyze, "_format_market_context", lambda _code: ("", {}))
-    monkeypatch.setattr(analyze, "_format_playstyle_block", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_market_context", lambda _code: ("", {
+        "market_sentiment": {"regime": "亢奋", "private_raw": "drop"},
+    }))
+    monkeypatch.setattr(analyze, "_format_playstyle_block", lambda _code: ("", {
+        "completeness": 0.4,
+        "risk_level": "high",
+        "features": {"volatility": {"vol_20d_pct": 82.31, "present": True}},
+    }))
     def run_loop_spy(**kwargs):
         captured["loop_baseline"] = kwargs["position_baseline"]
+        captured["report_context"] = kwargs["report_context"]
         return {
             "analysis_status": "completed", "draft_kind": "position_action",
             "draft_proposal": proposal, "draft_data": effective,
@@ -684,11 +701,80 @@ def test_run_passes_distinct_proposal_effective_state_and_frozen_baseline_to_fin
     assert result is result_entry
     assert captured["loop_baseline"] == baseline
     assert captured["loop_baseline"] is not baseline
+    assert set(captured["report_context"]) == {
+        "market", "history", "playstyle", "evidence_selection", "unknowns",
+    }
+    assert captured["report_context"]["market"]["sentiment"]["regime"] == "亢奋"
+    assert captured["report_context"]["history"][0]["verdict"] == "偏空"
+    assert "analysis_text" not in repr(captured["report_context"])
+    assert "DRAFT_ONLY_HISTORY_PEG_0_43" not in repr(captured["report_context"])
+    assert "private_raw" not in repr(captured["report_context"])
     assert captured["finalize_args"][1] == proposal
     assert captured["finalize_args"][2] == effective
     assert captured["finalize_args"][1] != captured["finalize_args"][2]
     assert captured["finalize_kwargs"]["position_baseline"] == baseline
     assert captured["finalize_kwargs"]["position_baseline"] is not baseline
+
+
+def test_run_persists_same_playstyle_as_report_finalization_metadata(monkeypatch):
+    captured = {}
+    saved = {}
+    playstyle_features = {
+        "completeness": 0.8,
+        "risk_level": "high",
+        "features": {
+            "volatility": {"vol_60d_pct": 82.31, "present": True},
+            "or_yoy": {
+                "latest": 10.0, "quarters_n": 2,
+                "sustained_high": False, "present": True,
+            },
+        },
+    }
+    candidate = {
+        **_bearish_candidate(),
+        "playstyle": {
+            "ratings": {"波段": 4, "中线": 3},
+            "primary": "波段", "secondary": "中线",
+            "reasons": ["20日波动率偏高"],
+        },
+    }
+
+    monkeypatch.setattr(analyze._cfg_mod, "get", lambda: {
+        "deepseek": {"model": "fake", "max_tool_iterations": 1, "history_limit": 1},
+    })
+    monkeypatch.setattr(analyze, "_make_client", lambda _cfg: object())
+    monkeypatch.setattr(analyze, "_load_system_prompt", lambda **_kwargs: "system")
+    monkeypatch.setattr(analyze.journal, "load_verdicts", lambda **_kwargs: [])
+    monkeypatch.setattr(analyze.forecast_calibration, "refresh_forecast_rows", lambda _rows: [])
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+    monkeypatch.setattr(analyze, "_format_history", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(analyze, "_format_intraday_block", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_market_context", lambda _code: ("", {}))
+    monkeypatch.setattr(
+        analyze, "_format_playstyle_block", lambda _code: ("", playstyle_features),
+    )
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"002192.SZ": "融捷股份"})
+    monkeypatch.setattr(analyze.trace_mod, "write_trace", lambda *_args, **_kwargs: None)
+
+    def run_loop_spy(**kwargs):
+        finalized, metadata = kwargs["finalize_candidate"]("verdict", candidate)
+        captured["report_metadata"] = metadata
+        return {
+            "analysis_status": "completed", "draft_kind": "verdict",
+            "draft_proposal": {}, "draft_data": finalized,
+            "analysis_text": "report", "evidence": [], "token_usage": {},
+            "finalization_metadata": {**metadata, "decision_policy": {}},
+        }
+
+    monkeypatch.setattr(analyze, "_run_langgraph_loop", run_loop_spy)
+    monkeypatch.setattr(analyze.journal, "write_entry", lambda entry: saved.update(entry))
+
+    result = analyze.run("002192.SZ", save=True)
+
+    assert saved["playstyle"] == captured["report_metadata"]["playstyle"]
+    assert saved["playstyle_fit"] == captured["report_metadata"]["playstyle_fit"]
+    assert saved["risk_level"] == captured["report_metadata"]["risk_level"]
+    assert result["playstyle"] == captured["report_metadata"]["playstyle"]
 
 
 def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monkeypatch):
@@ -884,6 +970,38 @@ def test_formal_report_replaces_research_process_text(monkeypatch):
     assert "融捷股份002192公告" in report_prompt
     assert "确定性市场上下文：沪深300五日下跌3%" in report_prompt
     assert '"review_outcome": "pass"' in report_prompt
+
+
+def test_formal_report_prompt_uses_structured_authority_not_research_draft(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=_complete_verdict_report()),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "DRAFT_ONLY_PEG_0_43"}],
+        max_iter=12, emit=lambda _event: None,
+        report_context={
+            "market": {"sentiment": {"regime": "亢奋"}},
+            "history": [{"verdict": "偏空", "forecast_outcome": {"hit": False}}],
+            "playstyle": {},
+            "evidence_selection": {"counted": [], "excluded": []},
+            "unknowns": [],
+        },
+    )
+
+    assert result["analysis_status"] == "completed"
+    report_messages = client.calls[-1]["messages"]
+    prompt = report_messages[-1]["content"]
+    assert '"regime": "亢奋"' in prompt
+    assert '"hit": false' in prompt
+    assert "DRAFT_ONLY_PEG_0_43" not in repr(report_messages)
 
 
 def test_formal_report_retries_once_with_validation_issues(monkeypatch):

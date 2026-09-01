@@ -31,6 +31,7 @@ from apex.position_action_state import (
     materialize_effective_position_plan,
     validate_proposal_shape,
 )
+from apex.report_context import build_report_context
 
 
 class AnalysisError(Exception):
@@ -2276,12 +2277,14 @@ def _with_policy_metadata(item: dict, tool_name: str) -> dict:
 def _run_langgraph_loop(
     *, ts_code: str, client, model: str, messages: list, max_iter: int, emit,
     system_context: str = "",
+    report_context: dict | None = None,
     finalize_candidate: Callable[[str, dict], tuple[dict, dict]] | None = None,
     prepare_candidate: Callable[[str, dict, list[dict]], tuple[dict, dict]] | None = None,
     initial_evidence: list[dict] | None = None,
     position_baseline: dict | None = None,
 ) -> dict:
     """Run the sole model/tool orchestration path as a LangGraph StateGraph."""
+    authoritative_report_context = deepcopy(report_context or {})
     controller = EvidenceController()
     controller.add_evidence(list(initial_evidence or []))
     stock_name = data.get_name_map().get(ts_code) or ""
@@ -2898,6 +2901,30 @@ def _run_langgraph_loop(
             key: value for key, value in decision_policy_context.items()
             if key != "excluded_claims"
         }
+        adaptive_context = deepcopy(authoritative_report_context)
+        if kind == "verdict":
+            finalized_context = build_report_context(
+                history_entries=[],
+                market_context={},
+                playstyle=finalization_metadata.get("playstyle"),
+                playstyle_features={},
+                playstyle_fit=finalization_metadata.get("playstyle_fit"),
+                risk_level=finalization_metadata.get("risk_level"),
+                decision_policy=decision_policy_context,
+                unknowns=list(state.get("unknowns") or []),
+            )
+            adaptive_context.setdefault("market", {})
+            adaptive_context.setdefault("history", [])
+            adaptive_context["evidence_selection"] = finalized_context["evidence_selection"]
+            adaptive_context["unknowns"] = finalized_context["unknowns"]
+            adaptive_playstyle = adaptive_context.get("playstyle")
+            if not isinstance(adaptive_playstyle, dict):
+                adaptive_playstyle = {}
+            finalized_playstyle = finalized_context["playstyle"]
+            adaptive_playstyle["profile"] = dict(finalized_playstyle.get("profile") or {})
+            adaptive_playstyle["fit"] = dict(finalized_playstyle.get("fit") or {})
+            adaptive_playstyle["risk_level"] = finalized_playstyle.get("risk_level")
+            adaptive_context["playstyle"] = adaptive_playstyle
         authoritative_context = {
             "kind": kind,
             "confirmed_evidence": confirmed_evidence,
@@ -2917,7 +2944,8 @@ def _run_langgraph_loop(
             })
         else:
             authoritative_context["candidate"] = candidate
-            if not decision_policy_context:
+            authoritative_context["adaptive_report"] = adaptive_context
+            if not decision_policy_context and not authoritative_report_context:
                 authoritative_context["system_context"] = system_context
         report_contract = (
             "你是 Apex 的正式投资分析报告编辑。候选结论已经完成证据门控和独立复核，"
@@ -2953,7 +2981,11 @@ def _run_langgraph_loop(
                 )
                 emit({"type": "report_retry", "attempt": attempt + 1, "issues": issues})
             try:
-                prior_messages = [] if decision_policy_context else list(state.get("messages") or [])
+                prior_messages = (
+                    []
+                    if decision_policy_context or (kind == "verdict" and authoritative_report_context)
+                    else list(state.get("messages") or [])
+                )
                 response = client.chat.completions.create(
                     model=model,
                     messages=[
@@ -3117,6 +3149,17 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         playstyle_block = f"## 玩法特征\n（加载失败: {type(e).__name__}: {e}）"
         playstyle_feats = {"completeness": 0.0, "risk_level": None, "features": {}, "notes": [f"FE 异常: {e}"]}
 
+    report_context = build_report_context(
+        history_entries=history_entries,
+        market_context=market_ctx,
+        playstyle=None,
+        playstyle_features=playstyle_feats,
+        playstyle_fit=None,
+        risk_level=playstyle_feats.get("risk_level"),
+        decision_policy={},
+        unknowns=[],
+    )
+
     stock_profile = _stock_profile_from_context(ts_code, playstyle_feats, candidate_context)
     initial_evidence = _system_evidence_items(
         ts_code=ts_code, profile=stock_profile, playstyle_feats=playstyle_feats,
@@ -3184,6 +3227,18 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
         metadata["stock_profile"] = stock_profile.to_dict()
         return limited, metadata
 
+    def _finalize_report_candidate(kind: str, candidate: dict) -> tuple[dict, dict]:
+        if kind != "verdict":
+            return dict(candidate), {}
+        report_playstyle = playstyle.finalize_playstyle(
+            candidate.get("playstyle"), playstyle_feats,
+        )
+        return dict(candidate), {
+            "playstyle": report_playstyle,
+            "playstyle_fit": playstyle.compute_playstyle_fit(report_playstyle),
+            "risk_level": playstyle_feats.get("risk_level"),
+        }
+
     graph_result = _run_langgraph_loop(
         ts_code=ts_code, client=client, model=model, messages=messages,
         max_iter=max_iter, emit=_emit,
@@ -3193,6 +3248,8 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
                 policy_block, candidate_block,
             ) if block
         ),
+        report_context=report_context,
+        finalize_candidate=_finalize_report_candidate,
         prepare_candidate=_prepare_policy_candidate,
         initial_evidence=initial_evidence,
         position_baseline=position_baseline,
