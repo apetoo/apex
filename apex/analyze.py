@@ -1886,13 +1886,18 @@ def _valuation_basis_conflict(candidate: dict, thesis: str) -> bool:
 _VERDICT_REPORT_SECTIONS = (
     "## 核心判断",
     "## 基本面分析",
+    "## 市场与个股环境",
+    "## 四维分析",
     "## 一、多头论点",
     "## 二、空头论点",
     "## 三、裁判结论",
     "### 加权四维评分",
+    "### 证据取舍与冲突",
+    "### 历史判断复盘",
+    "### 玩法与适用周期",
     "### 置信度调整",
     "## 操作建议",
-    "## 风险提示",
+    "## 风险与未知项",
 )
 _POSITION_REPORT_SECTIONS = (
     "## 核心判断",
@@ -2958,6 +2963,17 @@ def _run_langgraph_loop(
                 "多空论点每条必须以 `- [<evidence_id>]` 开头，只能使用 confirmed_evidence 中的 ID，每边 0-3 条。"
                 "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
                 "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
+                "新增详细章节的唯一权威来源是 `adaptive_report.market`、"
+                "`adaptive_report.history`、`adaptive_report.playstyle`、"
+                "`adaptive_report.evidence_selection` 和 `adaptive_report.unknowns`。"
+                "`evidence_selection.counted` 中的计入证据可以支持方向；"
+                "被排除证据只能解释排除原因，不得作为多头或空头论点的 evidence_id，"
+                "也不得支持方向或硬度。"
+                "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
+                "不得补写替代事实。"
+                "不得复制或推断先前 assistant 消息中的事实。"
+                "权威数据存在且充足时，目标为 2000–3000 个中文字符；"
+                "准确性与完整性优先于长度，不得为凑字数添加未验证事实。"
             )
         decision_policy_context = finalization_metadata.get("decision_policy") or {}
         counted_ids = {
