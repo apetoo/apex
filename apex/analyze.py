@@ -1909,8 +1909,12 @@ _REPORT_PROCESS_MARKERS = (
 )
 
 
+def _report_labeled_field_pattern(label: str) -> str:
+    return rf"\*\*{re.escape(label)}：([^*\n]+)\*\*"
+
+
 def _report_labeled_values(text: str, label: str) -> list[str]:
-    return [value.strip() for value in re.findall(rf"\*\*{re.escape(label)}：([^*\n]+)\*\*", text)]
+    return [value.strip() for value in re.findall(_report_labeled_field_pattern(label), text)]
 
 
 def _report_number(value) -> float | None:
@@ -1943,11 +1947,9 @@ def _normalize_report_evidence_coverage(text: str, candidate: dict) -> str:
     if coverage is None or heading not in text:
         return text
     authoritative = f"**证据覆盖率：{round(float(coverage) * 100, 1)}%**"
-    without_model_fields = re.sub(
-        r"(?m)^\s*\*\*证据覆盖率：[^*\n]+\*\*\s*\n?",
-        "",
-        text,
-    )
+    without_model_fields = re.sub(_report_labeled_field_pattern("证据覆盖率"), "", text)
+    without_model_fields = re.sub(r"([：:])\s*[，、；;]+", r"\1", without_model_fields)
+    without_model_fields = re.sub(r"([，、；;])\s*[，、；;]+", r"\1", without_model_fields)
     section_start = without_model_fields.index(heading) + len(heading)
     return (
         without_model_fields[:section_start]

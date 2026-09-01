@@ -361,14 +361,21 @@ def _position_report_with_plan(plan_text: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "model_fields",
+    ("model_fields", "remaining_prose"),
     [
-        "",
-        "**证据覆盖率：10.0%**",
-        "**证据覆盖率：10.0%**\n**证据覆盖率：90.0%**",
+        ("", ""),
+        ("**证据覆盖率：10.0%**", ""),
+        ("**证据覆盖率：10.0%**\n**证据覆盖率：90.0%**", ""),
+        ("结论：**证据覆盖率：10.0%**，仍需等待确认。", "结论：仍需等待确认。"),
+        (
+            "结论：**证据覆盖率：10.0%**；仍需等待确认；**证据覆盖率：90.0%**",
+            "结论：仍需等待确认；",
+        ),
     ],
 )
-def test_normalize_report_evidence_coverage_writes_one_authoritative_field(model_fields):
+def test_normalize_report_evidence_coverage_writes_one_authoritative_field(
+    model_fields, remaining_prose,
+):
     report = _complete_verdict_report().replace(
         "**证据覆盖率：60.0%**", model_fields,
     )
@@ -378,7 +385,9 @@ def test_normalize_report_evidence_coverage_writes_one_authoritative_field(model
     )
 
     assert normalized.count("**证据覆盖率：62.5%**") == 1
-    assert len(analyze._report_labeled_values(normalized, "证据覆盖率")) == 1
+    assert analyze._report_labeled_values(normalized, "证据覆盖率") == ["62.5%"]
+    if remaining_prose:
+        assert remaining_prose in normalized
 
 
 def test_normalize_report_evidence_coverage_does_not_hide_missing_heading():
@@ -1004,7 +1013,7 @@ def test_formal_report_normalizes_model_coverage_to_finalized_candidate(monkeypa
     finalized = {**raw, "evidence_coverage": 0.6, "counted_evidence_ids": ["sys_test"]}
     bad_report = _complete_verdict_report(verdict="中性", confidence=5).replace(
         "**证据覆盖率：60.0%**",
-        "**证据覆盖率：10.0%**\n**证据覆盖率：90.0%**",
+        "结论：**证据覆盖率：10.0%**；模型又声称**证据覆盖率：90.0%**，等待确认。",
     ).replace(
         "1. 盈利增长 → 提供安全边际。\n2. 现金流改善 → 盈利质量提升。\n3. 负债可控 → 财务风险有限。",
         "- [sys_test] 盈利增长 → 提供安全边际。",
@@ -1031,6 +1040,7 @@ def test_formal_report_normalizes_model_coverage_to_finalized_candidate(monkeypa
     assert result["analysis_text"].count("**证据覆盖率：60.0%**") == 1
     assert "**证据覆盖率：10.0%**" not in result["analysis_text"]
     assert "**证据覆盖率：90.0%**" not in result["analysis_text"]
+    assert "结论：模型又声称，等待确认。" in result["analysis_text"]
 
 
 def test_review_transition_downgrades_minor_abstain_after_revision_to_pass():
