@@ -725,6 +725,7 @@ def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monk
     prompt = client.calls[-1]["messages"][-1]["content"]
     assert '"new_stop": null' in prompt
     assert "有新止损的档位必须追加" not in prompt
+    assert "裁判必须引用权威上下文 decision_policy 中的覆盖率、净硬度和去重结果。" in prompt
 
 
 def test_ladder_mismatch_reports_expected_and_parsed_values():
