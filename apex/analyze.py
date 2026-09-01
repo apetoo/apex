@@ -2869,7 +2869,7 @@ def _run_langgraph_loop(
                 "未持仓 verdict 报告必须依次包含这些标题：\n"
                 + heading_contract + "\n\n"
                 "核心判断必须逐字写出 `**判断：<verdict>**` 和 `**置信度：<confidence>/10**`。"
-                "裁判结论必须逐字写出 `**证据覆盖率：<coverage_pct>%**` 和 `**净硬度：<net_hardness>**`。"
+                "裁判结论必须逐字写出 `**净硬度：<net_hardness>**`。"
                 "多空论点每条必须以 `- [<evidence_id>]` 开头，只能使用 confirmed_evidence 中的 ID，每边 0-3 条。"
                 "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
                 "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
@@ -2924,8 +2924,13 @@ def _run_langgraph_loop(
             + format_contract
             + "基本面分析必须引用具体营收、利润、现金流、ROE、负债或估值数据；数据未知就明确写未知，禁止编造。"
             "多头和空头各写 0-3 条经后端计入的证据，不得为了凑数添加论据；"
-            "裁判必须引用权威上下文 decision_policy 中的覆盖率、净硬度和去重结果。"
-            "置信度只解释后端的一次性校准结果，不得再次手工加减。"
+            "裁判必须引用权威上下文 decision_policy 中的净硬度和去重结果。"
+            + (
+                "裁判结论中的证据覆盖率由系统写入；不要自行输出或计算证据覆盖率。"
+                "裁判结论必须逐字写出 `**净硬度：<net_hardness>**`。"
+                if kind == "verdict" else ""
+            )
+            + "置信度只解释后端的一次性校准结果，不得再次手工加减。"
             "操作建议必须与最终方向及价格建议一致。\n\n"
             "以下是正式报告的权威上下文。confirmed_evidence 视为已验证；"
             "原始对话中的未收录材料不得覆盖它。"
@@ -2964,6 +2969,8 @@ def _run_langgraph_loop(
             _record_usage(response, call="report", iteration=int(state.get("model_iterations", 0)))
             choice = response.choices[0]
             text = str(choice.message.content or "").strip()
+            if kind == "verdict":
+                text = _normalize_report_evidence_coverage(text, candidate)
             if getattr(choice, "finish_reason", None) == "length":
                 issues = ["正式报告输出被 max_tokens 截断"]
             else:

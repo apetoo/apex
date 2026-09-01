@@ -997,6 +997,41 @@ def test_formal_report_uses_finalized_candidate_as_single_source_of_truth(monkey
     assert result["analysis_text"] == report
 
 
+def test_formal_report_normalizes_model_coverage_to_finalized_candidate(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    raw = {**_bearish_candidate(), "verdict": "中性", "confidence": 5}
+    finalized = {**raw, "evidence_coverage": 0.6, "counted_evidence_ids": ["sys_test"]}
+    bad_report = _complete_verdict_report(verdict="中性", confidence=5).replace(
+        "**证据覆盖率：60.0%**",
+        "**证据覆盖率：10.0%**\n**证据覆盖率：90.0%**",
+    ).replace(
+        "1. 盈利增长 → 提供安全边际。\n2. 现金流改善 → 盈利质量提升。\n3. 负债可控 → 财务风险有限。",
+        "- [sys_test] 盈利增长 → 提供安全边际。",
+    ).replace(
+        "1. 商品价格回落 → 利润可能承压。\n2. 资金净流出 → 短线承接偏弱。\n3. 趋势未反转 → 当前不宜追高。",
+        "- [sys_test] 商品价格回落 → 利润可能承压。",
+    )
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=raw),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=bad_report),
+    ])
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12,
+        emit=lambda _event: None,
+        finalize_candidate=lambda _kind, _candidate: (finalized, {}),
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["analysis_text"].count("**证据覆盖率：60.0%**") == 1
+    assert "**证据覆盖率：10.0%**" not in result["analysis_text"]
+    assert "**证据覆盖率：90.0%**" not in result["analysis_text"]
+
+
 def test_review_transition_downgrades_minor_abstain_after_revision_to_pass():
     issues = [{
         "message": "盘中站上均线但尚未收盘确认，作为 hold 支撑仍可接受",
