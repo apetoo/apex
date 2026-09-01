@@ -103,3 +103,27 @@ def test_build_report_context_sanitizes_allowed_values_and_bounds_text():
     assert context["evidence_selection"]["counted"][0]["inference"] == "i" * 240
     assert "evidence_id" not in context["evidence_selection"]["counted"][0]
     assert context["unknowns"] == ["u" * 240]
+
+
+def test_build_report_context_sanitizes_market_and_feature_keys():
+    class Unserializable:
+        def __str__(self):
+            return "unsafe-key"
+
+    long_group = "g" * 500
+    context = build_report_context(
+        history_entries=[],
+        market_context={"as_of": Unserializable()},
+        playstyle=None,
+        playstyle_features={"features": {
+            long_group: {Unserializable(): 1, "f" * 500: "ok"},
+        }},
+        playstyle_fit=None,
+        risk_level=None,
+        decision_policy={},
+        unknowns=[],
+    )
+    json.dumps(context, allow_nan=False)
+    assert context["market"] == {}
+    assert list(context["playstyle"]["features"]) == ["g" * 240]
+    assert context["playstyle"]["features"]["g" * 240] == {"f" * 240: "ok"}

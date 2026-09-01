@@ -25,3 +25,11 @@ The review identified that allowed fields were copied without sanitization. Adde
 
 - `../../.venv/bin/python -m pytest -q tests/test_report_context.py` — `3 passed`
 - `git diff --check` — passed
+
+## Second review fix
+
+Sanitized the remaining bypasses: `market.as_of` now uses the strict-value copier, and feature-group names plus feature-field keys are retained only when they are actual strings, capped at `MAX_TEXT`. Added regression coverage with an unserializable `as_of`, unserializable feature key, and overlong feature group/field names.
+
+- `../../.venv/bin/python -m pytest -q tests/test_report_context.py` — `4 passed`
+- Regression test includes `json.dumps(context, allow_nan=False)` — passed
+- `git diff --check` — passed

@@ -53,9 +53,9 @@ def _scalar_fields(source: Any) -> dict[str, Any]:
     if not isinstance(source, dict):
         return {}
     return {
-        key: scalar
+        key[:MAX_TEXT]: scalar
         for key, value in source.items()
-        if (scalar := _scalar(value)) is not None
+        if isinstance(key, str) and (scalar := _scalar(value)) is not None
     }
 
 
@@ -121,7 +121,9 @@ def build_report_context(
             if intraday:
                 market["intraday"] = intraday
         if market_context.get("as_of") is not None:
-            market["as_of"] = market_context["as_of"]
+            as_of = _safe_value(market_context["as_of"])
+            if as_of is not None:
+                market["as_of"] = as_of
 
     history = []
     for entry in (history_entries or [])[:MAX_HISTORY]:
@@ -149,7 +151,7 @@ def build_report_context(
     features = {}
     if isinstance(playstyle_features, dict) and isinstance(playstyle_features.get("features"), dict):
         features = {
-            name: _scalar_fields(group)
+            name[:MAX_TEXT]: _scalar_fields(group)
             for name, group in playstyle_features["features"].items()
             if isinstance(name, str) and _scalar_fields(group)
         }
