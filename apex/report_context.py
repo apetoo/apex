@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -16,14 +17,36 @@ def _text(value: Any) -> str:
 
 
 def _pick(source: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
-    return {key: source[key] for key in keys if source.get(key) is not None}
+    result = {}
+    for key in keys:
+        if source.get(key) is None:
+            continue
+        value = _safe_value(source[key])
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _safe_value(value: Any) -> Any:
+    """Copy only strict-JSON values, bounding every textual leaf."""
+    if isinstance(value, str):
+        return value[:MAX_TEXT]
+    if value is None or isinstance(value, bool) or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {
+            str(key)[:MAX_TEXT]: safe
+            for key, raw in value.items()
+            if (safe := _safe_value(raw)) is not None
+        }
+    return None
 
 
 def _scalar(value: Any) -> Any:
     """Return JSON-safe scalar values, dropping containers and exotic objects."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return None
+    return _safe_value(value) if not isinstance(value, dict) else None
 
 
 def _scalar_fields(source: Any) -> dict[str, Any]:

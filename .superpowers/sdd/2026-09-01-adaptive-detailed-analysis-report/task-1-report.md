@@ -18,3 +18,10 @@ Implemented the whitelisted authoritative report context builder and its focused
 ## Concerns
 
 The brief’s sample assertion checks that `"未确认现金流"` is absent from `repr(context)` while `unknowns` contains `"现金流口径未确认"`; these are different strings, so the supplied tests pass while preserving the required unknown.
+
+## Review fix
+
+The review identified that allowed fields were copied without sanitization. Added a regression test covering arbitrary objects, overlong text, and `NaN`/`Infinity` values, then updated the whitelist copier to recursively retain only strict-JSON scalars and cap textual leaves at `MAX_TEXT`; non-finite floats and unsupported objects are dropped.
+
+- `../../.venv/bin/python -m pytest -q tests/test_report_context.py` — `3 passed`
+- `git diff --check` — passed

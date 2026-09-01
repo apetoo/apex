@@ -1,4 +1,6 @@
 from apex.report_context import build_report_context
+import json
+import math
 
 
 def _context():
@@ -66,3 +68,38 @@ def test_build_report_context_returns_explicit_empty_states():
         "market": {}, "history": [], "playstyle": {},
         "evidence_selection": {"counted": [], "excluded": []}, "unknowns": [],
     }
+
+
+def test_build_report_context_sanitizes_allowed_values_and_bounds_text():
+    class Unserializable:
+        def __str__(self):
+            return "untrusted"
+
+    context = build_report_context(
+        history_entries=[{"verdict": Unserializable(), "analyzed_at": "x" * 500}],
+        market_context={
+            "as_of": "a" * 500,
+            "market_sentiment": {"regime": "r" * 500, "total_score": math.inf},
+            "stock_relative": {"ref_index_name": Unserializable(), "chg_5d_pct": math.nan},
+        },
+        playstyle={"primary": "p" * 500, "ratings": {"波段": Unserializable()}},
+        playstyle_features={"features": {"volatility": {"value": math.inf, "label": "v" * 500}}},
+        playstyle_fit={"state": "s" * 500},
+        risk_level="risk" * 100,
+        decision_policy={"counted_claims": [{"evidence_id": Unserializable(), "inference": "i" * 500}]},
+        unknowns=["u" * 500],
+    )
+    json.dumps(context, allow_nan=False)
+    assert context["history"][0]["analyzed_at"] == "x" * 240
+    assert "verdict" not in context["history"][0]
+    assert context["market"]["sentiment"]["regime"] == "r" * 240
+    assert "total_score" not in context["market"]["sentiment"]
+    assert "ref_index_name" not in context["market"].get("stock_relative", {})
+    assert "chg_5d_pct" not in context["market"].get("stock_relative", {})
+    assert context["playstyle"]["profile"]["primary"] == "p" * 240
+    assert context["playstyle"]["profile"]["ratings"] == {}
+    assert context["playstyle"]["features"]["volatility"]["label"] == "v" * 240
+    assert "value" not in context["playstyle"]["features"]["volatility"]
+    assert context["evidence_selection"]["counted"][0]["inference"] == "i" * 240
+    assert "evidence_id" not in context["evidence_selection"]["counted"][0]
+    assert context["unknowns"] == ["u" * 240]
