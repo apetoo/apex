@@ -1908,6 +1908,25 @@ _POSITION_REPORT_SECTIONS = (
 _REPORT_PROCESS_MARKERS = (
     "让我查询", "让我补充", "现在提交", "等等，重新核算", "我先获取",
 )
+_VERDICT_REPORT_CANDIDATE_SCALARS = (
+    "verdict", "confidence", "calibrated_confidence", "calibration_sample_size",
+    "calibration_applied", "calibration_explanation", "evidence_coverage",
+    "net_hardness", "proposed_trade_action", "entry_style", "valid_for_days",
+    "entry", "entry_low", "entry_high", "stop_loss", "target",
+    "position_size_pct", "setup_tag", "stock_type", "valuation_basis",
+    "growth_valuation_mode",
+)
+_VERDICT_REPORT_FEATURE_FIELDS = (
+    "ma5_position", "ma20_position", "ma_alignment", "volume_ratio", "macd_zone",
+    "rsi_14", "price_vs_ma5_pct", "atr_14_pct", "candle_direction",
+    "candle_body_pct", "candle_upper_shadow_pct", "candle_lower_shadow_pct",
+    "candle_pattern",
+)
+_DECISION_POLICY_REPORT_SCALARS = (
+    "verdict", "direction_allowed", "net_hardness", "evidence_coverage",
+    "policy_version",
+)
+_DECISION_DIMENSIONS = ("technical", "fundamental", "capital", "sentiment")
 
 
 def _report_labeled_field_pattern(label: str) -> str:
@@ -1970,6 +1989,67 @@ def _effective_position_report_candidate(effective: dict) -> dict:
         report_candidate["current_stop"] = (effective or {}).get("effective_stop")
         report_candidate["current_target"] = (effective or {}).get("effective_target")
     return report_candidate
+
+
+def _bounded_report_scalar(value):
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:240]
+    return None
+
+
+def _verdict_report_candidate(candidate: dict) -> dict:
+    """Keep only finalized machine fields needed to render and validate a verdict."""
+    result = {}
+    for key in _VERDICT_REPORT_CANDIDATE_SCALARS:
+        if key not in candidate:
+            continue
+        value = _bounded_report_scalar(candidate.get(key))
+        if value is not None or candidate.get(key) is None:
+            result[key] = value
+    counted_ids = candidate.get("counted_evidence_ids")
+    if isinstance(counted_ids, list):
+        result["counted_evidence_ids"] = [
+            str(item)[:240] for item in counted_ids[:6] if item is not None
+        ]
+    features = candidate.get("features")
+    if isinstance(features, dict):
+        result["features"] = {
+            key: value
+            for key in _VERDICT_REPORT_FEATURE_FIELDS
+            if key in features
+            and (
+                (value := _bounded_report_scalar(features.get(key))) is not None
+                or features.get(key) is None
+            )
+        }
+    return result
+
+
+def _decision_policy_report_summary(decision_policy: dict) -> dict:
+    """Expose deterministic policy outputs without duplicating raw claim collections."""
+    result = {}
+    for key in _DECISION_POLICY_REPORT_SCALARS:
+        if key not in decision_policy:
+            continue
+        value = _bounded_report_scalar(decision_policy.get(key))
+        if value is not None or decision_policy.get(key) is None:
+            result[key] = value
+    scores = decision_policy.get("dimension_scores")
+    if isinstance(scores, dict):
+        result["dimension_scores"] = {
+            key: value
+            for key in _DECISION_DIMENSIONS
+            if key in scores
+            and (
+                (value := _bounded_report_scalar(scores.get(key))) is not None
+                or scores.get(key) is None
+            )
+        }
+    return result
 
 
 def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
@@ -2925,24 +3005,37 @@ def _run_langgraph_loop(
             adaptive_playstyle["fit"] = dict(finalized_playstyle.get("fit") or {})
             adaptive_playstyle["risk_level"] = finalized_playstyle.get("risk_level")
             adaptive_context["playstyle"] = adaptive_playstyle
-        authoritative_context = {
-            "kind": kind,
-            "confirmed_evidence": confirmed_evidence,
-            "research_thesis": controller.thesis,
-            "gaps": list(state.get("gaps") or []),
-            "unknowns": list(state.get("unknowns") or []),
-            "review_outcome": state.get("review_outcome"),
-            "review_issues": list(state.get("review_issues") or []),
-            "decision_policy": report_decision_policy,
-            "stock_profile": finalization_metadata.get("stock_profile") or {},
-            "calibration": finalization_metadata.get("calibration") or {},
-        }
+        structured_verdict = kind == "verdict" and bool(authoritative_report_context)
+        if structured_verdict:
+            authoritative_context = {
+                "kind": kind,
+                "confirmed_evidence": confirmed_evidence,
+                "review_outcome": state.get("review_outcome"),
+                "decision_policy": _decision_policy_report_summary(decision_policy_context),
+                "stock_profile": finalization_metadata.get("stock_profile") or {},
+                "calibration": finalization_metadata.get("calibration") or {},
+                "candidate": _verdict_report_candidate(candidate),
+                "adaptive_report": adaptive_context,
+            }
+        else:
+            authoritative_context = {
+                "kind": kind,
+                "confirmed_evidence": confirmed_evidence,
+                "research_thesis": controller.thesis,
+                "gaps": list(state.get("gaps") or []),
+                "unknowns": list(state.get("unknowns") or []),
+                "review_outcome": state.get("review_outcome"),
+                "review_issues": list(state.get("review_issues") or []),
+                "decision_policy": report_decision_policy,
+                "stock_profile": finalization_metadata.get("stock_profile") or {},
+                "calibration": finalization_metadata.get("calibration") or {},
+            }
         if kind == "position_action":
             authoritative_context.update({
                 "effective": candidate,
                 "baseline_for_change_explanation": state.get("position_baseline") or {},
             })
-        else:
+        elif not structured_verdict:
             authoritative_context["candidate"] = candidate
             authoritative_context["adaptive_report"] = adaptive_context
             if not decision_policy_context and not authoritative_report_context:

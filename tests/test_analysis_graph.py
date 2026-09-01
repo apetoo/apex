@@ -974,34 +974,138 @@ def test_formal_report_replaces_research_process_text(monkeypatch):
 
 def test_formal_report_prompt_uses_structured_authority_not_research_draft(monkeypatch):
     _patch_report_graph_environment(monkeypatch)
+    original_build_analysis_graph = analyze.build_analysis_graph
+    raw_unknown = "RAW_TOP_LEVEL_UNKNOWN_" + "x" * 260
+
+    def build_graph_with_adversarial_report_state(handlers):
+        original_report = handlers.report
+
+        def report(state):
+            return original_report({
+                **state,
+                "unknowns": [raw_unknown],
+                "review_issues": ["RAW_REVIEW_ISSUE_SECRET"],
+            })
+
+        handlers.report = report
+        return original_build_analysis_graph(handlers)
+
+    monkeypatch.setattr(analyze, "build_analysis_graph", build_graph_with_adversarial_report_state)
+    candidate = {
+        **_bearish_candidate(),
+        "evidence": ["RAW_CANDIDATE_EVIDENCE_SECRET"],
+        "evidence_claims": [{
+            "evidence_id": "sys_capital", "stance": "bear", "dimension": "capital",
+            "nature": "current", "hardness": 4, "as_of": "2026-08-31",
+            "frequency": "daily", "is_complete": True,
+            "independence_group": "RAW_CANDIDATE_CLAIM_SECRET",
+            "inference": "RAW_CANDIDATE_INFERENCE_SECRET",
+        }],
+        "new_info": ["RAW_CANDIDATE_NEW_INFO_SECRET"],
+        "playstyle": {
+            "ratings": {"波段": 5}, "primary": "波段",
+            "reasons": ["RAW_CANDIDATE_PLAYSTYLE_SECRET"],
+        },
+    }
+    decision_policy = {
+        "verdict": "观望偏空", "direction_allowed": False,
+        "net_hardness": -0.8, "evidence_coverage": 0.25,
+        "dimension_scores": {"capital": -4.0},
+        "policy_version": "decision-policy-v1",
+        "counted_claims": [{
+            "evidence_id": "sys_capital", "stance": "bear", "dimension": "capital",
+            "nature": "current", "hardness": 4, "adjusted_hardness": 4.0,
+            "as_of": "2026-08-31", "frequency": "daily",
+            "inference": "SAFE_COUNTED_INFERENCE",
+            "raw_private": "RAW_COUNTED_PRIVATE_SECRET",
+        }],
+        "excluded_claims": [{
+            "evidence_id": "ev_old", "stance": "bear", "dimension": "capital",
+            "nature": "fact", "hardness": 2, "adjusted_hardness": 1.0,
+            "as_of": "2025-01-01", "frequency": "event",
+            "inference": "SAFE_EXCLUDED_INFERENCE", "reason": "stale_capital",
+            "raw_private": "RAW_EXCLUDED_PRIVATE_SECRET",
+        }],
+    }
     client = _FakeClient([
         _response(tool_name="submit_research_state", arguments={
-            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+            "thesis": "DRAFT_THESIS_SECRET",
+            "gaps": [{
+                "id": "draft_gap", "description": "DRAFT_GAP_SECRET",
+                "severity": "noncritical", "status": "open",
+            }],
+            "next_actions": [], "ready": True,
         }),
-        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(tool_name="record_verdict", arguments=candidate),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
         _response(content=_complete_verdict_report()),
     ])
 
+    report_context = {
+        "market": {"sentiment": {"regime": "亢奋"}},
+        "history": [{"verdict": "偏空", "forecast_outcome": {"hit": False}}],
+        "playstyle": {},
+        "evidence_selection": {"counted": [], "excluded": []},
+        "unknowns": [],
+    }
+
     result = analyze._run_langgraph_loop(
         ts_code="002192.SZ", client=client, model="fake",
-        messages=[{"role": "user", "content": "DRAFT_ONLY_PEG_0_43"}],
+        messages=[{"role": "user", "content": "DRAFT_MESSAGE_SECRET"}],
         max_iter=12, emit=lambda _event: None,
-        report_context={
-            "market": {"sentiment": {"regime": "亢奋"}},
-            "history": [{"verdict": "偏空", "forecast_outcome": {"hit": False}}],
-            "playstyle": {},
-            "evidence_selection": {"counted": [], "excluded": []},
-            "unknowns": [],
-        },
+        report_context=report_context,
+        prepare_candidate=lambda _kind, prepared, _ledger: (
+            prepared, {"decision_policy": decision_policy},
+        ),
+        finalize_candidate=lambda _kind, finalized: (finalized, {
+            "playstyle": {
+                "ratings": {"波段": 4}, "primary": "波段", "secondary": None,
+                "reasons": ["SAFE_FINAL_PLAYSTYLE"], "method": "ai_skill",
+                "low_confidence": False,
+            },
+            "playstyle_fit": {"state": "insufficient_data", "note": "画像累积中"},
+            "risk_level": "high",
+        }),
     )
 
     assert result["analysis_status"] == "completed"
     report_messages = client.calls[-1]["messages"]
     prompt = report_messages[-1]["content"]
-    assert '"regime": "亢奋"' in prompt
-    assert '"hit": false' in prompt
-    assert "DRAFT_ONLY_PEG_0_43" not in repr(report_messages)
+    authoritative = json.loads(
+        prompt.rsplit("candidate 是不可修改的最终机器结果：\n", 1)[1]
+    )
+    assert set(authoritative) == {
+        "adaptive_report", "calibration", "candidate", "confirmed_evidence",
+        "decision_policy", "kind", "review_outcome", "stock_profile",
+    }
+    assert authoritative["candidate"]["verdict"] == "观望偏空"
+    assert authoritative["candidate"]["confidence"] == 4
+    assert "evidence" not in authoritative["candidate"]
+    assert "evidence_claims" not in authoritative["candidate"]
+    assert "new_info" not in authoritative["candidate"]
+    assert "playstyle" not in authoritative["candidate"]
+    assert authoritative["decision_policy"] == {
+        "verdict": "观望偏空", "direction_allowed": False,
+        "net_hardness": -0.8, "evidence_coverage": 0.25,
+        "dimension_scores": {"capital": -4.0},
+        "policy_version": "decision-policy-v1",
+    }
+    adaptive = authoritative["adaptive_report"]
+    assert adaptive["market"]["sentiment"]["regime"] == "亢奋"
+    assert adaptive["history"][0]["forecast_outcome"]["hit"] is False
+    assert adaptive["playstyle"]["profile"]["primary"] == "波段"
+    assert adaptive["evidence_selection"]["counted"][0]["inference"] == "SAFE_COUNTED_INFERENCE"
+    assert adaptive["evidence_selection"]["excluded"][0]["reason"] == "stale_capital"
+    assert adaptive["unknowns"] == [raw_unknown[:240]]
+    rendered = repr(report_messages)
+    for marker in (
+        "DRAFT_MESSAGE_SECRET", "DRAFT_THESIS_SECRET", "DRAFT_GAP_SECRET",
+        "RAW_REVIEW_ISSUE_SECRET", "RAW_COUNTED_PRIVATE_SECRET",
+        "RAW_EXCLUDED_PRIVATE_SECRET", "RAW_CANDIDATE_EVIDENCE_SECRET",
+        "RAW_CANDIDATE_CLAIM_SECRET", "RAW_CANDIDATE_INFERENCE_SECRET",
+        "RAW_CANDIDATE_NEW_INFO_SECRET", "RAW_CANDIDATE_PLAYSTYLE_SECRET",
+    ):
+        assert marker not in rendered
 
 
 def test_formal_report_retries_once_with_validation_issues(monkeypatch):
