@@ -6,6 +6,7 @@ import json
 import math
 import re
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -1977,16 +1978,137 @@ def _validate_labeled_number(
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
+@dataclass(frozen=True)
+class _ReportMarkdownHeading:
+    canonical: str
+    level: int
+    start: int
+    line_end: int
+    content_start: int
+    content_end: int
+
+
+@dataclass(frozen=True)
+class _ParsedReportMarkdown:
+    source: str
+    visible_text: str
+    headings: tuple[_ReportMarkdownHeading, ...]
+
+    def sections(self, canonical: str) -> tuple[_ReportMarkdownHeading, ...]:
+        return tuple(
+            heading for heading in self.headings if heading.canonical == canonical
+        )
+
+    def section_text(self, canonical: str) -> str:
+        sections = self.sections(canonical)
+        if len(sections) != 1:
+            return ""
+        section = sections[0]
+        return self.visible_text[section.content_start:section.content_end]
+
+
+def _masked_markdown_line(line: str) -> str:
+    return re.sub(r"[^\r\n]", " ", line)
+
+
+def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
+    """Parse real ATX headings once while masking fenced code at stable offsets."""
+    heading_rows: list[tuple[str, int, int, int, int]] = []
+    visible_lines: list[str] = []
+    offset = 0
+    fence_char = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        if fence_char:
+            closing = re.match(r"^ {0,3}(`{3,}|~{3,})[ \t]*(?:\r?\n)?$", line)
+            visible_lines.append(_masked_markdown_line(line))
+            if (
+                closing
+                and closing.group(1)[0] == fence_char
+                and len(closing.group(1)) >= fence_length
+            ):
+                fence_char = ""
+                fence_length = 0
+            offset += len(line)
+            continue
+
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*?)(?:\r?\n)?$", line)
+        if opening and not (
+            opening.group(1)[0] == "`" and "`" in opening.group(2)
+        ):
+            fence_char = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            visible_lines.append(_masked_markdown_line(line))
+            offset += len(line)
+            continue
+
+        visible_lines.append(line)
+        heading_match = re.match(
+            r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*(?:\r?\n)?$", line,
+        )
+        if heading_match:
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", heading_match.group(2)).strip()
+            if title:
+                level = len(heading_match.group(1))
+                line_end = offset + len(line.rstrip("\r\n"))
+                heading_rows.append(
+                    (f"{'#' * level} {title}", level, offset, line_end, offset + len(line))
+                )
+        offset += len(line)
+
+    headings = tuple(
+        _ReportMarkdownHeading(
+            canonical=canonical,
+            level=level,
+            start=start,
+            line_end=line_end,
+            content_start=content_start,
+            content_end=(
+                heading_rows[index + 1][2]
+                if index + 1 < len(heading_rows)
+                else len(text)
+            ),
+        )
+        for index, (canonical, level, start, line_end, content_start) in enumerate(
+            heading_rows
+        )
+    )
+    return _ParsedReportMarkdown(
+        source=text,
+        visible_text="".join(visible_lines),
+        headings=headings,
+    )
+
+
+def _sub_visible_report_text(text: str, pattern: str, replacement: str) -> str:
+    parsed = _parse_report_markdown(text)
+    matches = list(re.finditer(pattern, parsed.visible_text))
+    for match in reversed(matches):
+        text = text[:match.start()] + match.expand(replacement) + text[match.end():]
+    return text
+
+
 def _normalize_report_evidence_coverage(text: str, candidate: dict) -> str:
     coverage = candidate.get("evidence_coverage")
     heading = "## 三、裁判结论"
-    if coverage is None or heading not in text:
+    parsed = _parse_report_markdown(text)
+    if coverage is None or not parsed.sections(heading):
         return text
     authoritative = f"**证据覆盖率：{round(float(coverage) * 100, 1)}%**"
-    without_model_fields = re.sub(_report_labeled_field_pattern("证据覆盖率"), "", text)
-    without_model_fields = re.sub(r"([：:])\s*[，、；;]+", r"\1", without_model_fields)
-    without_model_fields = re.sub(r"([，、；;])\s*[，、；;]+", r"\1", without_model_fields)
-    section_start = without_model_fields.index(heading) + len(heading)
+    without_model_fields = _sub_visible_report_text(
+        text, _report_labeled_field_pattern("证据覆盖率"), "",
+    )
+    without_model_fields = _sub_visible_report_text(
+        without_model_fields, r"([：:])\s*[，、；;]+", r"\1",
+    )
+    without_model_fields = _sub_visible_report_text(
+        without_model_fields, r"([，、；;])\s*[，、；;]+", r"\1",
+    )
+    normalized = _parse_report_markdown(without_model_fields)
+    judge_sections = normalized.sections(heading)
+    if not judge_sections:
+        return without_model_fields
+    section_start = judge_sections[0].line_end
     return (
         without_model_fields[:section_start]
         + "\n"
@@ -2068,26 +2190,16 @@ def _decision_policy_report_summary(decision_policy: dict) -> dict:
     return result
 
 
-def _adaptive_report_heading_issues(text: str) -> list[str]:
+def _adaptive_report_heading_issues(parsed: _ParsedReportMarkdown) -> list[str]:
     """Validate exact adaptive heading lines once and in contract order."""
-    headings: list[str] = []
-    fence_marker = ""
-    for raw_line in text.splitlines():
-        fence = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
-        if fence:
-            marker = fence.group(1)
-            if not fence_marker:
-                fence_marker = marker
-            elif marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
-                fence_marker = ""
-            continue
-        if fence_marker:
-            continue
-        line = raw_line.rstrip()
-        if re.fullmatch(r"#{2,3} [^\n]+", line):
-            headings.append(line)
+    headings = [heading.canonical for heading in parsed.headings]
 
     issues: list[str] = []
+    unexpected = [
+        heading for heading in headings if heading not in _VERDICT_REPORT_SECTIONS
+    ]
+    for heading in dict.fromkeys(unexpected):
+        issues.append(f"存在未授权章节：{heading}")
     counts = {section: headings.count(section) for section in _VERDICT_REPORT_SECTIONS}
     for section, count in counts.items():
         label = section.removeprefix("## ").removeprefix("# ")
@@ -2104,10 +2216,6 @@ def _adaptive_report_heading_issues(text: str) -> list[str]:
     return issues
 
 
-def _report_provenance_text(value) -> str:
-    return re.sub(r"[\W_]+", "", str(value or "").casefold())
-
-
 def _directional_bullet_has_counted_provenance(
     bullet: str,
     evidence_id: str,
@@ -2117,35 +2225,25 @@ def _directional_bullet_has_counted_provenance(
     evidence_selection = adaptive_report.get("evidence_selection")
     if not isinstance(evidence_selection, dict):
         return False
+    excluded_ids = {
+        str(item.get("evidence_id") or "")
+        for item in evidence_selection.get("excluded") or []
+        if isinstance(item, dict)
+    }
+    if evidence_id in excluded_ids:
+        return False
     counted_claims = [
         item for item in evidence_selection.get("counted") or []
         if isinstance(item, dict)
         and str(item.get("evidence_id") or "") == evidence_id
         and str(item.get("stance") or "") == expected_stance
     ]
-    counted_inferences = {
-        normalized
+    canonical_bullets = {
+        f"- [{evidence_id}] {str(item.get('inference') or '').strip()}"
         for item in counted_claims
-        if (normalized := _report_provenance_text(item.get("inference")))
+        if str(item.get("inference") or "").strip()
     }
-    bullet_text = _report_provenance_text(
-        re.sub(r"\[((?:ev_|sys_)[^\]]+)\]", "", bullet, count=1)
-    )
-    if not counted_inferences or not any(
-        inference in bullet_text for inference in counted_inferences
-    ):
-        return False
-
-    excluded_inferences = {
-        normalized
-        for item in evidence_selection.get("excluded") or []
-        if isinstance(item, dict)
-        and (normalized := _report_provenance_text(item.get("inference")))
-    }
-    return not any(
-        inference in bullet_text and inference not in counted_inferences
-        for inference in excluded_inferences
-    )
+    return bullet.strip() in canonical_bullets
 
 
 def _validate_final_report(
@@ -2158,8 +2256,12 @@ def _validate_final_report(
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
     issues: list[str] = []
+    parsed_markdown = None
+    validation_text = text
     if kind == "verdict" and adaptive_report is not None:
-        issues.extend(_adaptive_report_heading_issues(text))
+        parsed_markdown = _parse_report_markdown(text)
+        validation_text = parsed_markdown.visible_text
+        issues.extend(_adaptive_report_heading_issues(parsed_markdown))
     else:
         required_sections = (
             _POSITION_REPORT_SECTIONS
@@ -2171,7 +2273,7 @@ def _validate_final_report(
                 issues.append(
                     f"缺少必需章节：{section.removeprefix('## ').removeprefix('# ')}"
                 )
-    found_process = [marker for marker in _REPORT_PROCESS_MARKERS if marker in text]
+    found_process = [marker for marker in _REPORT_PROCESS_MARKERS if marker in validation_text]
     if found_process:
         issues.append("包含过程性措辞：" + "、".join(found_process))
     if len(text) < 300:
@@ -2180,8 +2282,8 @@ def _validate_final_report(
     if kind == "verdict":
         verdict = str(candidate.get("verdict") or "")
         confidence = candidate.get("confidence")
-        verdict_values = _report_labeled_values(text, "判断")
-        confidence_values = _report_labeled_values(text, "置信度")
+        verdict_values = _report_labeled_values(validation_text, "判断")
+        confidence_values = _report_labeled_values(validation_text, "置信度")
         if verdict and verdict not in verdict_values:
             issues.append("判断与结构化结果不一致")
         if verdict and any(value != verdict for value in verdict_values):
@@ -2195,7 +2297,7 @@ def _validate_final_report(
             issues.append("存在冲突的置信度")
         all_confidence_claims = [
             float(value) for value in re.findall(
-                r"(?:最终)?置信度[：:]\s*(\d+(?:\.\d+)?)\s*/\s*10", text,
+                r"(?:最终)?置信度[：:]\s*(\d+(?:\.\d+)?)\s*/\s*10", validation_text,
             )
         ]
         if confidence is not None and any(value != float(confidence) for value in all_confidence_claims):
@@ -2203,17 +2305,28 @@ def _validate_final_report(
                 issues.append("存在冲突的置信度")
         if candidate.get("evidence_coverage") is not None:
             expected_coverage = round(float(candidate["evidence_coverage"]) * 100, 1)
-            _validate_labeled_number(text, "证据覆盖率", expected_coverage, issues)
+            judge_text = (
+                parsed_markdown.section_text("## 三、裁判结论")
+                if parsed_markdown is not None else validation_text
+            )
+            _validate_labeled_number(judge_text, "证据覆盖率", expected_coverage, issues)
         if candidate.get("net_hardness") is not None:
-            _validate_labeled_number(text, "净硬度", candidate["net_hardness"], issues)
+            judge_text = (
+                parsed_markdown.section_text("## 三、裁判结论")
+                if parsed_markdown is not None else validation_text
+            )
+            _validate_labeled_number(judge_text, "净硬度", candidate["net_hardness"], issues)
         allowed_evidence_ids = set(candidate.get("counted_evidence_ids") or [])
         if candidate.get("evidence_coverage") is not None:
             headings = ("## 一、多头论点", "## 二、空头论点", "## 三、裁判结论")
             for index, heading in enumerate(headings[:2]):
                 expected_stance = "bull" if index == 0 else "bear"
-                start = text.find(heading)
-                end = text.find(headings[index + 1], start + len(heading)) if start >= 0 else -1
-                section = text[start + len(heading):end] if start >= 0 and end >= 0 else ""
+                if parsed_markdown is not None:
+                    section = parsed_markdown.section_text(heading)
+                else:
+                    start = text.find(heading)
+                    end = text.find(headings[index + 1], start + len(heading)) if start >= 0 else -1
+                    section = text[start + len(heading):end] if start >= 0 and end >= 0 else ""
                 content_lines = [line.strip() for line in section.splitlines() if line.strip()]
                 bullets = [line for line in content_lines if line.startswith("-")]
                 if len(bullets) != len(content_lines):
@@ -2231,7 +2344,7 @@ def _validate_final_report(
                         issues.append(f"{heading}方向论点与计入证据来源不一致")
                         break
         all_verdict_claims = re.findall(
-            r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", text,
+            r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", validation_text,
         )
         if verdict and any(value != verdict for value in all_verdict_claims):
             if "存在冲突的判断" not in issues:
@@ -2239,7 +2352,7 @@ def _validate_final_report(
         if verdict in BULLISH_VERDICTS:
             entry_low = candidate.get("entry_low") or candidate.get("entry")
             entry_high = candidate.get("entry_high") or candidate.get("entry")
-            entry_values = _report_labeled_values(text, "入场")
+            entry_values = _report_labeled_values(validation_text, "入场")
             entry_numbers = [_report_number(part) for value in entry_values for part in re.findall(r"-?\d+(?:\.\d+)?", value)]
             expected_entry = [_report_number(entry_low), _report_number(entry_high)]
             if entry_low is not None and (len(entry_values) != 1 or entry_numbers != expected_entry):
@@ -2249,7 +2362,7 @@ def _validate_final_report(
                 ("position_size_pct", "建议仓位"),
             ):
                 value = candidate.get(field)
-                _validate_labeled_number(text, label, value, issues)
+                _validate_labeled_number(validation_text, label, value, issues)
     elif kind == "position_action":
         action = str(candidate.get("action") or "")
         action_values = _report_labeled_values(text, "当前动作")
@@ -3084,7 +3197,8 @@ def _run_langgraph_loop(
                     "`adaptive_report.history`、`adaptive_report.playstyle`、"
                     "`adaptive_report.evidence_selection` 和 `adaptive_report.unknowns`。"
                     "`evidence_selection.counted` 中的计入证据可以支持方向；"
-                    "每条方向论点必须逐字包含其 evidence_id 对应的 counted inference，"
+                    "每条方向论点必须严格写成 `- [<evidence_id>] <counted inference>`，"
+                    "整条只允许对应 counted inference 原文，不得追加评论、否定或其他主张，"
                     "并放入与 counted stance 一致的多头或空头章节。"
                     "被排除证据只能解释排除原因，不得作为多头或空头论点的 evidence_id，"
                     "也不得支持方向或硬度。"

@@ -510,6 +510,37 @@ def test_adaptive_verdict_report_rejects_reordered_duplicate_and_prose_spoofed_h
     assert any("缺少必需章节：市场与个股环境" in issue for issue in spoofed_issues)
 
 
+@pytest.mark.parametrize("indent", [" ", "  ", "   "])
+def test_adaptive_verdict_report_accepts_commonmark_heading_indentation(indent):
+    report = "\n".join(
+        f"{indent}{line}" if line.startswith("#") else line
+        for line in _complete_adaptive_verdict_report().splitlines()
+    )
+
+    assert analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={"evidence_selection": {"counted": [], "excluded": []}},
+    ) == []
+
+
+def test_adaptive_verdict_report_rejects_unexpected_real_heading():
+    report = _complete_adaptive_verdict_report().replace(
+        "## 操作建议",
+        "## 补充观察\n这不是自适应报告契约的一部分。\n\n## 操作建议",
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={"evidence_selection": {"counted": [], "excluded": []}},
+    )
+
+    assert any("未授权章节：## 补充观察" in issue for issue in issues)
+
+
 def _adaptive_report_with_directional_evidence():
     report = _complete_adaptive_verdict_report().replace(
         "1. 盈利增长 → 提供安全边际。\n"
@@ -520,7 +551,7 @@ def _adaptive_report_with_directional_evidence():
         "1. 商品价格回落 → 利润可能承压。\n"
         "2. 资金净流出 → 短线承接偏弱。\n"
         "3. 趋势未反转 → 当前不宜追高。",
-        "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
+        "- [sys_capital] 近 5 日资金净流出",
     ).replace(
         "领先指标弱于滞后的利润数据，因此倾向谨慎。",
         "领先指标偏弱，因此倾向谨慎。\n**净硬度：-0.8**",
@@ -570,8 +601,8 @@ def test_adaptive_verdict_rejects_excluded_inference_relabelled_with_counted_id(
         "## 一、多头论点\n- [sys_capital] 旧龙虎榜资金 → 支持多头方向。\n\n## 二、空头论点",
     )
     relabelled_same_stance = report.replace(
-        "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
-        "- [sys_capital] 旧龙虎榜资金 → 支持空头方向。",
+        "- [sys_capital] 近 5 日资金净流出",
+        "- [sys_capital] 旧龙虎榜资金",
     )
 
     explicit_issues = analyze._validate_final_report(
@@ -587,6 +618,97 @@ def test_adaptive_verdict_rejects_excluded_inference_relabelled_with_counted_id(
     assert any("未计分或未标注 evidence_id" in issue for issue in explicit_issues)
     assert any("方向论点与计入证据来源不一致" in issue for issue in bull_issues)
     assert any("方向论点与计入证据来源不一致" in issue for issue in same_stance_issues)
+
+
+@pytest.mark.parametrize(
+    "unsafe_bullet",
+    [
+        "- [sys_capital] 并非近 5 日资金净流出，实际为流入，因此该证据不支持空头。",
+        "- [sys_capital] 近 5 日资金净流出；早前龙虎席位的旧资金也支持空头方向。",
+    ],
+)
+def test_adaptive_verdict_rejects_noncanonical_directional_claims(unsafe_bullet):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("- [sys_capital] 近 5 日资金净流出", unsafe_bullet)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("方向论点与计入证据来源不一致" in issue for issue in issues)
+
+
+def test_adaptive_verdict_allows_counted_inference_overlapping_excluded_inference():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    adaptive_report["evidence_selection"]["excluded"][0]["inference"] = "资金净流出"
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
+def test_adaptive_verdict_directional_validation_ignores_fenced_fake_sections():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    unsafe_real_report = report.replace(
+        "- [sys_capital] 近 5 日资金净流出",
+        "- [sys_capital] 旧龙虎榜资金",
+    )
+    fenced_safe_sections = """```markdown
+## 一、多头论点
+## 二、空头论点
+- [sys_capital] 近 5 日资金净流出
+## 三、裁判结论
+```
+
+"""
+
+    issues = analyze._validate_final_report(
+        fenced_safe_sections + unsafe_real_report,
+        "verdict",
+        candidate,
+        adaptive_report=adaptive_report,
+    )
+
+    assert any("方向论点与计入证据来源不一致" in issue for issue in issues)
+
+
+def test_adaptive_verdict_fenced_coverage_does_not_satisfy_real_judge_section():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**证据覆盖率：60.0%**", "")
+    fenced_fake_judge = """~~~markdown
+## 三、裁判结论
+**证据覆盖率：60.0%**
+~~~
+
+"""
+
+    issues = analyze._validate_final_report(
+        fenced_fake_judge + report,
+        "verdict",
+        candidate,
+        adaptive_report=adaptive_report,
+    )
+
+    assert any("证据覆盖率" in issue for issue in issues)
+
+
+def test_normalize_report_coverage_targets_real_judge_not_fenced_heading():
+    report, candidate, _adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**证据覆盖率：60.0%**", "")
+    fenced_fake_judge = """```markdown
+## 三、裁判结论
+代码示例保持原样。
+```
+
+"""
+
+    normalized = analyze._normalize_report_evidence_coverage(
+        fenced_fake_judge + report, candidate,
+    )
+
+    assert "## 三、裁判结论\n代码示例保持原样。" in normalized
+    real_judge = normalized.rsplit("## 三、裁判结论", 1)[1]
+    assert real_judge.startswith("\n**证据覆盖率：60.0%**")
 
 
 def test_position_report_sections_remain_unchanged():
@@ -1360,7 +1482,7 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
         "1. 商品价格回落 → 利润可能承压。\n"
         "2. 资金净流出 → 短线承接偏弱。\n"
         "3. 趋势未反转 → 当前不宜追高。",
-        "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
+        "- [sys_capital] 近 5 日资金净流出",
     ).replace(
         "领先指标弱于滞后的利润数据，因此倾向谨慎。",
         "领先指标偏弱，因此倾向谨慎。\n**净硬度：-0.8**",
@@ -1376,8 +1498,8 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
         _response(tool_name="record_verdict", arguments=_bearish_candidate()),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
         _response(content=report.replace(
-            "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
-            "- [sys_capital] 旧龙虎榜资金 → 支持空头方向。",
+            "- [sys_capital] 近 5 日资金净流出",
+            "- [sys_capital] 旧龙虎榜资金",
         )),
         _response(content=report),
     ])
@@ -1418,7 +1540,8 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     assert "波段" in report_prompt
     assert "历史样本" in report_prompt
     assert "DRAFT_ONLY_CASHFLOW_MINUS_8_65" not in report_prompt
-    assert "逐字包含其 evidence_id 对应的 counted inference" in report_prompt
+    assert "每条方向论点必须严格写成 `- [<evidence_id>] <counted inference>`" in report_prompt
+    assert "不得追加评论、否定或其他主张" in report_prompt
     assert "被排除证据只能解释排除原因" in report_prompt
     assert "不得作为多头或空头论点的 evidence_id" in report_prompt
     assert "无可靠数据" in report_prompt
