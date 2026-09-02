@@ -1899,6 +1899,17 @@ _VERDICT_REPORT_SECTIONS = (
     "## 操作建议",
     "## 风险与未知项",
 )
+_LEGACY_VERDICT_REPORT_SECTIONS = (
+    "## 核心判断",
+    "## 基本面分析",
+    "## 一、多头论点",
+    "## 二、空头论点",
+    "## 三、裁判结论",
+    "### 加权四维评分",
+    "### 置信度调整",
+    "## 操作建议",
+    "## 风险提示",
+)
 _POSITION_REPORT_SECTIONS = (
     "## 核心判断",
     "## 基本面分析",
@@ -2057,16 +2068,109 @@ def _decision_policy_report_summary(decision_policy: dict) -> dict:
     return result
 
 
-def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]:
+def _adaptive_report_heading_issues(text: str) -> list[str]:
+    """Validate exact adaptive heading lines once and in contract order."""
+    headings: list[str] = []
+    fence_marker = ""
+    for raw_line in text.splitlines():
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})", raw_line)
+        if fence:
+            marker = fence.group(1)
+            if not fence_marker:
+                fence_marker = marker
+            elif marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                fence_marker = ""
+            continue
+        if fence_marker:
+            continue
+        line = raw_line.rstrip()
+        if re.fullmatch(r"#{2,3} [^\n]+", line):
+            headings.append(line)
+
+    issues: list[str] = []
+    counts = {section: headings.count(section) for section in _VERDICT_REPORT_SECTIONS}
+    for section, count in counts.items():
+        label = section.removeprefix("## ").removeprefix("# ")
+        if count == 0:
+            issues.append(f"缺少必需章节：{label}")
+        elif count > 1:
+            issues.append(f"重复必需章节：{label}")
+    if all(count == 1 for count in counts.values()):
+        required_headings = [
+            heading for heading in headings if heading in _VERDICT_REPORT_SECTIONS
+        ]
+        if required_headings != list(_VERDICT_REPORT_SECTIONS):
+            issues.append("必需章节标题顺序不一致")
+    return issues
+
+
+def _report_provenance_text(value) -> str:
+    return re.sub(r"[\W_]+", "", str(value or "").casefold())
+
+
+def _directional_bullet_has_counted_provenance(
+    bullet: str,
+    evidence_id: str,
+    expected_stance: str,
+    adaptive_report: dict,
+) -> bool:
+    evidence_selection = adaptive_report.get("evidence_selection")
+    if not isinstance(evidence_selection, dict):
+        return False
+    counted_claims = [
+        item for item in evidence_selection.get("counted") or []
+        if isinstance(item, dict)
+        and str(item.get("evidence_id") or "") == evidence_id
+        and str(item.get("stance") or "") == expected_stance
+    ]
+    counted_inferences = {
+        normalized
+        for item in counted_claims
+        if (normalized := _report_provenance_text(item.get("inference")))
+    }
+    bullet_text = _report_provenance_text(
+        re.sub(r"\[((?:ev_|sys_)[^\]]+)\]", "", bullet, count=1)
+    )
+    if not counted_inferences or not any(
+        inference in bullet_text for inference in counted_inferences
+    ):
+        return False
+
+    excluded_inferences = {
+        normalized
+        for item in evidence_selection.get("excluded") or []
+        if isinstance(item, dict)
+        and (normalized := _report_provenance_text(item.get("inference")))
+    }
+    return not any(
+        inference in bullet_text and inference not in counted_inferences
+        for inference in excluded_inferences
+    )
+
+
+def _validate_final_report(
+    report: str,
+    kind: str,
+    candidate: dict,
+    *,
+    adaptive_report: dict | None = None,
+) -> list[str]:
     """Return deterministic issues that prevent a model report from being published."""
     text = str(report or "").strip()
     issues: list[str] = []
-    required_sections = (
-        _POSITION_REPORT_SECTIONS if kind == "position_action" else _VERDICT_REPORT_SECTIONS
-    )
-    for section in required_sections:
-        if section not in text:
-            issues.append(f"缺少必需章节：{section.removeprefix('## ').removeprefix('# ')}")
+    if kind == "verdict" and adaptive_report is not None:
+        issues.extend(_adaptive_report_heading_issues(text))
+    else:
+        required_sections = (
+            _POSITION_REPORT_SECTIONS
+            if kind == "position_action"
+            else _LEGACY_VERDICT_REPORT_SECTIONS
+        )
+        for section in required_sections:
+            if section not in text:
+                issues.append(
+                    f"缺少必需章节：{section.removeprefix('## ').removeprefix('# ')}"
+                )
     found_process = [marker for marker in _REPORT_PROCESS_MARKERS if marker in text]
     if found_process:
         issues.append("包含过程性措辞：" + "、".join(found_process))
@@ -2106,6 +2210,7 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
         if candidate.get("evidence_coverage") is not None:
             headings = ("## 一、多头论点", "## 二、空头论点", "## 三、裁判结论")
             for index, heading in enumerate(headings[:2]):
+                expected_stance = "bull" if index == 0 else "bear"
                 start = text.find(heading)
                 end = text.find(headings[index + 1], start + len(heading)) if start >= 0 else -1
                 section = text[start + len(heading):end] if start >= 0 and end >= 0 else ""
@@ -2119,6 +2224,11 @@ def _validate_final_report(report: str, kind: str, candidate: dict) -> list[str]
                     ids = re.findall(r"\[((?:ev_|sys_)[^\]]+)\]", bullet)
                     if len(ids) != 1 or ids[0] not in allowed_evidence_ids:
                         issues.append(f"{heading}包含未计分或未标注 evidence_id 的证据")
+                        break
+                    if adaptive_report is not None and not _directional_bullet_has_counted_provenance(
+                        bullet, ids[0], expected_stance, adaptive_report,
+                    ):
+                        issues.append(f"{heading}方向论点与计入证据来源不一致")
                         break
         all_verdict_claims = re.findall(
             r"(?:最终)?判断[：:]\s*(看多|偏多|观望偏多|中性|观望偏空|偏空|看空)", text,
@@ -2926,6 +3036,7 @@ def _run_langgraph_loop(
             candidate, late_metadata = finalize_candidate(kind, candidate)
             candidate = dict(candidate or {})
             finalization_metadata.update(dict(late_metadata or {}))
+        structured_verdict = kind == "verdict" and bool(authoritative_report_context)
         if kind == "position_action":
             candidate = _effective_position_report_candidate(candidate)
             heading_contract = "\n".join(_POSITION_REPORT_SECTIONS)
@@ -2954,7 +3065,12 @@ def _run_langgraph_loop(
                 )
             )
         else:
-            heading_contract = "\n".join(_VERDICT_REPORT_SECTIONS)
+            verdict_sections = (
+                _VERDICT_REPORT_SECTIONS
+                if structured_verdict
+                else _LEGACY_VERDICT_REPORT_SECTIONS
+            )
+            heading_contract = "\n".join(verdict_sections)
             format_contract = (
                 "未持仓 verdict 报告必须依次包含这些标题：\n"
                 + heading_contract + "\n\n"
@@ -2963,17 +3079,22 @@ def _run_langgraph_loop(
                 "多空论点每条必须以 `- [<evidence_id>]` 开头，只能使用 confirmed_evidence 中的 ID，每边 0-3 条。"
                 "看多类结论的操作建议必须逐字写出 `**入场：<entry_low>–<entry_high>**`、"
                 "`**止损：<stop_loss>**`、`**目标：<target>**`、`**建议仓位：<position_size_pct>%**`。"
-                "新增详细章节的唯一权威来源是 `adaptive_report.market`、"
-                "`adaptive_report.history`、`adaptive_report.playstyle`、"
-                "`adaptive_report.evidence_selection` 和 `adaptive_report.unknowns`。"
-                "`evidence_selection.counted` 中的计入证据可以支持方向；"
-                "被排除证据只能解释排除原因，不得作为多头或空头论点的 evidence_id，"
-                "也不得支持方向或硬度。"
-                "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
-                "不得补写替代事实。"
-                "不得复制或推断先前 assistant 消息中的事实。"
-                "权威数据存在且充足时，目标为 2000–3000 个中文字符；"
-                "准确性与完整性优先于长度，不得为凑字数添加未验证事实。"
+                + (
+                    "新增详细章节的唯一权威来源是 `adaptive_report.market`、"
+                    "`adaptive_report.history`、`adaptive_report.playstyle`、"
+                    "`adaptive_report.evidence_selection` 和 `adaptive_report.unknowns`。"
+                    "`evidence_selection.counted` 中的计入证据可以支持方向；"
+                    "每条方向论点必须逐字包含其 evidence_id 对应的 counted inference，"
+                    "并放入与 counted stance 一致的多头或空头章节。"
+                    "被排除证据只能解释排除原因，不得作为多头或空头论点的 evidence_id，"
+                    "也不得支持方向或硬度。"
+                    "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
+                    "不得补写替代事实。"
+                    "不得复制或推断先前 assistant 消息中的事实。"
+                    "权威数据存在且充足时，目标为 2000–3000 个中文字符；"
+                    "准确性与完整性优先于长度，不得为凑字数添加未验证事实。"
+                    if structured_verdict else ""
+                )
             )
         decision_policy_context = finalization_metadata.get("decision_policy") or {}
         counted_ids = {
@@ -3021,7 +3142,6 @@ def _run_langgraph_loop(
             adaptive_playstyle["fit"] = dict(finalized_playstyle.get("fit") or {})
             adaptive_playstyle["risk_level"] = finalized_playstyle.get("risk_level")
             adaptive_context["playstyle"] = adaptive_playstyle
-        structured_verdict = kind == "verdict" and bool(authoritative_report_context)
         if structured_verdict:
             authoritative_context = {
                 "kind": kind,
@@ -3117,7 +3237,12 @@ def _run_langgraph_loop(
             if getattr(choice, "finish_reason", None) == "length":
                 issues = ["正式报告输出被 max_tokens 截断"]
             else:
-                issues = _validate_final_report(text, kind, candidate)
+                if structured_verdict:
+                    issues = _validate_final_report(
+                        text, kind, candidate, adaptive_report=adaptive_context,
+                    )
+                else:
+                    issues = _validate_final_report(text, kind, candidate)
             if not issues:
                 emit({"type": "report_generated", "attempt": attempt + 1})
                 return {

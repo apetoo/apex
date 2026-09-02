@@ -282,7 +282,7 @@ def _multi_tool_response(calls):
     return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="tool_calls")])
 
 
-def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
+def _complete_adaptive_verdict_report(*, verdict="观望偏空", confidence=4):
     return f"""## 核心判断
 **判断：{verdict}**
 **置信度：{confidence}/10**
@@ -332,8 +332,39 @@ def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
 商品价格和市场波动可能使结论失效。未确认数据保持未知。"""
 
 
-def _complete_adaptive_verdict_report(*, verdict="观望偏空", confidence=4):
-    return _complete_verdict_report(verdict=verdict, confidence=confidence)
+def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
+    return f"""## 核心判断
+**判断：{verdict}**
+**置信度：{confidence}/10**
+
+## 基本面分析
+营收与利润数据完整，周期位置仍需谨慎。
+
+## 一、多头论点
+1. 盈利增长 → 提供安全边际。
+2. 现金流改善 → 盈利质量提升。
+3. 负债可控 → 财务风险有限。
+
+## 二、空头论点
+1. 商品价格回落 → 利润可能承压。
+2. 资金净流出 → 短线承接偏弱。
+3. 趋势未反转 → 当前不宜追高。
+
+## 三、裁判结论
+领先指标弱于滞后的利润数据，因此倾向谨慎。
+**证据覆盖率：60.0%**
+
+### 加权四维评分
+技术面 4 分，基本面 7 分，资金面 3 分，情绪面 5 分；加权总分 4.9。
+
+### 置信度调整
+初始 6，历史命中率扣 2，最终 {confidence}。
+
+## 操作建议
+当前不新开多头仓位，等待资金与趋势改善后重新评估。
+
+## 风险提示
+商品价格和市场波动可能使结论失效。"""
 
 
 def _complete_position_report(*, action="hold"):
@@ -430,14 +461,132 @@ def test_final_report_validator_rejects_missing_sections_and_process_text():
 
 def test_adaptive_verdict_report_requires_detailed_sections():
     report = _complete_adaptive_verdict_report()
+    adaptive_report = {
+        "evidence_selection": {"counted": [], "excluded": []},
+    }
     assert analyze._validate_final_report(report, "verdict", {
         "verdict": "观望偏空", "confidence": 4,
-    }) == []
+    }, adaptive_report=adaptive_report) == []
     issues = analyze._validate_final_report(
         report.replace("## 市场与个股环境", "## 市场"), "verdict",
         {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=adaptive_report,
     )
     assert any("市场与个股环境" in issue for issue in issues)
+
+
+def test_adaptive_verdict_report_rejects_reordered_duplicate_and_prose_spoofed_headings():
+    report = _complete_adaptive_verdict_report()
+    candidate = {"verdict": "观望偏空", "confidence": 4}
+    adaptive_report = {
+        "evidence_selection": {"counted": [], "excluded": []},
+    }
+    reordered = report.replace(
+        "## 基本面分析", "## __TEMP__", 1,
+    ).replace(
+        "## 市场与个股环境", "## 基本面分析", 1,
+    ).replace(
+        "## __TEMP__", "## 市场与个股环境", 1,
+    )
+    duplicate = report + "\n\n## 市场与个股环境\n重复章节。"
+    prose_spoof = report.replace(
+        "## 市场与个股环境",
+        "## 市场\n正文提及 `## 市场与个股环境`，但它不是 Markdown 标题行。",
+        1,
+    )
+
+    reordered_issues = analyze._validate_final_report(
+        reordered, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+    duplicate_issues = analyze._validate_final_report(
+        duplicate, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+    spoofed_issues = analyze._validate_final_report(
+        prose_spoof, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("标题顺序" in issue for issue in reordered_issues)
+    assert any("重复必需章节：市场与个股环境" in issue for issue in duplicate_issues)
+    assert any("缺少必需章节：市场与个股环境" in issue for issue in spoofed_issues)
+
+
+def _adaptive_report_with_directional_evidence():
+    report = _complete_adaptive_verdict_report().replace(
+        "1. 盈利增长 → 提供安全边际。\n"
+        "2. 现金流改善 → 盈利质量提升。\n"
+        "3. 负债可控 → 财务风险有限。",
+        "",
+    ).replace(
+        "1. 商品价格回落 → 利润可能承压。\n"
+        "2. 资金净流出 → 短线承接偏弱。\n"
+        "3. 趋势未反转 → 当前不宜追高。",
+        "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
+    ).replace(
+        "领先指标弱于滞后的利润数据，因此倾向谨慎。",
+        "领先指标偏弱，因此倾向谨慎。\n**净硬度：-0.8**",
+    ).replace(
+        "计入证据支持当前方向；过期资金证据仅解释排除原因，不参与方向判断。",
+        "旧龙虎榜资金因 stale_capital 被排除，仅在本节解释取舍。",
+    )
+    candidate = {
+        "verdict": "观望偏空", "confidence": 4,
+        "evidence_coverage": 0.6, "net_hardness": -0.8,
+        "counted_evidence_ids": ["sys_capital"],
+    }
+    adaptive_report = {
+        "evidence_selection": {
+            "counted": [{
+                "evidence_id": "sys_capital", "stance": "bear",
+                "inference": "近 5 日资金净流出",
+            }],
+            "excluded": [{
+                "evidence_id": "ev_old", "stance": "bear",
+                "inference": "旧龙虎榜资金", "reason": "stale_capital",
+            }],
+        },
+    }
+    return report, candidate, adaptive_report
+
+
+def test_adaptive_verdict_allows_counted_direction_and_excluded_conflict_explanation():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+    assert "旧龙虎榜资金因 stale_capital 被排除" in report.split(
+        "### 证据取舍与冲突", 1,
+    )[1].split("### 历史判断复盘", 1)[0]
+
+
+def test_adaptive_verdict_rejects_excluded_inference_relabelled_with_counted_id():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    explicit_excluded_id = report.replace(
+        "## 一、多头论点\n\n\n## 二、空头论点",
+        "## 一、多头论点\n- [ev_old] 旧龙虎榜资金 → 支持多头方向。\n\n## 二、空头论点",
+    )
+    relabelled_bull = report.replace(
+        "## 一、多头论点\n\n\n## 二、空头论点",
+        "## 一、多头论点\n- [sys_capital] 旧龙虎榜资金 → 支持多头方向。\n\n## 二、空头论点",
+    )
+    relabelled_same_stance = report.replace(
+        "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
+        "- [sys_capital] 旧龙虎榜资金 → 支持空头方向。",
+    )
+
+    explicit_issues = analyze._validate_final_report(
+        explicit_excluded_id, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+    bull_issues = analyze._validate_final_report(
+        relabelled_bull, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+    same_stance_issues = analyze._validate_final_report(
+        relabelled_same_stance, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("未计分或未标注 evidence_id" in issue for issue in explicit_issues)
+    assert any("方向论点与计入证据来源不一致" in issue for issue in bull_issues)
+    assert any("方向论点与计入证据来源不一致" in issue for issue in same_stance_issues)
 
 
 def test_position_report_sections_remain_unchanged():
@@ -1010,6 +1159,33 @@ def test_formal_report_replaces_research_process_text(monkeypatch):
     assert '"review_outcome": "pass"' in report_prompt
 
 
+def test_unstructured_direct_verdict_preserves_legacy_report_contract(monkeypatch):
+    _patch_report_graph_environment(monkeypatch)
+    legacy_report = _complete_verdict_report()
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "观望偏空", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_verdict", arguments=_bearish_candidate()),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=legacy_report),
+        _response(content=legacy_report),
+    ])
+
+    result = analyze._run_langgraph_loop(
+        ts_code="002192.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}],
+        max_iter=12, emit=lambda _event: None,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["analysis_text"] == legacy_report
+    report_prompt = client.calls[-1]["messages"][-1]["content"]
+    assert "## 风险提示" in report_prompt
+    assert "## 市场与个股环境" not in report_prompt
+    assert "新增详细章节的唯一权威来源" not in report_prompt
+
+
 def test_formal_report_prompt_uses_structured_authority_not_research_draft(monkeypatch):
     _patch_report_graph_environment(monkeypatch)
     original_build_analysis_graph = analyze.build_analysis_graph
@@ -1076,7 +1252,7 @@ def test_formal_report_prompt_uses_structured_authority_not_research_draft(monke
         }),
         _response(tool_name="record_verdict", arguments=candidate),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
-        _response(content=_complete_verdict_report()),
+        _response(content=_complete_adaptive_verdict_report()),
     ])
 
     report_context = {
@@ -1179,7 +1355,7 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
         "1. 盈利增长 → 提供安全边际。\n"
         "2. 现金流改善 → 盈利质量提升。\n"
         "3. 负债可控 → 财务风险有限。",
-        "- [sys_capital] 资金是唯一计入的方向证据，本侧无可靠多头证据。",
+        "",
     ).replace(
         "1. 商品价格回落 → 利润可能承压。\n"
         "2. 资金净流出 → 短线承接偏弱。\n"
@@ -1199,6 +1375,10 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
         }),
         _response(tool_name="record_verdict", arguments=_bearish_candidate()),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=report.replace(
+            "- [sys_capital] 近 5 日资金净流出 → 短线承接偏弱。",
+            "- [sys_capital] 旧龙虎榜资金 → 支持空头方向。",
+        )),
         _response(content=report),
     ])
 
@@ -1231,18 +1411,21 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     )
 
     assert result["analysis_status"] == "completed"
+    assert result["report_generation_attempts"] == 2
     report_prompt = client.calls[-1]["messages"][-1]["content"]
     assert "亢奋" in report_prompt
     assert "stale_capital" in report_prompt
     assert "波段" in report_prompt
     assert "历史样本" in report_prompt
     assert "DRAFT_ONLY_CASHFLOW_MINUS_8_65" not in report_prompt
+    assert "逐字包含其 evidence_id 对应的 counted inference" in report_prompt
     assert "被排除证据只能解释排除原因" in report_prompt
     assert "不得作为多头或空头论点的 evidence_id" in report_prompt
     assert "无可靠数据" in report_prompt
     assert "无历史样本" in report_prompt
     assert "不得复制或推断先前 assistant 消息中的事实" in report_prompt
     assert "2000–3000 个中文字符" in report_prompt
+    assert "方向论点与计入证据来源不一致" in report_prompt
     for heading in analyze._VERDICT_REPORT_SECTIONS:
         assert heading in result["analysis_text"]
     for field in (
