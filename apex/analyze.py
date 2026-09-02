@@ -2015,6 +2015,18 @@ def _masked_markdown_line(line: str) -> str:
     return re.sub(r"[^\r\n]", " ", line)
 
 
+def _is_indented_markdown_code(line: str) -> bool:
+    columns = 0
+    for character in line:
+        if character == " ":
+            columns += 1
+        elif character == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            break
+    return columns >= 4 and bool(line.strip())
+
+
 def _mask_markdown_span(characters: list[str], start: int, end: int) -> None:
     for index in range(start, end):
         if characters[index] not in "\r\n":
@@ -2086,7 +2098,11 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
             visible_lines.append(_masked_markdown_line(line))
             continue
 
-        visible_lines.append(line)
+        visible_lines.append(
+            _masked_markdown_line(line)
+            if _is_indented_markdown_code(line)
+            else line
+        )
     visible_text = _mask_nonrendered_markdown("".join(visible_lines))
 
     heading_rows: list[tuple[str, int, int, int, int]] = []
@@ -2287,14 +2303,19 @@ def _adaptive_report_excluded_issues(
         if isinstance(item, dict)
         and (inference := _canonical_report_inference(item.get("inference")))
     }
-    excluded_claims = [
-        (
-            str(item.get("evidence_id") or "").strip()[:240],
-            _canonical_report_inference(item.get("inference")),
+    excluded_claims = []
+    for item in evidence_selection.get("excluded") or []:
+        if not isinstance(item, dict):
+            continue
+        inference = _canonical_report_inference(item.get("inference"))
+        ambiguous_inference = inference and any(
+            inference in counted or counted in inference
+            for counted in counted_inferences
         )
-        for item in evidence_selection.get("excluded") or []
-        if isinstance(item, dict)
-    ]
+        excluded_claims.append((
+            str(item.get("evidence_id") or "").strip()[:240],
+            "" if ambiguous_inference else inference,
+        ))
     if not excluded_claims:
         return []
 

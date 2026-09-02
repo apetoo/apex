@@ -647,6 +647,19 @@ def test_adaptive_verdict_allows_counted_inference_overlapping_excluded_inferenc
     ) == []
 
 
+def test_adaptive_verdict_allows_ambiguous_counted_overlap_in_narrative():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    adaptive_report["evidence_selection"]["excluded"][0]["inference"] = "资金净流出"
+    report = report.replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        "资金净流出背景需要关注，但这里只复述已计入证据。",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
 def test_adaptive_verdict_directional_validation_ignores_fenced_fake_sections():
     report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
     unsafe_real_report = report.replace(
@@ -714,6 +727,55 @@ def test_adaptive_verdict_requires_one_rendered_net_hardness_in_real_judge(
     )
 
     assert any("净硬度" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "indented_code",
+    [
+        "    **净硬度：-0.8**",
+        "\t**净硬度：-0.8**",
+        "    示例代码第一行\n\n    **净硬度：-0.8**",
+    ],
+)
+def test_adaptive_verdict_indented_code_cannot_satisfy_net_hardness(
+    indented_code,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**净硬度：-0.8**", indented_code)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("净硬度" in issue for issue in issues)
+
+
+def test_adaptive_verdict_resumes_rendered_fields_after_indented_code_block():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "**净硬度：-0.8**",
+        "    **净硬度：999**\n\n**净硬度：-0.8**",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
+def test_adaptive_verdict_ignores_indented_code_for_evidence_provenance():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "- [sys_capital] 近 5 日资金净流出",
+        "    - [sys_capital] 近 5 日资金净流出\n\n"
+        "- [sys_capital] 近 5 日资金净流出",
+    ).replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        "    旧龙虎榜资金仅是代码示例。",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
 
 
 def test_normalize_report_coverage_targets_real_judge_not_fenced_heading():
