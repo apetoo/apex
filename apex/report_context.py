@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 
@@ -14,6 +15,10 @@ MAX_TEXT = 240
 
 def _text(value: Any) -> str:
     return str(value or "")[:MAX_TEXT]
+
+
+def _inference_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:MAX_TEXT]
 
 
 def _pick(source: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -74,7 +79,7 @@ def _claim(claim: Any, *, excluded: bool = False) -> dict[str, Any]:
     )
     result = _pick(claim, keys)
     if "inference" in result:
-        result["inference"] = _text(result["inference"])
+        result["inference"] = _inference_text(result["inference"])
     if excluded and claim.get("reason") is not None:
         result["reason"] = _text(claim["reason"])
     return result

@@ -1978,6 +1978,10 @@ def _validate_labeled_number(
         issues.append(f"存在冲突的{conflict_label or label}")
 
 
+def _append_unique_issues(issues: list[str], additions: list[str]) -> None:
+    issues.extend(issue for issue in additions if issue not in issues)
+
+
 @dataclass(frozen=True)
 class _ReportMarkdownHeading:
     canonical: str
@@ -2011,11 +2015,53 @@ def _masked_markdown_line(line: str) -> str:
     return re.sub(r"[^\r\n]", " ", line)
 
 
+def _mask_markdown_span(characters: list[str], start: int, end: int) -> None:
+    for index in range(start, end):
+        if characters[index] not in "\r\n":
+            characters[index] = " "
+
+
+def _mask_nonrendered_markdown(text: str) -> str:
+    """Mask HTML comments and inline code while preserving source offsets."""
+    characters = list(text)
+    for match in re.finditer(r"<!--.*?(?:-->|$)", text, flags=re.DOTALL):
+        _mask_markdown_span(characters, match.start(), match.end())
+
+    comment_masked = "".join(characters)
+    index = 0
+    while index < len(comment_masked):
+        if comment_masked[index] != "`":
+            index += 1
+            continue
+        run_end = index + 1
+        while run_end < len(comment_masked) and comment_masked[run_end] == "`":
+            run_end += 1
+        marker = comment_masked[index:run_end]
+        search_from = run_end
+        closing = -1
+        while True:
+            candidate = comment_masked.find(marker, search_from)
+            if candidate < 0:
+                break
+            before_is_tick = candidate > 0 and comment_masked[candidate - 1] == "`"
+            after = candidate + len(marker)
+            after_is_tick = after < len(comment_masked) and comment_masked[after] == "`"
+            if not before_is_tick and not after_is_tick:
+                closing = candidate
+                break
+            search_from = after
+        if closing < 0:
+            index = run_end
+            continue
+        span_end = closing + len(marker)
+        _mask_markdown_span(characters, index, span_end)
+        index = span_end
+    return "".join(characters)
+
+
 def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
-    """Parse real ATX headings once while masking fenced code at stable offsets."""
-    heading_rows: list[tuple[str, int, int, int, int]] = []
+    """Parse rendered ATX headings once while masking non-rendered Markdown."""
     visible_lines: list[str] = []
-    offset = 0
     fence_char = ""
     fence_length = 0
     for line in text.splitlines(keepends=True):
@@ -2029,7 +2075,6 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
             ):
                 fence_char = ""
                 fence_length = 0
-            offset += len(line)
             continue
 
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*?)(?:\r?\n)?$", line)
@@ -2039,10 +2084,14 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
             fence_char = opening.group(1)[0]
             fence_length = len(opening.group(1))
             visible_lines.append(_masked_markdown_line(line))
-            offset += len(line)
             continue
 
         visible_lines.append(line)
+    visible_text = _mask_nonrendered_markdown("".join(visible_lines))
+
+    heading_rows: list[tuple[str, int, int, int, int]] = []
+    offset = 0
+    for line in visible_text.splitlines(keepends=True):
         heading_match = re.match(
             r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*(?:\r?\n)?$", line,
         )
@@ -2075,7 +2124,7 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
     )
     return _ParsedReportMarkdown(
         source=text,
-        visible_text="".join(visible_lines),
+        visible_text=visible_text,
         headings=headings,
     )
 
@@ -2216,6 +2265,64 @@ def _adaptive_report_heading_issues(parsed: _ParsedReportMarkdown) -> list[str]:
     return issues
 
 
+def _normalize_report_whitespace(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _canonical_report_inference(value) -> str:
+    return _normalize_report_whitespace(value)[:240]
+
+
+def _adaptive_report_excluded_issues(
+    parsed: _ParsedReportMarkdown,
+    adaptive_report: dict,
+) -> list[str]:
+    """Restrict exact excluded claim identities/content to the conflict section."""
+    evidence_selection = adaptive_report.get("evidence_selection")
+    if not isinstance(evidence_selection, dict):
+        return []
+    counted_inferences = {
+        inference
+        for item in evidence_selection.get("counted") or []
+        if isinstance(item, dict)
+        and (inference := _canonical_report_inference(item.get("inference")))
+    }
+    excluded_claims = [
+        (
+            str(item.get("evidence_id") or "").strip()[:240],
+            _canonical_report_inference(item.get("inference")),
+        )
+        for item in evidence_selection.get("excluded") or []
+        if isinstance(item, dict)
+    ]
+    if not excluded_claims:
+        return []
+
+    def contains_excluded(content: str) -> bool:
+        normalized = _normalize_report_whitespace(content)
+        without_counted = normalized
+        for counted in sorted(counted_inferences, key=len, reverse=True):
+            without_counted = without_counted.replace(counted, "")
+        return any(
+            (evidence_id and evidence_id in normalized)
+            or (inference and inference in without_counted)
+            for evidence_id, inference in excluded_claims
+        )
+
+    issues: list[str] = []
+    conflict_heading = "### 证据取舍与冲突"
+    preamble_end = parsed.headings[0].start if parsed.headings else len(parsed.visible_text)
+    if contains_excluded(parsed.visible_text[:preamble_end]):
+        issues.append("报告正文包含仅允许在证据取舍与冲突中出现的被排除证据")
+    for heading in _VERDICT_REPORT_SECTIONS:
+        if heading == conflict_heading:
+            continue
+        if contains_excluded(parsed.section_text(heading)):
+            label = heading.removeprefix("## ").removeprefix("# ")
+            issues.append(f"{label}包含仅允许在证据取舍与冲突中出现的被排除证据")
+    return issues
+
+
 def _directional_bullet_has_counted_provenance(
     bullet: str,
     evidence_id: str,
@@ -2239,9 +2346,9 @@ def _directional_bullet_has_counted_provenance(
         and str(item.get("stance") or "") == expected_stance
     ]
     canonical_bullets = {
-        f"- [{evidence_id}] {str(item.get('inference') or '').strip()}"
+        f"- [{evidence_id}] {_canonical_report_inference(item.get('inference'))}"
         for item in counted_claims
-        if str(item.get("inference") or "").strip()
+        if _canonical_report_inference(item.get("inference"))
     }
     return bullet.strip() in canonical_bullets
 
@@ -2262,6 +2369,7 @@ def _validate_final_report(
         parsed_markdown = _parse_report_markdown(text)
         validation_text = parsed_markdown.visible_text
         issues.extend(_adaptive_report_heading_issues(parsed_markdown))
+        issues.extend(_adaptive_report_excluded_issues(parsed_markdown, adaptive_report))
     else:
         required_sections = (
             _POSITION_REPORT_SECTIONS
@@ -2310,15 +2418,28 @@ def _validate_final_report(
                 if parsed_markdown is not None else validation_text
             )
             _validate_labeled_number(judge_text, "证据覆盖率", expected_coverage, issues)
+            if parsed_markdown is not None:
+                global_issues: list[str] = []
+                _validate_labeled_number(
+                    validation_text, "证据覆盖率", expected_coverage, global_issues,
+                )
+                _append_unique_issues(issues, global_issues)
         if candidate.get("net_hardness") is not None:
             judge_text = (
                 parsed_markdown.section_text("## 三、裁判结论")
                 if parsed_markdown is not None else validation_text
             )
             _validate_labeled_number(judge_text, "净硬度", candidate["net_hardness"], issues)
+            if parsed_markdown is not None:
+                global_issues = []
+                _validate_labeled_number(
+                    validation_text, "净硬度", candidate["net_hardness"], global_issues,
+                )
+                _append_unique_issues(issues, global_issues)
         allowed_evidence_ids = set(candidate.get("counted_evidence_ids") or [])
         if candidate.get("evidence_coverage") is not None:
             headings = ("## 一、多头论点", "## 二、空头论点", "## 三、裁判结论")
+            used_directional_ids: set[str] = set()
             for index, heading in enumerate(headings[:2]):
                 expected_stance = "bull" if index == 0 else "bear"
                 if parsed_markdown is not None:
@@ -2338,6 +2459,11 @@ def _validate_final_report(
                     if len(ids) != 1 or ids[0] not in allowed_evidence_ids:
                         issues.append(f"{heading}包含未计分或未标注 evidence_id 的证据")
                         break
+                    if adaptive_report is not None and ids[0] in used_directional_ids:
+                        issues.append(f"{heading}重复使用 evidence_id：{ids[0]}")
+                        break
+                    if adaptive_report is not None:
+                        used_directional_ids.add(ids[0])
                     if adaptive_report is not None and not _directional_bullet_has_counted_provenance(
                         bullet, ids[0], expected_stance, adaptive_report,
                     ):
@@ -3197,10 +3323,12 @@ def _run_langgraph_loop(
                     "`adaptive_report.history`、`adaptive_report.playstyle`、"
                     "`adaptive_report.evidence_selection` 和 `adaptive_report.unknowns`。"
                     "`evidence_selection.counted` 中的计入证据可以支持方向；"
+                    "counted inference 已由系统标准化为单行文本；"
                     "每条方向论点必须严格写成 `- [<evidence_id>] <counted inference>`，"
                     "整条只允许对应 counted inference 原文，不得追加评论、否定或其他主张，"
                     "并放入与 counted stance 一致的多头或空头章节。"
-                    "被排除证据只能解释排除原因，不得作为多头或空头论点的 evidence_id，"
+                    "被排除证据只能在 `### 证据取舍与冲突` 中解释排除原因，"
+                    "不得作为多头或空头论点的 evidence_id，"
                     "也不得支持方向或硬度。"
                     "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
                     "不得补写替代事实。"

@@ -105,6 +105,28 @@ def test_build_report_context_sanitizes_allowed_values_and_bounds_text():
     assert context["unknowns"] == ["u" * 240]
 
 
+def test_build_report_context_normalizes_inference_to_bounded_single_line():
+    context = build_report_context(
+        history_entries=[], market_context={}, playstyle=None,
+        playstyle_features={}, playstyle_fit=None, risk_level=None,
+        decision_policy={
+            "counted_claims": [{
+                "evidence_id": "sys_capital",
+                "inference": "近 5 日资金 \r\n\t净流出" + " x" * 300,
+            }],
+            "excluded_claims": [],
+        },
+        unknowns=[],
+    )
+
+    inference = context["evidence_selection"]["counted"][0]["inference"]
+    assert inference.startswith("近 5 日资金 净流出 x")
+    assert "\n" not in inference
+    assert "\r" not in inference
+    assert "\t" not in inference
+    assert len(inference) <= 240
+
+
 def test_build_report_context_sanitizes_market_and_feature_keys():
     class Unserializable:
         def __str__(self):

@@ -692,6 +692,30 @@ def test_adaptive_verdict_fenced_coverage_does_not_satisfy_real_judge_section():
     assert any("证据覆盖率" in issue for issue in issues)
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "**净硬度：-0.8**\n\n报告尾部冲突字段：**净硬度：999**",
+        "`**净硬度：-0.8**`",
+        "<!-- **净硬度：-0.8** -->",
+    ],
+)
+def test_adaptive_verdict_requires_one_rendered_net_hardness_in_real_judge(
+    replacement,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    if "报告尾部" in replacement:
+        report = report + "\n\n" + replacement.split("\n\n", 1)[1]
+    else:
+        report = report.replace("**净硬度：-0.8**", replacement)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("净硬度" in issue for issue in issues)
+
+
 def test_normalize_report_coverage_targets_real_judge_not_fenced_heading():
     report, candidate, _adaptive_report = _adaptive_report_with_directional_evidence()
     report = report.replace("**证据覆盖率：60.0%**", "")
@@ -709,6 +733,87 @@ def test_normalize_report_coverage_targets_real_judge_not_fenced_heading():
     assert "## 三、裁判结论\n代码示例保持原样。" in normalized
     real_judge = normalized.rsplit("## 三、裁判结论", 1)[1]
     assert real_judge.startswith("\n**证据覆盖率：60.0%**")
+
+
+@pytest.mark.parametrize(
+    ("original", "section_name"),
+    [
+        ("技术、基本面、资金与情绪四个维度共同决定当前结论。", "四维分析"),
+        ("领先指标偏弱，因此倾向谨慎。", "裁判结论"),
+        ("当前不新开多头仓位，等待资金与趋势改善后重新评估。", "操作建议"),
+    ],
+)
+def test_adaptive_verdict_rejects_excluded_inference_outside_conflict_section(
+    original, section_name,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        original,
+        "旧龙虎榜资金证明空方占优，因此支持观望偏空。",
+    )
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any(section_name in issue and "被排除证据" in issue for issue in issues)
+
+
+def test_adaptive_verdict_finds_excluded_inference_after_long_section_prose():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "技术、基本面、资金与情绪四个维度共同决定当前结论。",
+        "安全背景。" * 100 + "旧龙虎榜资金证明空方占优。",
+    )
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("四维分析" in issue and "被排除证据" in issue for issue in issues)
+
+
+def test_adaptive_verdict_rejects_excluded_inference_before_first_section():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+
+    issues = analyze._validate_final_report(
+        "旧龙虎榜资金证明空方占优。\n\n" + report,
+        "verdict",
+        candidate,
+        adaptive_report=adaptive_report,
+    )
+
+    assert any("报告正文" in issue and "被排除证据" in issue for issue in issues)
+
+
+def test_adaptive_verdict_rejects_duplicate_directional_evidence_id():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "- [sys_capital] 近 5 日资金净流出",
+        "- [sys_capital] 近 5 日资金净流出\n"
+        "- [sys_capital] 近 5 日资金净流出",
+    )
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("重复使用 evidence_id" in issue for issue in issues)
+
+
+def test_adaptive_verdict_canonicalizes_counted_inference_whitespace():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "- [sys_capital] 近 5 日资金净流出",
+        "- [sys_capital] 近 5 日资金 净流出",
+    )
+    adaptive_report["evidence_selection"]["counted"][0]["inference"] = (
+        "近 5 日资金 \r\n\t净流出"
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
 
 
 def test_position_report_sections_remain_unchanged():
@@ -1542,7 +1647,8 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     assert "DRAFT_ONLY_CASHFLOW_MINUS_8_65" not in report_prompt
     assert "每条方向论点必须严格写成 `- [<evidence_id>] <counted inference>`" in report_prompt
     assert "不得追加评论、否定或其他主张" in report_prompt
-    assert "被排除证据只能解释排除原因" in report_prompt
+    assert "counted inference 已由系统标准化为单行文本" in report_prompt
+    assert "被排除证据只能在 `### 证据取舍与冲突` 中解释排除原因" in report_prompt
     assert "不得作为多头或空头论点的 evidence_id" in report_prompt
     assert "无可靠数据" in report_prompt
     assert "无历史样本" in report_prompt
