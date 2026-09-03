@@ -3400,6 +3400,7 @@ def _run_langgraph_loop(
                     "整条只允许对应 counted inference 原文，不得追加评论、否定或其他主张，"
                     "并放入与 counted stance 一致的多头或空头章节。"
                     "被排除证据只能在 `### 证据取舍与冲突` 中解释排除原因，"
+                    "其条目只提供安全元数据和排除原因，不得推断、复原或转述其事实、推论或方向，"
                     "不得作为多头或空头论点的 evidence_id，"
                     "也不得支持方向或硬度。"
                     "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
@@ -3699,6 +3700,7 @@ def _run_analysis(ts_code: str, save: bool = True, on_progress=None,
 
     report_context = build_report_context(
         history_entries=history_entries,
+        forecast_rows=forecast_rows,
         market_context=market_ctx,
         playstyle=None,
         playstyle_features=playstyle_feats,

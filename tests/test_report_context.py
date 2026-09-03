@@ -149,3 +149,108 @@ def test_build_report_context_sanitizes_market_and_feature_keys():
     assert context["market"] == {}
     assert list(context["playstyle"]["features"]) == ["g" * 240]
     assert context["playstyle"]["features"]["g" * 240] == {"f" * 240: "ok"}
+
+
+def test_build_report_context_selects_newest_history_and_joins_refreshed_forecasts():
+    history_entries = [
+        {
+            "ts_code": "600487.SH",
+            "date": f"2026-08-0{day}",
+            "analyzed_at": f"2026-08-0{day}T10:00:00+08:00",
+            "verdict": "偏空",
+            "confidence": day,
+            "forecast_outcome": None,
+        }
+        for day in range(1, 8)
+    ]
+    refreshed = [
+        {
+            "ts_code": "600487.SH",
+            "analyzed_at": "2026-08-07T02:00:00+00:00",
+            "verdict": "偏空",
+            "stock_return_pct": 6.5,
+            "benchmark_return_pct": 1.0,
+            "excess_return_pct": 5.5,
+            "outcome": "bull",
+            "matured_at": "2026-08-21",
+            "horizon_trading_days": 10,
+            "hit": False,
+            "policy_version": "decision-policy-v1",
+            "analysis_text": "REFRESHED_FORECAST_DRAFT_SECRET",
+        },
+        {
+            "ts_code": "000001.SZ",
+            "analyzed_at": "2026-08-07T10:00:00+08:00",
+            "verdict": "看多",
+            "excess_return_pct": -99.0,
+            "hit": True,
+        },
+    ]
+
+    context = build_report_context(
+        history_entries=history_entries,
+        forecast_rows=refreshed,
+        market_context={}, playstyle=None, playstyle_features={},
+        playstyle_fit=None, risk_level=None, decision_policy={}, unknowns=[],
+    )
+
+    assert [item["date"] for item in context["history"]] == [
+        "2026-08-07", "2026-08-06", "2026-08-05", "2026-08-04", "2026-08-03",
+    ]
+    assert context["history"][0]["forecast_outcome"] == {
+        "stock_return_pct": 6.5,
+        "benchmark_return_pct": 1.0,
+        "excess_return_pct": 5.5,
+        "outcome": "bull",
+        "matured_at": "2026-08-21",
+        "horizon_trading_days": 10,
+        "hit": False,
+        "verdict": "偏空",
+        "policy_version": "decision-policy-v1",
+    }
+    assert "REFRESHED_FORECAST_DRAFT_SECRET" not in repr(context)
+
+
+def test_build_report_context_history_order_parses_timestamps_and_has_stable_fallbacks():
+    context = build_report_context(
+        history_entries=[
+            {"analyzed_at": "invalid", "date": "2026-08-06", "confidence": 6},
+            {"analyzed_at": "2026-08-07T09:00:00+08:00", "confidence": 70},
+            {"analyzed_at": "2026-08-07T01:30:00+00:00", "confidence": 71},
+            {"analyzed_at": "2026-08-05T10:00:00+08:00", "confidence": 50},
+            {"analyzed_at": "2026-08-05T10:00:00+08:00", "confidence": 51},
+            {"analyzed_at": None, "date": None, "confidence": 1},
+        ],
+        market_context={}, playstyle=None, playstyle_features={},
+        playstyle_fit=None, risk_level=None, decision_policy={}, unknowns=[],
+    )
+
+    assert [item["confidence"] for item in context["history"]] == [71, 70, 6, 51, 50]
+
+
+def test_build_report_context_excluded_claims_cannot_seed_directional_paraphrase():
+    context = build_report_context(
+        history_entries=[], market_context={}, playstyle=None,
+        playstyle_features={}, playstyle_fit=None, risk_level=None,
+        decision_policy={
+            "excluded_claims": [{
+                "evidence_id": "ev_old", "stance": "bear",
+                "dimension": "capital", "nature": "fact", "hardness": 2,
+                "adjusted_hardness": 1.0, "as_of": "2025-01-01",
+                "frequency": "event", "reason": "stale_capital",
+                "inference": "EXCLUDED_INFERENCE_OLD_DRAGON_TIGER",
+                "fact": "EXCLUDED_FACT_PRIVATE_TEXT",
+                "body": "EXCLUDED_BODY_PRIVATE_TEXT",
+            }],
+        },
+        unknowns=[],
+    )
+
+    assert context["evidence_selection"]["excluded"] == [{
+        "evidence_id": "ev_old", "dimension": "capital", "nature": "fact",
+        "as_of": "2025-01-01", "frequency": "event", "reason": "stale_capital",
+    }]
+    assert "EXCLUDED_INFERENCE" not in repr(context)
+    assert "EXCLUDED_FACT" not in repr(context)
+    assert "EXCLUDED_BODY" not in repr(context)
+    assert "bear" not in repr(context["evidence_selection"]["excluded"])

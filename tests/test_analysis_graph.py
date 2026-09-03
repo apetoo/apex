@@ -1427,6 +1427,76 @@ def test_run_persists_same_playstyle_as_report_finalization_metadata(monkeypatch
     assert result["playstyle"] == captured["report_metadata"]["playstyle"]
 
 
+def test_run_passes_newest_refreshed_forecast_history_to_report_context(monkeypatch):
+    captured = {}
+    history_entries = [
+        {
+            "ts_code": "600487.SH",
+            "date": f"2026-07-0{day}",
+            "analyzed_at": f"2026-07-0{day}T10:00:00+08:00",
+            "analysis_status": "completed",
+            "verdict": "偏空",
+            "confidence": day,
+            "forecast_outcome": None,
+            "policy_version": "decision-policy-v1",
+        }
+        for day in range(1, 8)
+    ]
+    refreshed_rows = [{
+        "ts_code": "600487.SH",
+        "analyzed_at": "2026-07-07T10:00:00+08:00",
+        "verdict": "偏空",
+        "stock_return_pct": 7.0,
+        "benchmark_return_pct": 1.0,
+        "excess_return_pct": 6.0,
+        "outcome": "bull",
+        "matured_at": "2026-07-21",
+        "horizon_trading_days": 10,
+        "hit": False,
+        "policy_version": "decision-policy-v1",
+    }]
+
+    monkeypatch.setattr(analyze._cfg_mod, "get", lambda: {
+        "deepseek": {"model": "fake", "max_tool_iterations": 1, "history_limit": 8},
+    })
+    monkeypatch.setattr(analyze, "_make_client", lambda _cfg: object())
+    monkeypatch.setattr(analyze, "_load_system_prompt", lambda **_kwargs: "system")
+    monkeypatch.setattr(analyze.journal, "load_verdicts", lambda **_kwargs: history_entries)
+    monkeypatch.setattr(
+        analyze.forecast_calibration, "refresh_forecast_rows", lambda _rows: refreshed_rows,
+    )
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": []})
+    monkeypatch.setattr(analyze, "_format_history", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(analyze, "_format_intraday_block", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_market_context", lambda _code: ("", {}))
+    monkeypatch.setattr(analyze, "_format_playstyle_block", lambda _code: ("", {}))
+
+    def run_loop_spy(**kwargs):
+        captured["report_context"] = kwargs["report_context"]
+        return {
+            "analysis_status": "completed", "draft_kind": "position_action",
+            "draft_proposal": {"action": "hold"},
+            "draft_data": {"action": "hold"},
+            "analysis_text": "report", "evidence": [], "token_usage": {},
+        }
+
+    monkeypatch.setattr(analyze, "_run_langgraph_loop", run_loop_spy)
+    monkeypatch.setattr(
+        analyze, "_finalize_position_action", lambda *_args, **_kwargs: {
+            "analysis_status": "completed", "source": "position_action",
+        },
+    )
+
+    analyze.run("600487.SH", save=False)
+
+    report_history = captured["report_context"]["history"]
+    assert [item["date"] for item in report_history] == [
+        "2026-07-07", "2026-07-06", "2026-07-05", "2026-07-04", "2026-07-03",
+    ]
+    assert report_history[0]["forecast_outcome"]["hit"] is False
+    assert report_history[0]["forecast_outcome"]["excess_return_pct"] == 6.0
+
+
 def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monkeypatch):
     held = {"ts_code": "000977.SZ", "entry_price": 77.0, "position_size_shares": 200,
             "stop_loss": 71.5, "target": 90.0}
@@ -1701,6 +1771,8 @@ def test_formal_report_prompt_uses_structured_authority_not_research_draft(monke
             "nature": "fact", "hardness": 2, "adjusted_hardness": 1.0,
             "as_of": "2025-01-01", "frequency": "event",
             "inference": "SAFE_EXCLUDED_INFERENCE", "reason": "stale_capital",
+            "fact": "RAW_EXCLUDED_FACT_SECRET",
+            "body": "RAW_EXCLUDED_BODY_SECRET",
             "raw_private": "RAW_EXCLUDED_PRIVATE_SECRET",
         }],
     }
@@ -1773,12 +1845,20 @@ def test_formal_report_prompt_uses_structured_authority_not_research_draft(monke
     assert adaptive["playstyle"]["profile"]["primary"] == "波段"
     assert adaptive["evidence_selection"]["counted"][0]["inference"] == "SAFE_COUNTED_INFERENCE"
     assert adaptive["evidence_selection"]["excluded"][0]["reason"] == "stale_capital"
+    assert "inference" not in adaptive["evidence_selection"]["excluded"][0]
+    assert "fact" not in adaptive["evidence_selection"]["excluded"][0]
+    assert "body" not in adaptive["evidence_selection"]["excluded"][0]
+    assert "stance" not in adaptive["evidence_selection"]["excluded"][0]
+    assert "hardness" not in adaptive["evidence_selection"]["excluded"][0]
+    assert "adjusted_hardness" not in adaptive["evidence_selection"]["excluded"][0]
     assert adaptive["unknowns"] == [raw_unknown[:240]]
     rendered = repr(report_messages)
     for marker in (
         "DRAFT_MESSAGE_SECRET", "DRAFT_THESIS_SECRET", "DRAFT_GAP_SECRET",
         "RAW_REVIEW_ISSUE_SECRET", "RAW_COUNTED_PRIVATE_SECRET",
         "RAW_EXCLUDED_PRIVATE_SECRET", "RAW_CANDIDATE_EVIDENCE_SECRET",
+        "SAFE_EXCLUDED_INFERENCE", "RAW_EXCLUDED_FACT_SECRET",
+        "RAW_EXCLUDED_BODY_SECRET",
         "RAW_CANDIDATE_CLAIM_SECRET", "RAW_CANDIDATE_INFERENCE_SECRET",
         "RAW_CANDIDATE_NEW_INFO_SECRET", "RAW_CANDIDATE_PLAYSTYLE_SECRET",
     ):
@@ -1885,6 +1965,7 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     assert "不得追加评论、否定或其他主张" in report_prompt
     assert "counted inference 已由系统标准化为单行文本" in report_prompt
     assert "被排除证据只能在 `### 证据取舍与冲突` 中解释排除原因" in report_prompt
+    assert "不得推断、复原或转述其事实、推论或方向" in report_prompt
     assert "不得作为多头或空头论点的 evidence_id" in report_prompt
     assert "无可靠数据" in report_prompt
     assert "无历史样本" in report_prompt

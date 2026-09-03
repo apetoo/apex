@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import math
 import re
 from typing import Any
@@ -11,6 +12,19 @@ MAX_HISTORY = 5
 MAX_REASONS = 5
 MAX_UNKNOWNS = 8
 MAX_TEXT = 240
+
+_FORECAST_OUTCOME_FIELDS = (
+    "return_pct",
+    "stock_return_pct",
+    "benchmark_return_pct",
+    "excess_return_pct",
+    "outcome",
+    "matured_at",
+    "horizon_trading_days",
+    "hit",
+    "verdict",
+    "policy_version",
+)
 
 
 def _text(value: Any) -> str:
@@ -64,6 +78,51 @@ def _scalar_fields(source: Any) -> dict[str, Any]:
     }
 
 
+def _timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _row_timestamp(row: Any, *keys: str) -> datetime | None:
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        if parsed := _timestamp(row.get(key)):
+            return parsed
+    return None
+
+
+def _forecast_key(row: Any) -> tuple[str, datetime] | None:
+    if not isinstance(row, dict) or not isinstance(row.get("ts_code"), str):
+        return None
+    analyzed_at = _row_timestamp(row, "analyzed_at", "date")
+    if analyzed_at is None:
+        return None
+    return row["ts_code"].strip(), analyzed_at
+
+
+def _forecast_outcome(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    result = {}
+    for key in _FORECAST_OUTCOME_FIELDS:
+        if source.get(key) is None:
+            continue
+        if (value := _scalar(source[key])) is not None:
+            result[key] = value
+    return result
+
+
 def _bounded_reasons(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -74,8 +133,12 @@ def _claim(claim: Any, *, excluded: bool = False) -> dict[str, Any]:
     if not isinstance(claim, dict):
         return {}
     keys = (
-        "evidence_id", "stance", "dimension", "nature", "hardness",
-        "adjusted_hardness", "as_of", "frequency", "inference",
+        ("evidence_id", "dimension", "nature", "as_of", "frequency")
+        if excluded else
+        (
+            "evidence_id", "stance", "dimension", "nature", "hardness",
+            "adjusted_hardness", "as_of", "frequency", "inference",
+        )
     )
     result = _pick(claim, keys)
     if "inference" in result:
@@ -95,6 +158,7 @@ def build_report_context(
     risk_level: str | None,
     decision_policy: dict,
     unknowns: list[str],
+    forecast_rows: list[dict] | None = None,
 ) -> dict:
     """Select only bounded, report-authoritative data from analysis state."""
     market = {}
@@ -130,18 +194,45 @@ def build_report_context(
             if as_of is not None:
                 market["as_of"] = as_of
 
+    refreshed_by_entry: dict[tuple[str, datetime], tuple[tuple, dict]] = {}
+    for index, row in enumerate(forecast_rows or []):
+        key = _forecast_key(row)
+        if key is None:
+            continue
+        matured_at = _row_timestamp(row, "matured_at")
+        rank = (
+            matured_at is not None,
+            matured_at or datetime.min.replace(tzinfo=timezone.utc),
+            index,
+        )
+        if key not in refreshed_by_entry or rank > refreshed_by_entry[key][0]:
+            refreshed_by_entry[key] = rank, row
+
+    sortable_history = [
+        (entry, index, _row_timestamp(entry, "analyzed_at", "date"))
+        for index, entry in enumerate(history_entries or [])
+        if isinstance(entry, dict)
+    ]
+    sortable_history.sort(
+        key=lambda item: (
+            item[2] is not None,
+            item[2] or datetime.min.replace(tzinfo=timezone.utc),
+            item[1],
+        ),
+        reverse=True,
+    )
+
     history = []
-    for entry in (history_entries or [])[:MAX_HISTORY]:
+    for entry, _index, _analyzed_at in sortable_history[:MAX_HISTORY]:
         if not isinstance(entry, dict):
             continue
         item = _pick(entry, (
             "analyzed_at", "date", "verdict", "confidence", "calibrated_confidence",
         ))
-        outcome = entry.get("forecast_outcome")
-        if isinstance(outcome, dict):
-            safe_outcome = _scalar_fields(outcome)
-            if safe_outcome:
-                item["forecast_outcome"] = safe_outcome
+        refreshed = refreshed_by_entry.get(_forecast_key(entry))
+        outcome = refreshed[1] if refreshed is not None else entry.get("forecast_outcome")
+        if safe_outcome := _forecast_outcome(outcome):
+            item["forecast_outcome"] = safe_outcome
         history.append(item)
 
     profile = {}
