@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from markdown_it import MarkdownIt
 from openai import OpenAI
 
 _TZ_CN = timezone(timedelta(hours=8))
@@ -2011,154 +2012,92 @@ class _ParsedReportMarkdown:
         return self.visible_text[section.content_start:section.content_end]
 
 
-def _masked_markdown_line(line: str) -> str:
-    return re.sub(r"[^\r\n]", " ", line)
+_REPORT_MARKDOWN = MarkdownIt("commonmark")
 
 
-def _is_indented_markdown_code(line: str) -> bool:
-    columns = 0
-    for character in line:
-        if character == " ":
-            columns += 1
-        elif character == "\t":
-            columns += 4 - (columns % 4)
-        else:
-            break
-    return columns >= 4 and bool(line.strip())
-
-
-def _markdown_block_quote_content(line: str) -> tuple[int, str]:
-    """Return block-quote depth and content after CommonMark container prefixes."""
-    index = 0
-    depth = 0
-    while index < len(line):
-        prefix_start = index
-        columns = 0
-        while index < len(line) and line[index] in " \t":
-            next_columns = (
-                columns + 1
-                if line[index] == " "
-                else columns + 4 - (columns % 4)
-            )
-            if next_columns > 3:
-                break
-            columns = next_columns
-            index += 1
-        if index >= len(line) or line[index] != ">":
-            index = prefix_start
-            break
-        depth += 1
-        index += 1
-        if index < len(line) and line[index] in " \t":
-            index += 1
-    return depth, line[index:]
-
-
-def _mask_markdown_span(characters: list[str], start: int, end: int) -> None:
-    for index in range(start, end):
-        if characters[index] not in "\r\n":
-            characters[index] = " "
-
-
-def _mask_nonrendered_markdown(text: str) -> str:
-    """Mask HTML comments and inline code while preserving source offsets."""
-    characters = list(text)
-    for match in re.finditer(r"<!--.*?(?:-->|$)", text, flags=re.DOTALL):
-        _mask_markdown_span(characters, match.start(), match.end())
-
-    comment_masked = "".join(characters)
-    index = 0
-    while index < len(comment_masked):
-        if comment_masked[index] != "`":
-            index += 1
-            continue
-        run_end = index + 1
-        while run_end < len(comment_masked) and comment_masked[run_end] == "`":
-            run_end += 1
-        marker = comment_masked[index:run_end]
-        search_from = run_end
-        closing = -1
-        while True:
-            candidate = comment_masked.find(marker, search_from)
-            if candidate < 0:
-                break
-            before_is_tick = candidate > 0 and comment_masked[candidate - 1] == "`"
-            after = candidate + len(marker)
-            after_is_tick = after < len(comment_masked) and comment_masked[after] == "`"
-            if not before_is_tick and not after_is_tick:
-                closing = candidate
-                break
-            search_from = after
-        if closing < 0:
-            index = run_end
-            continue
-        span_end = closing + len(marker)
-        _mask_markdown_span(characters, index, span_end)
-        index = span_end
-    return "".join(characters)
+def _render_report_inline(children) -> str:
+    """Render only visible inline token content into validator-safe Markdown."""
+    parts: list[str] = []
+    for child in children or ():
+        if child.type == "text":
+            # Preserve literal asterisks without letting escaped text impersonate
+            # structural strong markers used by machine fields.
+            parts.append(child.content.replace("*", r"\*"))
+        elif child.type in {"softbreak", "hardbreak"}:
+            parts.append("\n")
+        elif child.type in {"strong_open", "strong_close", "em_open", "em_close"}:
+            parts.append(child.markup)
+        elif child.type in {"code_inline", "html_inline", "image"}:
+            parts.append(" ")
+    return "".join(parts)
 
 
 def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
-    """Parse rendered ATX headings once while masking non-rendered Markdown."""
-    visible_lines: list[str] = []
-    fence_char = ""
-    fence_length = 0
-    paragraph_container_depth: int | None = None
-    for line in text.splitlines(keepends=True):
-        if fence_char:
-            closing = re.match(r"^ {0,3}(`{3,}|~{3,})[ \t]*(?:\r?\n)?$", line)
-            visible_lines.append(_masked_markdown_line(line))
-            if (
-                closing
-                and closing.group(1)[0] == fence_char
-                and len(closing.group(1)) >= fence_length
-            ):
-                fence_char = ""
-                fence_length = 0
-            continue
-
-        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*?)(?:\r?\n)?$", line)
-        if opening and not (
-            opening.group(1)[0] == "`" and "`" in opening.group(2)
-        ):
-            fence_char = opening.group(1)[0]
-            fence_length = len(opening.group(1))
-            visible_lines.append(_masked_markdown_line(line))
-            paragraph_container_depth = None
-            continue
-
-        container_depth, container_content = _markdown_block_quote_content(line)
-        if not container_content.strip():
-            visible_lines.append(line)
-            paragraph_container_depth = None
-            continue
-
-        indented_code = _is_indented_markdown_code(container_content)
-        if indented_code and paragraph_container_depth != container_depth:
-            visible_lines.append(_masked_markdown_line(line))
-            paragraph_container_depth = None
-            continue
-
-        visible_lines.append(line)
-        heading = re.match(r"^ {0,3}#{1,6}(?:[ \t]+|$)", container_content)
-        paragraph_container_depth = None if heading else container_depth
-    visible_text = _mask_nonrendered_markdown("".join(visible_lines))
-
-    heading_rows: list[tuple[str, int, int, int, int]] = []
+    """Build rendered validation text and top-level ATX sections from CommonMark."""
+    source_lines = text.splitlines(keepends=True)
+    line_offsets: list[int] = []
     offset = 0
-    for line in visible_text.splitlines(keepends=True):
-        heading_match = re.match(
-            r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*(?:\r?\n)?$", line,
-        )
-        if heading_match:
-            title = re.sub(r"[ \t]+#+[ \t]*$", "", heading_match.group(2)).strip()
-            if title:
-                level = len(heading_match.group(1))
-                line_end = offset + len(line.rstrip("\r\n"))
-                heading_rows.append(
-                    (f"{'#' * level} {title}", level, offset, line_end, offset + len(line))
-                )
+    for line in source_lines:
+        line_offsets.append(offset)
         offset += len(line)
+
+    visible_parts: list[str] = []
+    visible_length = 0
+    heading_rows: list[tuple[str, int, int, int, int]] = []
+    list_markers: list[str] = []
+    item_prefix_pending: list[bool] = []
+    tokens = _REPORT_MARKDOWN.parse(text)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.type == "bullet_list_open":
+            list_markers.append("- ")
+        elif token.type == "ordered_list_open":
+            list_markers.append("1. ")
+        elif token.type in {"bullet_list_close", "ordered_list_close"}:
+            list_markers.pop()
+        elif token.type == "list_item_open":
+            item_prefix_pending.append(True)
+        elif token.type == "list_item_close":
+            item_prefix_pending.pop()
+        elif token.type == "heading_open" and index + 1 < len(tokens):
+            inline = tokens[index + 1]
+            source_line = token.map[0] if token.map else 0
+            raw_line = source_lines[source_line] if source_line < len(source_lines) else ""
+            is_contract_atx = token.markup.startswith("#") and bool(
+                re.match(r"^ {0,3}#{1,6}(?:[ \t]+|$)", raw_line)
+            )
+            if is_contract_atx and inline.type == "inline" and inline.content.strip():
+                title = inline.content.strip()
+                level = len(token.markup)
+                canonical = f"{'#' * level} {title}"
+                start = visible_length
+                heading_text = canonical + "\n"
+                visible_parts.append(heading_text)
+                visible_length += len(heading_text)
+                line_end = line_offsets[source_line] + len(raw_line.rstrip("\r\n"))
+                heading_rows.append(
+                    (canonical, level, start, line_end, visible_length)
+                )
+            elif inline.type == "inline":
+                rendered = _render_report_inline(inline.children)
+                if rendered:
+                    visible_parts.append(rendered + "\n")
+                    visible_length += len(rendered) + 1
+            index += 1
+        elif token.type == "inline":
+            rendered = _render_report_inline(token.children)
+            if rendered:
+                prefix = ""
+                if item_prefix_pending and item_prefix_pending[-1]:
+                    prefix = list_markers[-1] if list_markers else "- "
+                    item_prefix_pending[-1] = False
+                rendered_line = prefix + rendered + "\n"
+                visible_parts.append(rendered_line)
+                visible_length += len(rendered_line)
+        index += 1
+
+    visible_text = "".join(visible_parts)
 
     headings = tuple(
         _ReportMarkdownHeading(
@@ -2170,7 +2109,7 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
             content_end=(
                 heading_rows[index + 1][2]
                 if index + 1 < len(heading_rows)
-                else len(text)
+                else len(visible_text)
             ),
         )
         for index, (canonical, level, start, line_end, content_start) in enumerate(
@@ -2185,9 +2124,16 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
 
 
 def _sub_visible_report_text(text: str, pattern: str, replacement: str) -> str:
-    parsed = _parse_report_markdown(text)
-    matches = list(re.finditer(pattern, parsed.visible_text))
-    for match in reversed(matches):
+    matches = list(re.finditer(pattern, text))
+    visible_matches = []
+    for ordinal, match in enumerate(matches):
+        marker = f"APEXVISIBLEMATCH{ordinal}TOKEN"
+        while marker in text:
+            marker += "X"
+        probed = text[:match.start()] + marker + text[match.end():]
+        if marker in _parse_report_markdown(probed).visible_text:
+            visible_matches.append(match)
+    for match in reversed(visible_matches):
         text = text[:match.start()] + match.expand(replacement) + text[match.end():]
     return text
 

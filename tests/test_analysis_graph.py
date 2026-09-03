@@ -825,6 +825,58 @@ def test_adaptive_verdict_ignores_blockquoted_indented_code_for_provenance():
     ) == []
 
 
+@pytest.mark.parametrize(
+    "block_boundary",
+    [
+        "\n---\n    **净硬度：-0.8**",
+        "\n边界标题\n---\n    **净硬度：-0.8**",
+    ],
+)
+def test_adaptive_verdict_indented_code_after_commonmark_block_is_ignored(
+    block_boundary,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**净硬度：-0.8**", block_boundary)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("净硬度" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "quoted_fence",
+    [
+        "> ~~~\n> **净硬度：-0.8**\n> ~~~",
+        "> > ~~~\n> > **净硬度：-0.8**\n> > ~~~",
+    ],
+)
+def test_adaptive_verdict_blockquoted_fence_cannot_satisfy_net_hardness(
+    quoted_fence,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**净硬度：-0.8**", quoted_fence)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("净硬度" in issue for issue in issues)
+
+
+def test_adaptive_verdict_lazy_blockquote_paragraph_continuation_is_rendered():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "**净硬度：-0.8**",
+        "> 前一段仍开放\n    **净硬度：-0.8**",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
 def test_adaptive_verdict_resumes_rendered_fields_after_indented_code_block():
     report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
     report = report.replace(
