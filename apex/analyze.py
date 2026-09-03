@@ -2027,6 +2027,33 @@ def _is_indented_markdown_code(line: str) -> bool:
     return columns >= 4 and bool(line.strip())
 
 
+def _markdown_block_quote_content(line: str) -> tuple[int, str]:
+    """Return block-quote depth and content after CommonMark container prefixes."""
+    index = 0
+    depth = 0
+    while index < len(line):
+        prefix_start = index
+        columns = 0
+        while index < len(line) and line[index] in " \t":
+            next_columns = (
+                columns + 1
+                if line[index] == " "
+                else columns + 4 - (columns % 4)
+            )
+            if next_columns > 3:
+                break
+            columns = next_columns
+            index += 1
+        if index >= len(line) or line[index] != ">":
+            index = prefix_start
+            break
+        depth += 1
+        index += 1
+        if index < len(line) and line[index] in " \t":
+            index += 1
+    return depth, line[index:]
+
+
 def _mask_markdown_span(characters: list[str], start: int, end: int) -> None:
     for index in range(start, end):
         if characters[index] not in "\r\n":
@@ -2076,6 +2103,7 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
     visible_lines: list[str] = []
     fence_char = ""
     fence_length = 0
+    paragraph_container_depth: int | None = None
     for line in text.splitlines(keepends=True):
         if fence_char:
             closing = re.match(r"^ {0,3}(`{3,}|~{3,})[ \t]*(?:\r?\n)?$", line)
@@ -2096,13 +2124,24 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
             fence_char = opening.group(1)[0]
             fence_length = len(opening.group(1))
             visible_lines.append(_masked_markdown_line(line))
+            paragraph_container_depth = None
             continue
 
-        visible_lines.append(
-            _masked_markdown_line(line)
-            if _is_indented_markdown_code(line)
-            else line
-        )
+        container_depth, container_content = _markdown_block_quote_content(line)
+        if not container_content.strip():
+            visible_lines.append(line)
+            paragraph_container_depth = None
+            continue
+
+        indented_code = _is_indented_markdown_code(container_content)
+        if indented_code and paragraph_container_depth != container_depth:
+            visible_lines.append(_masked_markdown_line(line))
+            paragraph_container_depth = None
+            continue
+
+        visible_lines.append(line)
+        heading = re.match(r"^ {0,3}#{1,6}(?:[ \t]+|$)", container_content)
+        paragraph_container_depth = None if heading else container_depth
     visible_text = _mask_nonrendered_markdown("".join(visible_lines))
 
     heading_rows: list[tuple[str, int, int, int, int]] = []
@@ -2309,7 +2348,7 @@ def _adaptive_report_excluded_issues(
             continue
         inference = _canonical_report_inference(item.get("inference"))
         ambiguous_inference = inference and any(
-            inference in counted or counted in inference
+            inference in counted
             for counted in counted_inferences
         )
         excluded_claims.append((
@@ -2321,12 +2360,9 @@ def _adaptive_report_excluded_issues(
 
     def contains_excluded(content: str) -> bool:
         normalized = _normalize_report_whitespace(content)
-        without_counted = normalized
-        for counted in sorted(counted_inferences, key=len, reverse=True):
-            without_counted = without_counted.replace(counted, "")
         return any(
             (evidence_id and evidence_id in normalized)
-            or (inference and inference in without_counted)
+            or (inference and inference in normalized)
             for evidence_id, inference in excluded_claims
         )
 

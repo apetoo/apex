@@ -660,6 +660,23 @@ def test_adaptive_verdict_allows_ambiguous_counted_overlap_in_narrative():
     ) == []
 
 
+def test_adaptive_verdict_rejects_longer_excluded_inference_containing_counted():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    adaptive_report["evidence_selection"]["excluded"][0]["inference"] = (
+        "旧龙虎榜显示近 5 日资金净流出"
+    )
+    report = report.replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        "旧龙虎榜显示近 5 日资金净流出，因此支持空方。",
+    )
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("被排除证据" in issue for issue in issues)
+
+
 def test_adaptive_verdict_directional_validation_ignores_fenced_fake_sections():
     report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
     unsafe_real_report = report.replace(
@@ -732,8 +749,8 @@ def test_adaptive_verdict_requires_one_rendered_net_hardness_in_real_judge(
 @pytest.mark.parametrize(
     "indented_code",
     [
-        "    **净硬度：-0.8**",
-        "\t**净硬度：-0.8**",
+        "\n    **净硬度：-0.8**",
+        "\n\t**净硬度：-0.8**",
         "    示例代码第一行\n\n    **净硬度：-0.8**",
     ],
 )
@@ -750,11 +767,69 @@ def test_adaptive_verdict_indented_code_cannot_satisfy_net_hardness(
     assert any("净硬度" in issue for issue in issues)
 
 
+@pytest.mark.parametrize(
+    "quoted_code",
+    [
+        ">     **净硬度：-0.8**",
+        "> >     **净硬度：-0.8**",
+    ],
+)
+def test_adaptive_verdict_blockquoted_indented_code_cannot_satisfy_net_hardness(
+    quoted_code,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace("**净硬度：-0.8**", quoted_code)
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("净硬度" in issue for issue in issues)
+
+
+def test_adaptive_verdict_indented_line_continuing_paragraph_remains_rendered():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "**净硬度：-0.8**",
+        "领先指标偏弱，因此倾向谨慎。\n    **净硬度：-0.8**",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
+def test_adaptive_verdict_blockquoted_indented_code_cannot_supply_heading():
+    report = _complete_adaptive_verdict_report().replace("## 一、多头论点", "")
+    report = ">     ## 一、多头论点\n\n" + report
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={"evidence_selection": {"counted": [], "excluded": []}},
+    )
+
+    assert any("缺少必需章节：一、多头论点" in issue for issue in issues)
+
+
+def test_adaptive_verdict_ignores_blockquoted_indented_code_for_provenance():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        ">     旧龙虎榜资金仅是代码示例。",
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
 def test_adaptive_verdict_resumes_rendered_fields_after_indented_code_block():
     report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
     report = report.replace(
         "**净硬度：-0.8**",
-        "    **净硬度：999**\n\n**净硬度：-0.8**",
+        "\n    **净硬度：999**\n\n**净硬度：-0.8**",
     )
 
     assert analyze._validate_final_report(
