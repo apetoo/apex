@@ -877,6 +877,53 @@ def test_adaptive_verdict_lazy_blockquote_paragraph_continuation_is_rendered():
     ) == []
 
 
+@pytest.mark.parametrize(
+    "formatted_excluded",
+    [
+        "旧龙虎榜**资金**证明空方占优，因此支持观望偏空。",
+        "旧龙虎榜<!-- split -->资金证明空方占优，因此支持观望偏空。",
+        "旧龙虎榜<span></span>资金证明空方占优，因此支持观望偏空。",
+        "ev_**old** 明确支持空方。",
+        "ev_<!-- split -->old 明确支持空方。",
+    ],
+)
+def test_adaptive_verdict_rejects_rendered_contiguous_excluded_identity(
+    formatted_excluded,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        formatted_excluded,
+    )
+
+    issues = analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    )
+
+    assert any("市场与个股环境" in issue and "被排除证据" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "nonrendered_excluded",
+    [
+        "`旧龙虎榜资金` 仅作为代码示例。",
+        "<div>\n旧龙虎榜资金仅作为 HTML 块示例。\n</div>",
+    ],
+)
+def test_adaptive_verdict_nonrendered_excluded_content_remains_inert(
+    nonrendered_excluded,
+):
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = report.replace(
+        "市场处于亢奋阶段，个股短期涨幅较大，需防范高位波动。",
+        nonrendered_excluded,
+    )
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
 def test_adaptive_verdict_resumes_rendered_fields_after_indented_code_block():
     report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
     report = report.replace(

@@ -1991,12 +1991,16 @@ class _ReportMarkdownHeading:
     line_end: int
     content_start: int
     content_end: int
+    prose_start: int
+    prose_content_start: int
+    prose_content_end: int
 
 
 @dataclass(frozen=True)
 class _ParsedReportMarkdown:
     source: str
     visible_text: str
+    visible_prose: str
     headings: tuple[_ReportMarkdownHeading, ...]
 
     def sections(self, canonical: str) -> tuple[_ReportMarkdownHeading, ...]:
@@ -2010,6 +2014,15 @@ class _ParsedReportMarkdown:
             return ""
         section = sections[0]
         return self.visible_text[section.content_start:section.content_end]
+
+    def section_prose(self, canonical: str) -> str:
+        sections = self.sections(canonical)
+        if len(sections) != 1:
+            return ""
+        section = sections[0]
+        return self.visible_prose[
+            section.prose_content_start:section.prose_content_end
+        ]
 
 
 _REPORT_MARKDOWN = MarkdownIt("commonmark")
@@ -2032,6 +2045,21 @@ def _render_report_inline(children) -> str:
     return "".join(parts)
 
 
+def _render_report_inline_prose(children) -> str:
+    """Render contiguous visible prose without structural Markdown markup."""
+    parts: list[str] = []
+    for child in children or ():
+        if child.type == "text":
+            parts.append(child.content)
+        elif child.type in {"softbreak", "hardbreak"}:
+            parts.append("\n")
+        elif child.type in {"code_inline", "image"}:
+            parts.append(" ")
+        # Inline HTML is non-prose markup. Omitting it without a separator keeps
+        # adjacent rendered text contiguous, exactly as it appears to readers.
+    return "".join(parts)
+
+
 def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
     """Build rendered validation text and top-level ATX sections from CommonMark."""
     source_lines = text.splitlines(keepends=True)
@@ -2043,7 +2071,9 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
 
     visible_parts: list[str] = []
     visible_length = 0
-    heading_rows: list[tuple[str, int, int, int, int]] = []
+    prose_parts: list[str] = []
+    prose_length = 0
+    heading_rows: list[tuple[str, int, int, int, int, int, int]] = []
     list_markers: list[str] = []
     item_prefix_pending: list[bool] = []
     tokens = _REPORT_MARKDOWN.parse(text)
@@ -2075,29 +2105,51 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
                 heading_text = canonical + "\n"
                 visible_parts.append(heading_text)
                 visible_length += len(heading_text)
+                prose_start = prose_length
+                prose_heading = _render_report_inline_prose(inline.children) + "\n"
+                prose_parts.append(prose_heading)
+                prose_length += len(prose_heading)
                 line_end = line_offsets[source_line] + len(raw_line.rstrip("\r\n"))
                 heading_rows.append(
-                    (canonical, level, start, line_end, visible_length)
+                    (
+                        canonical,
+                        level,
+                        start,
+                        line_end,
+                        visible_length,
+                        prose_start,
+                        prose_length,
+                    )
                 )
             elif inline.type == "inline":
                 rendered = _render_report_inline(inline.children)
+                prose = _render_report_inline_prose(inline.children)
                 if rendered:
                     visible_parts.append(rendered + "\n")
                     visible_length += len(rendered) + 1
+                if prose:
+                    prose_parts.append(prose + "\n")
+                    prose_length += len(prose) + 1
             index += 1
         elif token.type == "inline":
             rendered = _render_report_inline(token.children)
+            prose = _render_report_inline_prose(token.children)
+            prefix = ""
+            if item_prefix_pending and item_prefix_pending[-1]:
+                prefix = list_markers[-1] if list_markers else "- "
+                item_prefix_pending[-1] = False
             if rendered:
-                prefix = ""
-                if item_prefix_pending and item_prefix_pending[-1]:
-                    prefix = list_markers[-1] if list_markers else "- "
-                    item_prefix_pending[-1] = False
                 rendered_line = prefix + rendered + "\n"
                 visible_parts.append(rendered_line)
                 visible_length += len(rendered_line)
+            if prose:
+                prose_line = prefix + prose + "\n"
+                prose_parts.append(prose_line)
+                prose_length += len(prose_line)
         index += 1
 
     visible_text = "".join(visible_parts)
+    visible_prose = "".join(prose_parts)
 
     headings = tuple(
         _ReportMarkdownHeading(
@@ -2111,14 +2163,28 @@ def _parse_report_markdown(text: str) -> _ParsedReportMarkdown:
                 if index + 1 < len(heading_rows)
                 else len(visible_text)
             ),
+            prose_start=prose_start,
+            prose_content_start=prose_content_start,
+            prose_content_end=(
+                heading_rows[index + 1][5]
+                if index + 1 < len(heading_rows)
+                else len(visible_prose)
+            ),
         )
-        for index, (canonical, level, start, line_end, content_start) in enumerate(
-            heading_rows
-        )
+        for index, (
+            canonical,
+            level,
+            start,
+            line_end,
+            content_start,
+            prose_start,
+            prose_content_start,
+        ) in enumerate(heading_rows)
     )
     return _ParsedReportMarkdown(
         source=text,
         visible_text=visible_text,
+        visible_prose=visible_prose,
         headings=headings,
     )
 
@@ -2314,13 +2380,16 @@ def _adaptive_report_excluded_issues(
 
     issues: list[str] = []
     conflict_heading = "### 证据取舍与冲突"
-    preamble_end = parsed.headings[0].start if parsed.headings else len(parsed.visible_text)
-    if contains_excluded(parsed.visible_text[:preamble_end]):
+    preamble_end = (
+        parsed.headings[0].prose_start
+        if parsed.headings else len(parsed.visible_prose)
+    )
+    if contains_excluded(parsed.visible_prose[:preamble_end]):
         issues.append("报告正文包含仅允许在证据取舍与冲突中出现的被排除证据")
     for heading in _VERDICT_REPORT_SECTIONS:
         if heading == conflict_heading:
             continue
-        if contains_excluded(parsed.section_text(heading)):
+        if contains_excluded(parsed.section_prose(heading)):
             label = heading.removeprefix("## ").removeprefix("# ")
             issues.append(f"{label}包含仅允许在证据取舍与冲突中出现的被排除证据")
     return issues
