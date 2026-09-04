@@ -332,6 +332,57 @@ def _complete_adaptive_verdict_report(*, verdict="观望偏空", confidence=4):
 商品价格和市场波动可能使结论失效。未确认数据保持未知。"""
 
 
+def _replace_adaptive_section(report: str, heading: str, content: str) -> str:
+    sections = list(analyze._VERDICT_REPORT_SECTIONS)
+    index = sections.index(heading)
+    next_heading = sections[index + 1] if index + 1 < len(sections) else None
+    prefix, remainder = report.split(heading, 1)
+    if next_heading is None:
+        return prefix + heading + "\n" + content
+    _old_content, suffix = remainder.split(next_heading, 1)
+    return prefix + heading + "\n" + content + "\n\n" + next_heading + suffix
+
+
+def _populated_adaptive_authority():
+    return {
+        "market": {"sentiment": {"regime": "MARKET_REGIME_ALPHA"}},
+        "history": [{
+            "date": "2026-08-01",
+            "verdict": "偏空",
+            "forecast_outcome": {
+                "outcome": "HISTORY_CALIBRATION_LABEL_42",
+                "hit": False,
+            },
+        }],
+        "playstyle": {"profile": {"primary": "PLAYSTYLE_SWING_ALPHA"}},
+        "evidence_selection": {
+            "counted": [],
+            "excluded": [{
+                "evidence_id": "ev_history_stale",
+                "reason": "stale_capital",
+            }],
+        },
+        "unknowns": ["UNKNOWN_DATA_ALPHA"],
+    }
+
+
+def _authority_backed_adaptive_report():
+    report = _complete_adaptive_verdict_report()
+    replacements = {
+        "## 市场与个股环境": "市场状态为 MARKET_REGIME_ALPHA。",
+        "### 证据取舍与冲突": (
+            "ev_history_stale 因 stale_capital 被排除，仅说明取舍。"
+        ),
+        "### 历史判断复盘": (
+            "历史校准标签 HISTORY_CALIBRATION_LABEL_42 仅用于复盘。"
+        ),
+        "### 玩法与适用周期": "系统玩法为 PLAYSTYLE_SWING_ALPHA。",
+    }
+    for heading, content in replacements.items():
+        report = _replace_adaptive_section(report, heading, content)
+    return report
+
+
 def _complete_verdict_report(*, verdict="观望偏空", confidence=4):
     return f"""## 核心判断
 **判断：{verdict}**
@@ -461,9 +512,7 @@ def test_final_report_validator_rejects_missing_sections_and_process_text():
 
 def test_adaptive_verdict_report_requires_detailed_sections():
     report = _complete_adaptive_verdict_report()
-    adaptive_report = {
-        "evidence_selection": {"counted": [], "excluded": []},
-    }
+    adaptive_report = {}
     assert analyze._validate_final_report(report, "verdict", {
         "verdict": "观望偏空", "confidence": 4,
     }, adaptive_report=adaptive_report) == []
@@ -473,6 +522,238 @@ def test_adaptive_verdict_report_requires_detailed_sections():
         adaptive_report=adaptive_report,
     )
     assert any("市场与个股环境" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    ("heading", "empty_state"),
+    [
+        ("## 市场与个股环境", "本次无可靠数据。"),
+        ("### 历史判断复盘", "本次无历史样本。"),
+        ("### 玩法与适用周期", "本次无数据。"),
+        ("### 证据取舍与冲突", "本次无可靠数据。"),
+    ],
+)
+def test_adaptive_verdict_rejects_empty_state_for_populated_authority(
+    heading, empty_state,
+):
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(), heading, empty_state,
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=_populated_adaptive_authority(),
+    )
+
+    assert any(
+        heading.removeprefix("## ").removeprefix("# ") in issue
+        and "权威上下文非空" in issue
+        for issue in issues
+    )
+
+
+def test_adaptive_verdict_accepts_short_empty_states_for_true_empty_authority():
+    report = _complete_adaptive_verdict_report()
+    for heading, content in (
+        ("## 市场与个股环境", "本次无可靠数据。"),
+        ("### 证据取舍与冲突", "本次无可靠数据。"),
+        ("### 历史判断复盘", "本次无历史样本。"),
+        ("### 玩法与适用周期", "本次无可靠数据。"),
+    ):
+        report = _replace_adaptive_section(report, heading, content)
+
+    assert analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={
+            "market": {},
+            "history": [],
+            "playstyle": {},
+            "evidence_selection": {"counted": [], "excluded": []},
+            "unknowns": [],
+        },
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## 市场与个股环境",
+        "### 历史判断复盘",
+        "### 玩法与适用周期",
+        "### 证据取舍与冲突",
+    ],
+)
+def test_adaptive_verdict_requires_empty_state_when_authority_is_empty(heading):
+    issues = analyze._validate_final_report(
+        _complete_adaptive_verdict_report(),
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={
+            "market": {},
+            "history": [],
+            "playstyle": {},
+            "evidence_selection": {"counted": [], "excluded": []},
+            "unknowns": [],
+        },
+    )
+
+    assert any(
+        heading.removeprefix("## ").removeprefix("# ") in issue
+        and "权威上下文为空" in issue
+        for issue in issues
+    )
+
+
+def test_adaptive_verdict_treats_empty_finalized_wrappers_as_true_empty_authority():
+    report = _complete_adaptive_verdict_report()
+    for heading in (
+        "## 市场与个股环境",
+        "### 证据取舍与冲突",
+        "### 玩法与适用周期",
+    ):
+        report = _replace_adaptive_section(report, heading, "本次无可靠数据。")
+    report = _replace_adaptive_section(
+        report, "### 历史判断复盘", "本次无历史样本。",
+    )
+
+    assert analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report={
+            "market": {"sentiment": {}},
+            "history": [{}],
+            "playstyle": {"profile": {}, "fit": {}, "risk_level": None},
+            "evidence_selection": {"counted": [], "excluded": []},
+            "unknowns": [],
+        },
+    ) == []
+
+
+def test_adaptive_verdict_requires_content_for_boolean_only_history_authority():
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(), "### 历史判断复盘", "",
+    )
+    adaptive_report = _populated_adaptive_authority()
+    adaptive_report["history"] = [{"forecast_outcome": {"hit": False}}]
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=adaptive_report,
+    )
+
+    assert any("历史判断复盘" in issue and "权威上下文非空" in issue for issue in issues)
+
+
+def test_adaptive_verdict_rejects_history_only_value_in_current_direction_section():
+    report = _authority_backed_adaptive_report().replace(
+        "**判断：观望偏空**",
+        "**判断：观望偏空**\n"
+        "HISTORY_CALIBRATION_LABEL_42 证明本次方向。",
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=_populated_adaptive_authority(),
+    )
+
+    assert any("核心判断" in issue and "历史复盘专用值" in issue for issue in issues)
+
+
+def test_adaptive_verdict_rejects_short_history_label_in_current_direction_section():
+    adaptive_report = _populated_adaptive_authority()
+    adaptive_report["history"][0]["forecast_outcome"]["outcome"] = "bear"
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(),
+        "### 历史判断复盘",
+        "历史结果标签 bear 仅用于复盘和校准。",
+    ).replace(
+        "**判断：观望偏空**",
+        "**判断：观望偏空**\nbear 标签支持本次方向。",
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=adaptive_report,
+    )
+
+    assert any("核心判断" in issue and "历史复盘专用值" in issue for issue in issues)
+
+
+def test_adaptive_verdict_rejects_final_rereview_history_return_probe():
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(),
+        "### 历史判断复盘",
+        "历史样本前向收益为负，直接证明本次应继续观望偏空。",
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=_populated_adaptive_authority(),
+    )
+
+    assert any("历史判断复盘" in issue and "收益幅度" in issue for issue in issues)
+
+
+def test_adaptive_verdict_allows_history_value_shared_with_current_authority():
+    report, candidate, adaptive_report = _adaptive_report_with_directional_evidence()
+    report = _replace_adaptive_section(
+        report,
+        "### 历史判断复盘",
+        "历史结果为近 5 日资金净流出，仅用于复盘和校准。",
+    )
+    adaptive_report["history"] = [{
+        "date": "2026-08-01",
+        "forecast_outcome": {"outcome": "近 5 日资金净流出"},
+    }]
+
+    assert analyze._validate_final_report(
+        report, "verdict", candidate, adaptive_report=adaptive_report,
+    ) == []
+
+
+def test_adaptive_verdict_allows_partial_missing_data_note_with_authority_value():
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(),
+        "## 市场与个股环境",
+        "部分指标无数据；可用市场状态为 MARKET_REGIME_ALPHA。",
+    )
+
+    assert analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=_populated_adaptive_authority(),
+    ) == []
+
+
+def test_adaptive_verdict_rejects_empty_state_claim_even_with_authority_value():
+    report = _replace_adaptive_section(
+        _authority_backed_adaptive_report(),
+        "## 市场与个股环境",
+        "本次无可靠数据，但市场状态为 MARKET_REGIME_ALPHA。",
+    )
+
+    issues = analyze._validate_final_report(
+        report,
+        "verdict",
+        {"verdict": "观望偏空", "confidence": 4},
+        adaptive_report=_populated_adaptive_authority(),
+    )
+
+    assert any("市场与个股环境" in issue and "声称无数据" in issue for issue in issues)
 
 
 def test_adaptive_verdict_report_rejects_reordered_duplicate_and_prose_spoofed_headings():
@@ -521,7 +802,7 @@ def test_adaptive_verdict_report_accepts_commonmark_heading_indentation(indent):
         report,
         "verdict",
         {"verdict": "观望偏空", "confidence": 4},
-        adaptive_report={"evidence_selection": {"counted": [], "excluded": []}},
+        adaptive_report={},
     ) == []
 
 
@@ -1494,7 +1775,14 @@ def test_run_passes_newest_refreshed_forecast_history_to_report_context(monkeypa
         "2026-07-07", "2026-07-06", "2026-07-05", "2026-07-04", "2026-07-03",
     ]
     assert report_history[0]["forecast_outcome"]["hit"] is False
-    assert report_history[0]["forecast_outcome"]["excess_return_pct"] == 6.0
+    assert report_history[0]["forecast_outcome"] == {
+        "outcome": "bull",
+        "matured_at": "2026-07-21",
+        "hit": False,
+        "policy_version": "decision-policy-v1",
+    }
+    assert "return_pct" not in repr(report_history)
+    assert "horizon_trading_days" not in repr(report_history)
 
 
 def test_position_report_normalizes_raw_candidate_for_prompt_and_validation(monkeypatch):
@@ -1776,6 +2064,13 @@ def test_formal_report_prompt_uses_structured_authority_not_research_draft(monke
             "raw_private": "RAW_EXCLUDED_PRIVATE_SECRET",
         }],
     }
+    formal_report = _complete_adaptive_verdict_report().replace(
+        "计入证据支持当前方向；过期资金证据仅解释排除原因，不参与方向判断。",
+        "ev_old 因 stale_capital 被排除，仅用于说明证据取舍。",
+    ).replace(
+        "历史样本曾出现方向偏差，本次仅用于说明置信度校准，不作为当前方向证据。",
+        "历史判断为偏空，本次仅用于说明置信度校准，不作为当前方向证据。",
+    )
     client = _FakeClient([
         _response(tool_name="submit_research_state", arguments={
             "thesis": "DRAFT_THESIS_SECRET",
@@ -1787,7 +2082,7 @@ def test_formal_report_prompt_uses_structured_authority_not_research_draft(monke
         }),
         _response(tool_name="record_verdict", arguments=candidate),
         _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
-        _response(content=_complete_adaptive_verdict_report()),
+        _response(content=formal_report),
     ])
 
     report_context = {
@@ -1910,6 +2205,9 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     ).replace(
         "当前不新开多头仓位，等待资金与趋势改善后重新评估。",
         "**入场：0–0**\n**止损：0**\n**目标：0**\n**建议仓位：0%**\n当前暂不介入。",
+    ).replace(
+        "计入证据支持当前方向；过期资金证据仅解释排除原因，不参与方向判断。",
+        "ev_old 因 stale_capital 被排除，仅用于说明证据取舍。",
     )
     client = _FakeClient([
         _response(tool_name="submit_research_state", arguments={
@@ -1933,7 +2231,15 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
             "market": {"sentiment": {"regime": "亢奋"}},
             "history": [{
                 "date": "历史样本", "verdict": "偏空",
-                "forecast_outcome": {"hit": False},
+                "forecast_outcome": {
+                    "stock_return_pct": 987654.321,
+                    "benchmark_return_pct": -123456.789,
+                    "excess_return_pct": 1111111.11,
+                    "horizon_trading_days": 10,
+                    "outcome": "HISTORY_MISS_LABEL_ALPHA",
+                    "hit": False,
+                    "policy_version": "decision-policy-v1",
+                },
             }],
             "playstyle": {},
             "evidence_selection": {"counted": [], "excluded": []},
@@ -1961,6 +2267,12 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     assert "波段" in report_prompt
     assert "历史样本" in report_prompt
     assert "DRAFT_ONLY_CASHFLOW_MINUS_8_65" not in report_prompt
+    assert "stock_return_pct" not in report_prompt
+    assert "benchmark_return_pct" not in report_prompt
+    assert "excess_return_pct" not in report_prompt
+    assert "horizon_trading_days" not in report_prompt
+    assert "987654.321" not in report_prompt
+    assert "HISTORY_MISS_LABEL_ALPHA" in report_prompt
     assert "每条方向论点必须严格写成 `- [<evidence_id>] <counted inference>`" in report_prompt
     assert "不得追加评论、否定或其他主张" in report_prompt
     assert "counted inference 已由系统标准化为单行文本" in report_prompt
@@ -1970,6 +2282,9 @@ def test_600487_style_adaptive_report_uses_only_structured_authority(monkeypatch
     assert "无可靠数据" in report_prompt
     assert "无历史样本" in report_prompt
     assert "不得复制或推断先前 assistant 消息中的事实" in report_prompt
+    assert "历史只能用于 `### 历史判断复盘` 和 `### 置信度调整`" in report_prompt
+    assert "历史命中、未命中或结果标签不得支持本次多空方向" in report_prompt
+    assert "历史样本前向收益为负，直接证明本次应继续观望偏空" not in report_prompt
     assert "2000–3000 个中文字符" in report_prompt
     assert "方向论点与计入证据来源不一致" in report_prompt
     for heading in analyze._VERDICT_REPORT_SECTIONS:

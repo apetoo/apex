@@ -198,16 +198,13 @@ def test_build_report_context_selects_newest_history_and_joins_refreshed_forecas
         "2026-08-07", "2026-08-06", "2026-08-05", "2026-08-04", "2026-08-03",
     ]
     assert context["history"][0]["forecast_outcome"] == {
-        "stock_return_pct": 6.5,
-        "benchmark_return_pct": 1.0,
-        "excess_return_pct": 5.5,
         "outcome": "bull",
         "matured_at": "2026-08-21",
-        "horizon_trading_days": 10,
         "hit": False,
-        "verdict": "偏空",
         "policy_version": "decision-policy-v1",
     }
+    assert "return_pct" not in repr(context["history"])
+    assert "horizon_trading_days" not in repr(context["history"])
     assert "REFRESHED_FORECAST_DRAFT_SECRET" not in repr(context)
 
 

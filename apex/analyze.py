@@ -2395,6 +2395,168 @@ def _adaptive_report_excluded_issues(
     return issues
 
 
+_ADAPTIVE_AUTHORITY_SECTIONS = (
+    ("market", "## 市场与个股环境"),
+    ("evidence_selection", "### 证据取舍与冲突"),
+    ("history", "### 历史判断复盘"),
+    ("playstyle", "### 玩法与适用周期"),
+)
+_CURRENT_DIRECTION_SECTIONS = (
+    "## 核心判断",
+    "## 四维分析",
+    "## 一、多头论点",
+    "## 二、空头论点",
+    "## 三、裁判结论",
+    "### 加权四维评分",
+    "## 操作建议",
+)
+_EMPTY_AUTHORITY_PATTERN = re.compile(
+    r"(?:本次)?(?:暂无|无)(?:可靠)?(?:历史)?(?:数据|样本)(?:可用)?[。.]?"
+)
+_REMOVED_HISTORY_MAGNITUDE_LABELS = (
+    "前向收益",
+    "股票收益",
+    "基准收益",
+    "超额收益",
+)
+
+
+def _authority_values(value, *, include_numbers: bool = True) -> set[str]:
+    """Return exact, non-trivial scalar values suitable for provenance checks."""
+    values: set[str] = set()
+    if isinstance(value, dict):
+        for nested in value.values():
+            values.update(_authority_values(nested, include_numbers=include_numbers))
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            values.update(_authority_values(nested, include_numbers=include_numbers))
+    elif isinstance(value, str):
+        normalized = _normalize_report_whitespace(value)
+        if len(normalized) >= 2:
+            values.add(normalized)
+    elif include_numbers and isinstance(value, (int, float)) and not isinstance(value, bool):
+        normalized = str(value)
+        if len(normalized) >= 2:
+            values.add(normalized)
+    return values
+
+
+def _has_report_authority(value) -> bool:
+    if isinstance(value, dict):
+        return any(_has_report_authority(nested) for nested in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_report_authority(nested) for nested in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None and isinstance(value, (bool, int, float))
+
+
+def _evidence_selection_has_authority(value) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and (
+            _has_report_authority(value.get("counted"))
+            or _has_report_authority(value.get("excluded"))
+        )
+    )
+
+
+def _contains_empty_authority_claim(content: str) -> bool:
+    sentences = re.split(r"[。.!！?？；;]+", content)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        match = _EMPTY_AUTHORITY_PATTERN.match(sentence)
+        if match and (
+            match.end() == len(sentence)
+            or sentence[match.end()] in "，,：:"
+        ):
+            return True
+    return False
+
+
+def _contains_authority_value(content: str, value: str) -> bool:
+    if re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
+            content,
+        ))
+    return value in content
+
+
+def _adaptive_report_authority_issues(
+    parsed: _ParsedReportMarkdown,
+    adaptive_report: dict,
+) -> list[str]:
+    """Keep populated and empty adaptive sections aligned with their authority."""
+    issues: list[str] = []
+    for key, heading in _ADAPTIVE_AUTHORITY_SECTIONS:
+        if key not in adaptive_report:
+            continue
+        authority = adaptive_report.get(key)
+        populated = (
+            _evidence_selection_has_authority(authority)
+            if key == "evidence_selection"
+            else _has_report_authority(authority)
+        )
+        content = _normalize_report_whitespace(parsed.section_prose(heading))
+        label = heading.removeprefix("## ").removeprefix("# ")
+        if populated:
+            if _contains_empty_authority_claim(content):
+                issues.append(f"{label}权威上下文非空但声称无数据")
+                continue
+            values = _authority_values(authority)
+            if not content or (
+                values and not any(
+                    _contains_authority_value(content, value) for value in values
+                )
+            ):
+                issues.append(f"{label}权威上下文非空但未呈现权威值")
+        elif not _EMPTY_AUTHORITY_PATTERN.fullmatch(content):
+            issues.append(f"{label}权威上下文为空时必须仅写简短空态句")
+    return issues
+
+
+def _adaptive_report_history_issues(
+    parsed: _ParsedReportMarkdown,
+    candidate: dict,
+    adaptive_report: dict,
+) -> list[str]:
+    """Keep retrospective-only history values out of current-direction sections."""
+    history = adaptive_report.get("history")
+    if not history:
+        return []
+    current_authority = {
+        key: value for key, value in adaptive_report.items() if key != "history"
+    }
+    current_values = (
+        _authority_values(candidate, include_numbers=False)
+        | _authority_values(current_authority, include_numbers=False)
+    )
+    history_only_values = {
+        value for value in _authority_values(history, include_numbers=False)
+        if value not in current_values
+        and (
+            (bool(re.fullmatch(r"[A-Za-z0-9_.:-]+", value)) and len(value) >= 4)
+            or len(value) >= 6
+        )
+    }
+    issues: list[str] = []
+    for heading in _CURRENT_DIRECTION_SECTIONS:
+        content = _normalize_report_whitespace(parsed.section_prose(heading))
+        if any(
+            _contains_authority_value(content, value)
+            for value in history_only_values
+        ):
+            label = heading.removeprefix("## ").removeprefix("# ")
+            issues.append(f"{label}包含仅允许用于历史复盘或置信度调整的历史复盘专用值")
+    history_content = _normalize_report_whitespace(
+        parsed.section_prose("### 历史判断复盘")
+    )
+    if any(label in history_content for label in _REMOVED_HISTORY_MAGNITUDE_LABELS):
+        issues.append("历史判断复盘包含正式报告历史权限未提供的收益幅度描述")
+    return issues
+
+
 def _directional_bullet_has_counted_provenance(
     bullet: str,
     evidence_id: str,
@@ -2442,6 +2604,12 @@ def _validate_final_report(
         validation_text = parsed_markdown.visible_text
         issues.extend(_adaptive_report_heading_issues(parsed_markdown))
         issues.extend(_adaptive_report_excluded_issues(parsed_markdown, adaptive_report))
+        issues.extend(_adaptive_report_authority_issues(parsed_markdown, adaptive_report))
+        issues.extend(
+            _adaptive_report_history_issues(
+                parsed_markdown, candidate, adaptive_report,
+            )
+        )
     else:
         required_sections = (
             _POSITION_REPORT_SECTIONS
@@ -3403,6 +3571,9 @@ def _run_langgraph_loop(
                     "其条目只提供安全元数据和排除原因，不得推断、复原或转述其事实、推论或方向，"
                     "不得作为多头或空头论点的 evidence_id，"
                     "也不得支持方向或硬度。"
+                    "历史只能用于 `### 历史判断复盘` 和 `### 置信度调整`，"
+                    "只能做事后复盘与置信度校准；历史命中、未命中或结果标签不得支持本次多空方向、"
+                    "净硬度、交易动作或价位，也不得出现在其他当前方向章节。"
                     "对应对象或列表为空时，只写一句简短的“无可靠数据”或“无历史样本”，"
                     "不得补写替代事实。"
                     "不得复制或推断先前 assistant 消息中的事实。"
@@ -3435,6 +3606,17 @@ def _run_langgraph_loop(
         }
         adaptive_context = deepcopy(authoritative_report_context)
         if kind == "verdict":
+            base_history = adaptive_context.get("history")
+            sanitized_history = build_report_context(
+                history_entries=base_history if isinstance(base_history, list) else [],
+                market_context={},
+                playstyle=None,
+                playstyle_features={},
+                playstyle_fit=None,
+                risk_level=None,
+                decision_policy={},
+                unknowns=[],
+            )["history"]
             finalized_context = build_report_context(
                 history_entries=[],
                 market_context={},
@@ -3446,7 +3628,7 @@ def _run_langgraph_loop(
                 unknowns=list(state.get("unknowns") or []),
             )
             adaptive_context.setdefault("market", {})
-            adaptive_context.setdefault("history", [])
+            adaptive_context["history"] = sanitized_history
             adaptive_context["evidence_selection"] = finalized_context["evidence_selection"]
             adaptive_context["unknowns"] = finalized_context["unknowns"]
             adaptive_playstyle = adaptive_context.get("playstyle")

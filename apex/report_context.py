@@ -14,15 +14,9 @@ MAX_UNKNOWNS = 8
 MAX_TEXT = 240
 
 _FORECAST_OUTCOME_FIELDS = (
-    "return_pct",
-    "stock_return_pct",
-    "benchmark_return_pct",
-    "excess_return_pct",
     "outcome",
     "matured_at",
-    "horizon_trading_days",
     "hit",
-    "verdict",
     "policy_version",
 )
 
