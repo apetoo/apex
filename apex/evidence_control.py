@@ -140,7 +140,15 @@ class EvidenceController:
             blockers.append("权威黑天鹅扫描失败")
         for gap in self.gaps:
             if gap.get("severity") == "critical" and gap.get("status", "open") != "resolved":
-                blockers.append(str(gap.get("description") or gap.get("id") or "关键证据缺口"))
+                # 000977 回归：拒收消息须自解释——critical 未解决的 gap 会阻塞所有
+                # 候选提交（包括 hold）。等待类事项（如收盘确认）靠等而非补证，
+                # 模型无从得知这条规则，只回传裸描述会让它反复试探烧光轮次。
+                blockers.append(
+                    str(gap.get("description") or gap.get("id") or "关键证据缺口")
+                    + "（critical 未解决的证据缺口会阻塞所有候选提交，包括 hold；"
+                    "只能靠等待或时间解决、无法靠补证解决的事项（如收盘确认）"
+                    "应降级为非 critical 并记入 unknowns，不得阻塞候选提交）"
+                )
         if not any(int(item.get("source_tier") or 3) <= 2 for item in self.evidence.values()):
             blockers.append("缺少可用于决策的 Tier 1/2 证据")
         material_types = {"material_event", "earnings", "shareholders", "regulatory", "corporate_actions"}

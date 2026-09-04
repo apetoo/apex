@@ -117,7 +117,28 @@ def test_tier_three_lead_cannot_resolve_critical_gap():
 
     decision = ctl.finalization_decision()
     assert decision.allowed is False
-    assert "疑似重大处罚" in decision.blockers
+    assert any(blocker.startswith("疑似重大处罚") for blocker in decision.blockers)
+
+
+def test_critical_gap_blocker_explains_resolution_rule():
+    """000977 回归：拒收消息须自解释，否则模型猜不出 critical gap 连 hold 一起阻塞。"""
+    ctl = EvidenceController()
+    ctl.record_safety_scan(success=True, evidence=[])
+    ctl.add_evidence([_ev()])
+    ctl.submit_assessment(
+        thesis="等收盘确认",
+        gaps=[{"id": "g1", "description": "盘中数据未收盘，需确认收盘是否有效跌破80.0",
+               "severity": "critical", "status": "open"}],
+        ready=True,
+    )
+
+    decision = ctl.finalization_decision(action="hold")
+
+    assert decision.allowed is False
+    blocker = next(b for b in decision.blockers if "盘中数据未收盘" in b)
+    assert "阻塞所有候选提交，包括 hold" in blocker
+    assert "非 critical" in blocker
+    assert "unknowns" in blocker
 
 
 def test_two_no_progress_rounds_stop_research():

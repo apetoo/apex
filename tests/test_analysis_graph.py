@@ -2960,6 +2960,89 @@ def test_safety_scan_error_payload_abstains_without_calling_model(monkeypatch):
     assert client.calls == []
 
 
+def test_critical_wait_gap_feedback_guides_model_to_noncritical(monkeypatch):
+    """000977 回归：盘中未收盘的等待型 gap 被标 critical 会连 hold 一起阻塞；
+    拒收反馈须告诉模型降级为 noncritical，而不是让它瞎猜规则烧光轮次。"""
+    held = {
+        "ts_code": "000977.SZ", "entry_price": 79.0, "position_size_shares": 400,
+        "stop_loss": 80.0, "target": 90.0,
+        "plan": {"scale_plan": [
+            {"level": 2, "action": "trim", "trigger_price": 80.0, "pct": 1.0},
+        ]},
+    }
+    wait_gap_critical = {
+        "id": "g1", "severity": "critical", "status": "open",
+        "description": "盘中数据未收盘，需确认收盘是否有效跌破80.0",
+    }
+    wait_gap_minor = {**wait_gap_critical, "severity": "noncritical"}
+    hold = {"action": "hold", "ladder_intent": "preserve",
+            "rationale": "盘中破位未确认，保留 L2 纪律等收盘。"}
+    report = _complete_position_report().replace(
+        "**当前动作：hold**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：hold**\n**当前有效止损：80.0**\n**当前有效目标：90.0**\n"
+        "盘中破位未确认，保留 L2 退出纪律等收盘确认。",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "- trim @ 80.0，比例 1.0",
+    )
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "盘中破位等收盘", "gaps": [wait_gap_critical],
+            "next_actions": ["等收盘确认"], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=hold),
+        # 收到降级指引后重新评估，把等待型 gap 降为 noncritical
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "盘中破位等收盘", "gaps": [wait_gap_minor],
+            "next_actions": ["等收盘确认"], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=hold),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=report),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 79.65})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
+        "results": [{
+            "title": "浪潮信息公告", "snippet": "风险扫描完成",
+            "url": "https://www.cninfo.com.cn/scan", "date": "2026-09-03",
+            "site": "巨潮资讯", "source_tier": 1, "entity_matched": True,
+            "freshness_status": "current",
+        }],
+    }))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [held]})
+    monkeypatch.setattr(analyze.journal, "load_position_actions", lambda _code: [])
+    monkeypatch.setattr(analyze, "_finalize_position_action", lambda *_args, **_kwargs: {
+        "analysis_status": "completed", "position_action": hold,
+    })
+    events = []
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=events.append,
+        position_baseline=held,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["analysis_text"] == report
+    # 第一次 record_position_action 的拒收反馈须带降级指引
+    rejection = next(
+        message["content"] for call in client.calls
+        for message in call.get("messages", [])
+        if isinstance(message, dict) and message.get("role") == "tool"
+        and "盘中数据未收盘" in str(message.get("content"))
+    )
+    assert "阻塞所有候选提交，包括 hold" in rejection
+    assert "非 critical" in rejection
+    # 工具 schema 的 severity 描述须预防等待型 gap 标 critical
+    severity_prop = next(
+        tool for tool in analyze.TOOLS
+        if tool["function"]["name"] == "submit_research_state"
+    )["function"]["parameters"]["properties"]["gaps"]["items"]["properties"]["severity"]
+    assert "等待" in severity_prop["description"]
+    assert "noncritical" in severity_prop["description"]
+
+
 def test_budget_exhaustion_preserves_business_gap_not_internal_stop_code(monkeypatch):
     gap = {"id": "earnings", "description": "最新业绩预告尚未从权威来源核实", "severity": "critical", "status": "open"}
     client = _FakeClient([
@@ -2987,7 +3070,10 @@ def test_budget_exhaustion_preserves_business_gap_not_internal_stop_code(monkeyp
 
     assert result["analysis_status"] == "insufficient_evidence"
     assert result["outcome_reason"] == "evidence_gap"
-    assert result["unknowns"] == ["最新业绩预告尚未从权威来源核实"]
+    assert result["unknowns"] == ["最新业绩预告尚未从权威来源核实"] or (
+        len(result["unknowns"]) == 1
+        and result["unknowns"][0].startswith("最新业绩预告尚未从权威来源核实")
+    )
     assert result["next_actions"] == ["核实最新业绩预告"]
     assert result["research_metrics"]["stop_reason"] == "research_round_budget"
     assert result["research_metrics"]["research_rounds"] == 3

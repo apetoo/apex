@@ -559,7 +559,14 @@ TOOLS.insert(-2, {
                         "properties": {
                             "id": {"type": "string"},
                             "description": {"type": "string"},
-                            "severity": {"type": "string", "enum": ["critical", "noncritical"]},
+                            "severity": {
+                                "type": "string", "enum": ["critical", "noncritical"],
+                                "description": (
+                                    "critical 且未解决的缺口会阻塞所有候选提交（包括 hold）。"
+                                    "只能靠等待或时间解决、无法靠补证解决的事项"
+                                    "（如等收盘确认、等下次财报）必须标 noncritical。"
+                                ),
+                            },
                             "status": {"type": "string", "enum": ["open", "resolved"]},
                         },
                         "required": ["id", "description", "severity", "status"],
