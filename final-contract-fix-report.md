@@ -49,3 +49,11 @@
 - `tests/test_report_context.py`
 - `tests/test_analysis_graph.py`
 - `final-contract-fix-report.md`
+
+## 追加：二次清洗排序幂等性回归（2026-09-04）
+
+复审在合并前发现一处新回归：`build_report_context()` 的历史排序把输入位置作为 tie-break（`reverse=True`），报告节点对已清洗 history 的二次清洗会把相同时间戳记录的组内顺序再次反转，清洗不幂等。
+
+- 修复：排序键移除位置 tie-break，改用 Python 稳定排序（`reverse=True` 仍保持相等键的原始顺序），相同时间戳保留输入顺序，二次清洗天然幂等。
+- RED/GREEN：新增 `test_build_report_context_history_cleaning_is_idempotent`（先复现组内反转，修复后通过）；既有排序用例的相同时间戳组内期望从 `[51, 50]` 更新为输入顺序 `[50, 51]`。
+- 验证：`tests/test_report_context.py tests/test_analysis_graph.py` `141 passed`；全量 Python（排除上述两项已记录 PII 基线失败）`853 passed, 2 deselected`。

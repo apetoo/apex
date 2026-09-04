@@ -222,7 +222,27 @@ def test_build_report_context_history_order_parses_timestamps_and_has_stable_fal
         playstyle_fit=None, risk_level=None, decision_policy={}, unknowns=[],
     )
 
-    assert [item["confidence"] for item in context["history"]] == [71, 70, 6, 51, 50]
+    # 相同时间戳组内保留输入顺序（稳定排序），保证二次清洗幂等
+    assert [item["confidence"] for item in context["history"]] == [71, 70, 6, 50, 51]
+
+
+def test_build_report_context_history_cleaning_is_idempotent():
+    # 正式报告节点会对已清洗的 history 再跑一次 build_report_context（analyze.py 的
+    # sanitized_history 二次清洗）；二次排序不得把相同时间戳的组内顺序再次反转。
+    history_entries = [
+        {"analyzed_at": "2026-08-05T10:00:00+08:00", "confidence": 50, "verdict": "看空"},
+        {"analyzed_at": "2026-08-05T10:00:00+08:00", "confidence": 51, "verdict": "看多"},
+        {"analyzed_at": "2026-08-06T10:00:00+08:00", "confidence": 60, "verdict": "看多"},
+    ]
+    kwargs = dict(
+        market_context={}, playstyle=None, playstyle_features={},
+        playstyle_fit=None, risk_level=None, decision_policy={}, unknowns=[],
+    )
+
+    first = build_report_context(history_entries=history_entries, **kwargs)
+    second = build_report_context(history_entries=first["history"], **kwargs)
+
+    assert second["history"] == first["history"]
 
 
 def test_build_report_context_excluded_claims_cannot_seed_directional_paraphrase():

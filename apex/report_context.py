@@ -203,21 +203,24 @@ def build_report_context(
             refreshed_by_entry[key] = rank, row
 
     sortable_history = [
-        (entry, index, _row_timestamp(entry, "analyzed_at", "date"))
-        for index, entry in enumerate(history_entries or [])
+        (entry, _row_timestamp(entry, "analyzed_at", "date"))
+        for entry in (history_entries or [])
         if isinstance(entry, dict)
     ]
+    # 排序键不含输入位置：报告节点会对已清洗的 history 再清洗一次（analyze.py 的
+    # sanitized_history 二次清洗），若用位置做 tie-break，reverse=True 会在二次清洗时
+    # 把相同时间戳的组内顺序再次反转（非幂等）。Python 排序稳定（reverse=True 也保持
+    # 相等键的原始顺序），相等时间戳保留输入顺序即天然幂等。
     sortable_history.sort(
         key=lambda item: (
-            item[2] is not None,
-            item[2] or datetime.min.replace(tzinfo=timezone.utc),
-            item[1],
+            item[1] is not None,
+            item[1] or datetime.min.replace(tzinfo=timezone.utc),
         ),
         reverse=True,
     )
 
     history = []
-    for entry, _index, _analyzed_at in sortable_history[:MAX_HISTORY]:
+    for entry, _analyzed_at in sortable_history[:MAX_HISTORY]:
         if not isinstance(entry, dict):
             continue
         item = _pick(entry, (
