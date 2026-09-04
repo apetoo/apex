@@ -1453,6 +1453,97 @@ def test_final_report_validator_enforces_position_risk_and_ladder_fields():
     assert any("当前有效目标与结构化结果不一致" in issue for issue in issues)
 
 
+def test_position_report_null_field_label_issue_names_structured_value():
+    """000977 回归：trim 按比例提交时报告写换算股数，重试反馈须指明结构化值为空。"""
+    candidate = analyze._effective_position_report_candidate({
+        "action": "trim", "trim_shares": None, "trim_pct": 1.0,
+        "effective_stop": 80.0, "effective_target": 90.0,
+        "effective_scale_plan": [], "ladder_intent": "clear",
+        "rationale": "全部退出",
+    })
+    report = _complete_position_report(action="trim").replace(
+        "**当前动作：trim**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：trim**\n**减仓比例：1.0**\n**减仓股数：400**\n全部退出。",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "条件触发计划已清空。",
+    )
+
+    issues = analyze._validate_final_report(report, "position_action", candidate)
+
+    assert any(
+        "减仓股数与结构化结果不一致" in issue
+        and "结构化值为空" in issue and "删除该标签" in issue
+        for issue in issues
+    )
+
+
+def test_position_report_contract_forbids_null_label_and_share_conversion(monkeypatch):
+    """000977 回归：持仓报告契约须禁止 null 字段标签与比例换算股数。"""
+    held = {
+        "ts_code": "000977.SZ", "entry_price": 79.0, "position_size_shares": 400,
+        "stop_loss": 80.0, "target": 90.0, "plan": {"scale_plan": []},
+    }
+    action = {
+        "action": "trim", "trim_pct": 1.0, "ladder_intent": "clear",
+        "rationale": "跌破止损平台，全部退出。",
+    }
+    buggy = _complete_position_report(action="trim").replace(
+        "**当前动作：trim**，保持现有仓位并执行既定风险计划。",
+        "**当前动作：trim**\n**减仓比例：1.0**\n**减仓股数：400**\n"
+        "**当前有效止损：80.0**\n**当前有效目标：90.0**\n全部退出。",
+    ).replace(
+        "价格满足计划条件后才执行未来动作，当前不提前交易。",
+        "条件触发计划已清空。",
+    )
+    fixed = buggy.replace("\n**减仓股数：400**", "")
+    client = _FakeClient([
+        _response(tool_name="submit_research_state", arguments={
+            "thesis": "全部退出", "gaps": [], "next_actions": [], "ready": True,
+        }),
+        _response(tool_name="record_position_action", arguments=action),
+        _response(content=json.dumps({"outcome": "pass", "issues": []}, ensure_ascii=False)),
+        _response(content=buggy),
+        _response(content=fixed),
+    ])
+    monkeypatch.setattr(analyze.data, "get_name_map", lambda: {"000977.SZ": "浪潮信息"})
+    monkeypatch.setattr(analyze.data, "get_realtime_price", lambda _codes: {"000977.SZ": 78.4})
+    monkeypatch.setattr(analyze.data, "web_search", lambda *args, **kwargs: json.dumps({
+        "results": [{
+            "title": "浪潮信息公告", "snippet": "风险扫描完成", "url": "https://www.cninfo.com.cn/scan",
+            "date": "2026-09-03", "site": "巨潮资讯", "source_tier": 1,
+            "entity_matched": True, "freshness_status": "current",
+        }],
+    }))
+    monkeypatch.setattr("apex.watchlist.load", lambda: {"active_positions": [held]})
+    monkeypatch.setattr(analyze.journal, "load_position_actions", lambda _code: [])
+    monkeypatch.setattr(analyze, "_finalize_position_action", lambda *_args, **_kwargs: {
+        "analysis_status": "completed", "position_action": action,
+    })
+    events = []
+
+    result = analyze._run_langgraph_loop(
+        ts_code="000977.SZ", client=client, model="fake",
+        messages=[{"role": "user", "content": "分析"}], max_iter=12, emit=events.append,
+        position_baseline=held,
+    )
+
+    assert result["analysis_status"] == "completed"
+    assert result["analysis_text"] == fixed
+    assert result["report_generation_attempts"] == 2
+    first_report_prompt = client.calls[-2]["messages"][-1]["content"]
+    assert "值为 null 的字段禁止输出对应标签" in first_report_prompt
+    assert "禁止换算成股数" in first_report_prompt
+    retry_prompt = client.calls[-1]["messages"][-1]["content"]
+    assert "减仓股数与结构化结果不一致（结构化值为空，请删除该标签）" in retry_prompt
+    retry_issues = [
+        event["issues"] for event in events if event["type"] == "report_retry"
+    ]
+    assert retry_issues and any(
+        any("结构化值为空" in issue for issue in issues) for issues in retry_issues
+    )
+
+
 def test_final_report_validator_requires_explicit_clear_ladder_statement():
     """A clear effective state must report the removal, not silently omit its ladder."""
     candidate = analyze._effective_position_report_candidate({

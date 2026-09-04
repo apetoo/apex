@@ -1971,10 +1971,12 @@ def _validate_labeled_number(
     ]
     if expected_number is None:
         if values:
-            issues.append(f"{label}与结构化结果不一致")
+            # 000977 回归：结构化值为 null 时模型常写换算值（如 trim_pct=1.0 写成
+            # 减仓股数 400）；反馈须指明结构化值为空，否则模型自认等价、两轮都挂。
+            issues.append(f"{label}与结构化结果不一致（结构化值为空，请删除该标签）")
         return
     if parsed != [[expected_number]]:
-        issues.append(f"{label}与结构化结果不一致")
+        issues.append(f"{label}与结构化结果不一致（结构化值为 {expected_number:g}）")
     if len(values) != 1 or parsed != [[expected_number]]:
         issues.append(f"存在冲突的{conflict_label or label}")
 
@@ -3536,6 +3538,10 @@ def _run_langgraph_loop(
                 "`**加仓股数：<add_shares>**`、`**减仓股数：<trim_shares>**`、"
                 "`**减仓比例：<trim_pct>**`、`**当前有效止损：<current_stop>**`、"
                 "`**当前有效目标：<current_target>**`。"
+                "值为 null 的字段禁止输出对应标签，"
+                "也不得用 0、占位符或换算值代替；"
+                "trim 以 trim_pct 提交时必须写 `**减仓比例：<trim_pct>**`，"
+                "禁止换算成股数写减仓股数。"
                 + ladder_contract
                 + "条件触发计划必须区分当前动作与未来条件，不得把未来 add/trim 写成现役指令。"
                 + (
